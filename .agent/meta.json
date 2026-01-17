@@ -1,0 +1,9 @@
+{
+  "task_id": "prompt-1763113713839",
+  "summary": "Implement the factorial helper and CLI with stronger validation and regression tests.",
+  "files": [
+    "src/factorial.py",
+    "tests/test_factorial.py"
+  ],
+  "generated_at": 1763113713839
+}

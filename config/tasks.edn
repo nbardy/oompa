@@ -1,0 +1,5 @@
+[{:id "fact-001"
+  :summary "Build src/factorial.py with factorial(n) helper and CLI usage `python src/factorial.py 5` -> `120`"
+  :targets ["src/factorial.py" "tests/test_factorial.py"]
+  :priority 1
+  :dependencies []}]

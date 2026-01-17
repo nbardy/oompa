@@ -1,0 +1,21 @@
+# Runtime artifacts
+/runs/
+/tmp/
+
+# Clojure build caches
+/target/
+/.cpcache/
+
+# Python caches
+__pycache__/
+*.pyc
+.pytest_cache/
+.mypy_cache/
+
+# Tooling / env
+/.idea/
+.venv/
+python/.venv/
+
+# Misc
+.DS_Store

@@ -1,0 +1,8 @@
+{:allow ["src/**" "tests/**" "scripts/**" "docs/**" "config/**"]
+ :deny ["secrets/**" "**/*.pem" "**/.env*" "node_modules/**" "build/**" "*.bin"]
+ :max-lines-added 800
+ :max-lines-deleted 800
+ :max-files 10
+ :allow-binary? false
+ :review-timeout-seconds 600
+ :propose-timeout-seconds 300}

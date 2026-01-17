@@ -1,0 +1,33 @@
+{:paths ["agentnet/src"]
+
+ ;; No external deps - pure babashka
+
+ :tasks
+ {:override-builtin true  ; Suppress warning about 'run'
+
+  run {:doc "Run the AgentNet orchestrator once"
+       :task (shell "./agentnet.bb" "run")}
+
+  loop {:doc "Run N iterations (default 20)"
+        :task (shell "./agentnet.bb" "loop" (or (first *command-line-args*) "20"))}
+
+  prompt {:doc "Run ad-hoc prompt"
+          :task (apply shell "./agentnet.bb" "prompt" *command-line-args*)}
+
+  status {:doc "Show the summary from the latest run log"
+          :task (shell "./agentnet.bb" "status")}
+
+  worktrees {:doc "List worktree status"
+             :task (shell "./agentnet.bb" "worktrees")}
+
+  cleanup {:doc "Remove all worktrees"
+           :task (shell "./agentnet.bb" "cleanup")}
+
+  context {:doc "Dump the current context pack"
+           :task (shell "./agentnet.bb" "context")}
+
+  check {:doc "Check agent backend availability"
+         :task (shell "./agentnet.bb" "check")}
+
+  lint-notes {:doc "Validate agent notes front-matter"
+              :task (shell "./agentnet.bb" "lint-notes")}}}
