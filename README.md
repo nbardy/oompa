@@ -1,4 +1,10 @@
-# AgentNet Swarm
+# oompa
+
+![Oompa Loompas building code](docs/resources/oompa-banner.png)
+
+*Getting your ralphs to work together*
+
+---
 
 A multi-agent orchestrator that runs parallel AI coding agents (Claude or Codex) with git worktree isolation, automated code review, and conflict-free merging.
 
