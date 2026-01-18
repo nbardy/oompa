@@ -7,8 +7,6 @@ https://github.com/user-attachments/assets/030c3a5e-b071-4894-a416-631288ceb439
 
 ---
 
-https://github.com/user-attachments/assets/030c3a5e-b071-4894-a416-631288ceb439
-
 
 
 A multi-agent orchestrator that runs parallel AI coding agents (Claude or Codex) with git worktree isolation, automated code review, and conflict-free merging.
