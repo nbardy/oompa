@@ -6,35 +6,35 @@ A multi-agent orchestrator that runs parallel AI coding agents (Claude or Codex)
 
 ```
 ┌─────────────────────────────────────────────────────────────────────────────┐
-│                              ORCHESTRATOR                                    │
-│                                                                              │
+│                              ORCHESTRATOR                                   │
+│                                                                             │
 │   ┌──────────────┐     ┌──────────────┐     ┌──────────────┐                │
 │   │   WORKTREE   │     │   WORKTREE   │     │   WORKTREE   │                │
 │   │   worker-0   │     │   worker-1   │     │   worker-2   │                │
 │   │  (isolated)  │     │  (isolated)  │     │  (isolated)  │                │
 │   └──────┬───────┘     └──────┬───────┘     └──────┬───────┘                │
-│          │                    │                    │                         │
-│          ▼                    ▼                    ▼                         │
+│          │                    │                    │                        │
+│          ▼                    ▼                    ▼                        │
 │   ┌──────────────┐     ┌──────────────┐     ┌──────────────┐                │
 │   │   PROPOSER   │     │   PROPOSER   │     │   PROPOSER   │                │
-│   │ (Claude/Codex)│     │ (Claude/Codex)│     │ (Claude/Codex)│                │
+│   │ (Claude/Codex)│     │ (Claude/Codex)│     │ (Claude/Codex)│             │
 │   │  writes code │     │  writes code │     │  writes code │                │
 │   └──────┬───────┘     └──────┬───────┘     └──────┬───────┘                │
-│          │                    │                    │                         │
-│          ▼                    ▼                    ▼                         │
+│          │                    │                    │                        │
+│          ▼                    ▼                    ▼                        │
 │   ┌──────────────┐     ┌──────────────┐     ┌──────────────┐                │
 │   │   REVIEWER   │     │   REVIEWER   │     │   REVIEWER   │                │
-│   │ (Claude/Codex)│     │ (Claude/Codex)│     │ (Claude/Codex)│                │
-│   │reviews & fixes│     │reviews & fixes│     │reviews & fixes│                │
+│   │ (Claude/Codex)│     │ (Claude/Codex)│     │ (Claude/Codex)│             │
+│   │reviews & fixes│     │reviews & fixes│     │reviews & fixes│             │
 │   └──────┬───────┘     └──────┬───────┘     └──────┬───────┘                │
-│          │                    │                    │                         │
-│          └────────────────────┼────────────────────┘                         │
-│                               ▼                                              │
-│                        ┌──────────────┐                                      │
-│                        │    MERGER    │                                      │
-│                        │  (sequential)│                                      │
-│                        │  to main     │                                      │
-│                        └──────────────┘                                      │
+│          │                    │                    │                        │
+│          └────────────────────┼────────────────────┘                        │
+│                               ▼                                             │
+│                        ┌──────────────┐                                     │
+│                        │    MERGER    │                                     │
+│                        │  (sequential)│                                     │
+│                        │  to main     │                                     │
+│                        └──────────────┘                                     │
 └─────────────────────────────────────────────────────────────────────────────┘
 ```
 
