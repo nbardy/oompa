@@ -1,0 +1,7 @@
+{
+  "workers": [
+    {"harness": "codex", "model": "codex-5.2", "iterations": 10},
+    {"harness": "codex", "model": "codex-5.2-mini", "iterations": 10},
+    {"harness": "claude", "model": "opus", "iterations": 5}
+  ]
+}

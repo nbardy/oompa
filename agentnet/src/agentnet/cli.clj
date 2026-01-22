@@ -180,6 +180,54 @@
                        (name agent-type)
                        (if available? "✓ available" "✗ not found"))))))
 
+(defn cmd-swarm
+  "Run multiple worker configs from oompa.json in parallel"
+  [opts args]
+  (let [config-file (or (first args) "oompa.json")
+        f (io/file config-file)]
+    (when-not (.exists f)
+      (println (format "Config file not found: %s" config-file))
+      (println)
+      (println "Create oompa.json with format:")
+      (println "  {")
+      (println "    \"workers\": [")
+      (println "      {\"harness\": \"codex\", \"model\": \"codex-5.2\", \"iterations\": 10},")
+      (println "      {\"harness\": \"codex\", \"model\": \"codex-5.2-mini\", \"iterations\": 10},")
+      (println "      {\"harness\": \"claude\", \"model\": \"opus\", \"iterations\": 5}")
+      (println "    ]")
+      (println "  }")
+      (System/exit 1))
+    (let [config (json/parse-string (slurp f) true)
+          worker-configs (:workers config)]
+      (println (format "Launching %d worker configs from %s..." (count worker-configs) config-file))
+      (println)
+      ;; Launch each worker config in parallel using futures
+      (let [futures (doall
+                      (map-indexed
+                        (fn [idx {:keys [harness model iterations] :as wc}]
+                          (let [harness-kw (keyword (or harness "codex"))
+                                iters (or iterations 10)]
+                            (println (format "  [%d] %s/%s x%d iterations"
+                                             idx (name harness-kw) (or model "default") iters))
+                            (future
+                              (try
+                                (orchestrator/run-loop! iters
+                                                        (merge opts
+                                                               {:harness harness-kw
+                                                                :model model
+                                                                :workers 1}))
+                                (catch Exception e
+                                  (println (format "[%d] Error: %s" idx (.getMessage e))))))))
+                        worker-configs))]
+        (println)
+        (println "All workers launched. Waiting for completion...")
+        ;; Wait for all futures
+        (doseq [[idx f] (map-indexed vector futures)]
+          (deref f)
+          (println (format "  [%d] completed" idx)))
+        (println)
+        (println "Swarm complete.")))))
+
 (defn cmd-help
   "Print usage information"
   [opts args]
@@ -190,6 +238,7 @@
   (println "Commands:")
   (println "  run              Run all tasks once")
   (println "  loop N           Run N iterations")
+  (println "  swarm [file]     Run multiple worker configs from oompa.json (parallel)")
   (println "  prompt \"...\"     Run ad-hoc prompt")
   (println "  status           Show last run summary")
   (println "  worktrees        List worktree status")
@@ -207,7 +256,8 @@
   (println)
   (println "Examples:")
   (println "  ./swarm.bb loop 10 --harness codex --model codex-5.2-mini --workers 3")
-  (println "  ./swarm.bb loop 5 --harness claude --model opus --workers 2"))
+  (println "  ./swarm.bb loop 5 --harness claude --model opus --workers 2")
+  (println "  ./swarm.bb swarm oompa.json  # Run multi-model config"))
 
 ;; =============================================================================
 ;; Main Entry Point
@@ -216,6 +266,7 @@
 (def commands
   {"run" cmd-run
    "loop" cmd-loop
+   "swarm" cmd-swarm
    "prompt" cmd-prompt
    "status" cmd-status
    "worktrees" cmd-worktrees
