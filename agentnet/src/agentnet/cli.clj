@@ -29,7 +29,8 @@
 
 (defn parse-args [args]
   (loop [opts {:workers 2
-               :agent-type :codex
+               :harness :codex
+               :model nil
                :dry-run false
                :iterations 1}
          remaining args]
@@ -39,12 +40,24 @@
         (recur (assoc opts :workers (parse-int (second remaining) 2))
                (nnext remaining))
 
+        (= arg "--harness")
+        (let [h (keyword (second remaining))]
+          (when-not (#{:codex :claude} h)
+            (throw (ex-info (str "Unknown harness: " (second remaining) ". Use 'codex' or 'claude'") {})))
+          (recur (assoc opts :harness h)
+                 (nnext remaining)))
+
+        (= arg "--model")
+        (recur (assoc opts :model (second remaining))
+               (nnext remaining))
+
+        ;; Legacy flags (still supported)
         (= arg "--claude")
-        (recur (assoc opts :agent-type :claude)
+        (recur (assoc opts :harness :claude)
                (next remaining))
 
         (= arg "--codex")
-        (recur (assoc opts :agent-type :codex)
+        (recur (assoc opts :harness :codex)
                (next remaining))
 
         (= arg "--dry-run")
@@ -77,9 +90,12 @@
 (defn cmd-loop
   "Run orchestrator N times"
   [opts args]
-  (let [iterations (parse-int (first args) 20)]
-    (println (format "Starting %d iterations with %s backend..."
-                     iterations (name (:agent-type opts))))
+  (let [iterations (parse-int (first args) 20)
+        model-str (if (:model opts)
+                    (format " (model: %s)" (:model opts))
+                    "")]
+    (println (format "Starting %d iterations with %s harness%s..."
+                     iterations (name (:harness opts)) model-str))
     (orchestrator/run-loop! iterations opts)))
 
 (defn cmd-prompt
@@ -169,7 +185,7 @@
   [opts args]
   (println "AgentNet Orchestrator")
   (println)
-  (println "Usage: ./agentnet.bb <command> [options]")
+  (println "Usage: ./swarm.bb <command> [options]")
   (println)
   (println "Commands:")
   (println "  run              Run all tasks once")
@@ -183,11 +199,15 @@
   (println "  help             Show this help")
   (println)
   (println "Options:")
-  (println "  --workers N      Number of parallel workers (default: 2)")
-  (println "  --claude         Use Claude backend")
-  (println "  --codex          Use Codex backend (default)")
-  (println "  --dry-run        Skip actual merges")
-  (println "  --keep-worktrees Don't cleanup worktrees after run"))
+  (println "  --workers N          Number of parallel workers (default: 2)")
+  (println "  --harness {codex,claude}  Agent harness to use (default: codex)")
+  (println "  --model MODEL        Model to use (e.g., codex-5.2, codex-5.2-mini, opus)")
+  (println "  --dry-run            Skip actual merges")
+  (println "  --keep-worktrees     Don't cleanup worktrees after run")
+  (println)
+  (println "Examples:")
+  (println "  ./swarm.bb loop 10 --harness codex --model codex-5.2-mini --workers 3")
+  (println "  ./swarm.bb loop 5 --harness claude --model opus --workers 2"))
 
 ;; =============================================================================
 ;; Main Entry Point

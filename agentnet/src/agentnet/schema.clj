@@ -94,9 +94,9 @@
 
 (defn valid-orchestrator-config? [x]
   (and (map? x)
-       (has-keys? x [:worker-count :agent-type])
+       (has-keys? x [:worker-count :harness])
        (pos-int? (:worker-count x))
-       (agent-type? (:agent-type x))))
+       (agent-type? (:harness x))))
 
 ;; =============================================================================
 ;; Validation Helpers
@@ -138,4 +138,4 @@
 ;; AgentConfig     <- {:type :codex|:claude, :model string, :sandbox keyword}
 ;; ReviewFeedback  <- {:verdict :approved|:needs-changes|:rejected, :comments [string]}
 ;; MergeResult     <- {:status :merged|:conflict|:failed, :source-branch string, ...}
-;; OrchestratorConfig <- {:worker-count int, :agent-type keyword, :dry-run bool}
+;; OrchestratorConfig <- {:worker-count int, :harness :codex|:claude, :model string, :dry-run bool}

@@ -59,6 +59,7 @@
 (defmethod build-command :codex
   [_ {:keys [model sandbox timeout-seconds]} prompt cwd]
   (cond-> ["codex" "exec" "--full-auto" "--skip-git-repo-check"]
+    model (into ["--model" model])
     cwd (into ["-C" cwd])
     sandbox (into ["--sandbox" (name sandbox)])
     true (conj "--" prompt)))

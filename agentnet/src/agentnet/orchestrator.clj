@@ -168,11 +168,12 @@
      config - OrchestratorConfig
 
    Returns OrchestratorState"
-  [{:keys [worker-count agent-type worktree-root dry-run] :as config}]
+  [{:keys [worker-count harness model worktree-root dry-run] :as config}]
   (schema/assert-valid schema/valid-orchestrator-config? config "OrchestratorConfig")
 
-  (println (format "Initializing %d workers with %s backend..."
-                   worker-count (name agent-type)))
+  (let [model-str (if model (format " (model: %s)" model) "")]
+    (println (format "Initializing %d workers with %s harness%s..."
+                     worker-count (name harness) model-str)))
 
   ;; Initialize worktree pool
   (let [pool (worktree/init-pool! config)
@@ -199,13 +200,11 @@
    Returns updated OrchestratorState."
   [state]
   (let [{:keys [config workers worktree-pool task-queue]} state
-        {:keys [worker-count agent-type dry-run]} config
+        {:keys [worker-count harness model dry-run]} config
         policy (load-policy)
 
-        agent-config {:type agent-type
-                      :model (case agent-type
-                               :claude "opus"
-                               :codex nil)
+        agent-config {:type harness
+                      :model model
                       :sandbox :workspace-write
                       :timeout-seconds 300}
 
@@ -319,12 +318,13 @@
   "Convenience: create orchestrator, run, save log, shutdown.
 
    Arguments:
-     opts - {:worker-count N, :agent-type :codex|:claude, :dry-run bool}
+     opts - {:workers N, :harness :codex|:claude, :model string, :dry-run bool}
 
    Returns run log path"
   [opts]
-  (let [config {:worker-count (or (:worker-count opts) 2)
-                :agent-type (or (:agent-type opts) :codex)
+  (let [config {:worker-count (or (:workers opts) 2)
+                :harness (or (:harness opts) :codex)
+                :model (:model opts)
                 :worktree-root ".workers"
                 :dry-run (:dry-run opts false)
                 :policy (load-policy)}
