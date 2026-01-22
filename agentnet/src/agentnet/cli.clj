@@ -180,6 +180,14 @@
                        (name agent-type)
                        (if available? "✓ available" "✗ not found"))))))
 
+(defn- parse-model-string
+  "Parse 'harness:model' string into {:harness :model}"
+  [s]
+  (if (and s (str/includes? s ":"))
+    (let [[h m] (str/split s #":" 2)]
+      {:harness (keyword h) :model m})
+    {:harness :codex :model s}))
+
 (defn cmd-swarm
   "Run multiple worker configs from oompa.json in parallel"
   [opts args]
@@ -189,42 +197,69 @@
       (println (format "Config file not found: %s" config-file))
       (println)
       (println "Create oompa.json with format:")
-      (println "  {")
-      (println "    \"workers\": [")
-      (println "      {\"harness\": \"codex\", \"model\": \"codex-5.2\", \"iterations\": 10},")
-      (println "      {\"harness\": \"codex\", \"model\": \"codex-5.2-mini\", \"iterations\": 10},")
-      (println "      {\"harness\": \"claude\", \"model\": \"opus\", \"iterations\": 5}")
-      (println "    ]")
-      (println "  }")
+      (println "{")
+      (println "  \"plan_model\": \"claude:opus-4.5\",")
+      (println "  \"review_model\": \"codex:codex-5.2\",")
+      (println "  \"workers\": [")
+      (println "    {\"model\": \"codex:codex-5.2-mini\", \"iterations\": 10, \"count\": 3},")
+      (println "    {\"model\": \"codex:codex-5.2\", \"iterations\": 5, \"count\": 1, \"prompt\": \"prompts/senior.md\"}")
+      (println "  ]")
+      (println "}")
       (System/exit 1))
     (let [config (json/parse-string (slurp f) true)
-          worker-configs (:workers config)]
-      (println (format "Launching %d worker configs from %s..." (count worker-configs) config-file))
+          plan-model (some-> (:plan_model config) parse-model-string)
+          review-model (some-> (:review_model config) parse-model-string)
+          worker-configs (:workers config)
+          ;; Expand worker configs by count
+          expanded-workers (mapcat (fn [wc]
+                                     (let [cnt (or (:count wc) 1)]
+                                       (repeat cnt (dissoc wc :count))))
+                                   worker-configs)
+          total-workers (count expanded-workers)]
+
+      (println (format "Swarm config from %s:" config-file))
+      (when plan-model
+        (println (format "  Plan:   %s:%s" (name (:harness plan-model)) (:model plan-model))))
+      (when review-model
+        (println (format "  Review: %s:%s" (name (:harness review-model)) (:model review-model))))
+      (println (format "  Workers: %d total" total-workers))
+      (doseq [[idx wc] (map-indexed vector worker-configs)]
+        (let [{:keys [harness model]} (parse-model-string (:model wc))]
+          (println (format "    - %dx %s:%s (%d iters%s)"
+                           (or (:count wc) 1)
+                           (name harness)
+                           model
+                           (or (:iterations wc) 10)
+                           (if (:prompt wc) (str ", " (:prompt wc)) "")))))
       (println)
-      ;; Launch each worker config in parallel using futures
+
+      ;; Launch each expanded worker in parallel
       (let [futures (doall
                       (map-indexed
-                        (fn [idx {:keys [harness model iterations] :as wc}]
-                          (let [harness-kw (keyword (or harness "codex"))
-                                iters (or iterations 10)]
-                            (println (format "  [%d] %s/%s x%d iterations"
-                                             idx (name harness-kw) (or model "default") iters))
+                        (fn [idx wc]
+                          (let [{:keys [harness model]} (parse-model-string (:model wc))
+                                iters (or (:iterations wc) 10)
+                                custom-prompt (:prompt wc)]
+                            (println (format "[%d] Starting %s:%s..." idx (name harness) model))
                             (future
                               (try
                                 (orchestrator/run-loop! iters
                                                         (merge opts
-                                                               {:harness harness-kw
+                                                               {:harness harness
                                                                 :model model
+                                                                :review-harness (:harness review-model)
+                                                                :review-model (:model review-model)
+                                                                :custom-prompt custom-prompt
                                                                 :workers 1}))
                                 (catch Exception e
                                   (println (format "[%d] Error: %s" idx (.getMessage e))))))))
-                        worker-configs))]
+                        expanded-workers))]
         (println)
         (println "All workers launched. Waiting for completion...")
         ;; Wait for all futures
         (doseq [[idx f] (map-indexed vector futures)]
           (deref f)
-          (println (format "  [%d] completed" idx)))
+          (println (format "[%d] completed" idx)))
         (println)
         (println "Swarm complete.")))))
 

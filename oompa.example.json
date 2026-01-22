@@ -1,7 +1,18 @@
 {
+  "plan_model": "claude:opus-4.5",
+  "review_model": "codex:codex-5.2",
+
   "workers": [
-    {"harness": "codex", "model": "codex-5.2", "iterations": 10},
-    {"harness": "codex", "model": "codex-5.2-mini", "iterations": 10},
-    {"harness": "claude", "model": "opus", "iterations": 5}
+    {
+      "model": "codex:codex-5.2-mini",
+      "iterations": 10,
+      "count": 3
+    },
+    {
+      "model": "codex:codex-5.2",
+      "iterations": 5,
+      "count": 1,
+      "prompt": "prompts/senior.md"
+    }
   ]
 }

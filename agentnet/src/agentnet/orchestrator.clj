@@ -200,13 +200,20 @@
    Returns updated OrchestratorState."
   [state]
   (let [{:keys [config workers worktree-pool task-queue]} state
-        {:keys [worker-count harness model dry-run]} config
+        {:keys [worker-count harness model review-harness review-model custom-prompt dry-run]} config
         policy (load-policy)
 
+        ;; Proposer config
         agent-config {:type harness
                       :model model
                       :sandbox :workspace-write
                       :timeout-seconds 300}
+
+        ;; Reviewer config (defaults to same as proposer)
+        reviewer-config {:type (or review-harness harness)
+                         :model (or review-model model)
+                         :sandbox :workspace-write
+                         :timeout-seconds 300}
 
         context (build-context task-queue)
 
@@ -318,13 +325,18 @@
   "Convenience: create orchestrator, run, save log, shutdown.
 
    Arguments:
-     opts - {:workers N, :harness :codex|:claude, :model string, :dry-run bool}
+     opts - {:workers N, :harness :codex|:claude, :model string,
+             :review-harness keyword, :review-model string,
+             :custom-prompt string, :dry-run bool}
 
    Returns run log path"
   [opts]
   (let [config {:worker-count (or (:workers opts) 2)
                 :harness (or (:harness opts) :codex)
                 :model (:model opts)
+                :review-harness (:review-harness opts)
+                :review-model (:review-model opts)
+                :custom-prompt (:custom-prompt opts)
                 :worktree-root ".workers"
                 :dry-run (:dry-run opts false)
                 :policy (load-policy)}
