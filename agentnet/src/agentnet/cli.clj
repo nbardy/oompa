@@ -13,6 +13,8 @@
      ./agentnet.bb cleanup          # Remove all worktrees"
   (:require [agentnet.orchestrator :as orchestrator]
             [agentnet.worktree :as worktree]
+            [agentnet.worker :as worker]
+            [agentnet.tasks :as tasks]
             [agentnet.agent :as agent]
             [clojure.string :as str]
             [clojure.java.io :as io]
@@ -198,31 +200,41 @@
       (println)
       (println "Create oompa.json with format:")
       (println "{")
-      (println "  \"plan_model\": \"claude:opus-4.5\",")
       (println "  \"review_model\": \"codex:codex-5.2\",")
       (println "  \"workers\": [")
       (println "    {\"model\": \"codex:codex-5.2-mini\", \"iterations\": 10, \"count\": 3},")
-      (println "    {\"model\": \"codex:codex-5.2\", \"iterations\": 5, \"count\": 1, \"prompt\": \"prompts/senior.md\"}")
+      (println "    {\"model\": \"codex:codex-5.2\", \"iterations\": 5, \"count\": 1, \"prompt\": \"prompts/planner.md\"}")
       (println "  ]")
       (println "}")
       (System/exit 1))
     (let [config (json/parse-string (slurp f) true)
-          plan-model (some-> (:plan_model config) parse-model-string)
           review-model (some-> (:review_model config) parse-model-string)
           worker-configs (:workers config)
+
           ;; Expand worker configs by count
           expanded-workers (mapcat (fn [wc]
                                      (let [cnt (or (:count wc) 1)]
                                        (repeat cnt (dissoc wc :count))))
                                    worker-configs)
-          total-workers (count expanded-workers)]
+
+          ;; Convert to worker format
+          workers (map-indexed
+                    (fn [idx wc]
+                      (let [{:keys [harness model]} (parse-model-string (:model wc))]
+                        (worker/create-worker
+                          {:id (str "w" idx)
+                           :harness harness
+                           :model model
+                           :iterations (or (:iterations wc) 10)
+                           :custom-prompt (:prompt wc)
+                           :review-harness (:harness review-model)
+                           :review-model (:model review-model)})))
+                    expanded-workers)]
 
       (println (format "Swarm config from %s:" config-file))
-      (when plan-model
-        (println (format "  Plan:   %s:%s" (name (:harness plan-model)) (:model plan-model))))
       (when review-model
         (println (format "  Review: %s:%s" (name (:harness review-model)) (:model review-model))))
-      (println (format "  Workers: %d total" total-workers))
+      (println (format "  Workers: %d total" (count workers)))
       (doseq [[idx wc] (map-indexed vector worker-configs)]
         (let [{:keys [harness model]} (parse-model-string (:model wc))]
           (println (format "    - %dx %s:%s (%d iters%s)"
@@ -233,35 +245,27 @@
                            (if (:prompt wc) (str ", " (:prompt wc)) "")))))
       (println)
 
-      ;; Launch each expanded worker in parallel
-      (let [futures (doall
-                      (map-indexed
-                        (fn [idx wc]
-                          (let [{:keys [harness model]} (parse-model-string (:model wc))
-                                iters (or (:iterations wc) 10)
-                                custom-prompt (:prompt wc)]
-                            (println (format "[%d] Starting %s:%s..." idx (name harness) model))
-                            (future
-                              (try
-                                (orchestrator/run-loop! iters
-                                                        (merge opts
-                                                               {:harness harness
-                                                                :model model
-                                                                :review-harness (:harness review-model)
-                                                                :review-model (:model review-model)
-                                                                :custom-prompt custom-prompt
-                                                                :workers 1}))
-                                (catch Exception e
-                                  (println (format "[%d] Error: %s" idx (.getMessage e))))))))
-                        expanded-workers))]
-        (println)
-        (println "All workers launched. Waiting for completion...")
-        ;; Wait for all futures
-        (doseq [[idx f] (map-indexed vector futures)]
-          (deref f)
-          (println (format "[%d] completed" idx)))
-        (println)
-        (println "Swarm complete.")))))
+      ;; Run workers using new worker module
+      (worker/run-workers! workers))))
+
+(defn cmd-tasks
+  "Show task status"
+  [opts args]
+  (tasks/ensure-dirs!)
+  (let [status (tasks/status-summary)]
+    (println "Task Status:")
+    (println (format "  Pending:  %d" (:pending status)))
+    (println (format "  Current:  %d" (:current status)))
+    (println (format "  Complete: %d" (:complete status)))
+    (println)
+    (when (pos? (:pending status))
+      (println "Pending tasks:")
+      (doseq [t (tasks/list-pending)]
+        (println (format "  - %s: %s" (:id t) (:summary t)))))
+    (when (pos? (:current status))
+      (println "In-progress tasks:")
+      (doseq [t (tasks/list-current)]
+        (println (format "  - %s: %s" (:id t) (:summary t)))))))
 
 (defn cmd-help
   "Print usage information"
@@ -274,6 +278,7 @@
   (println "  run              Run all tasks once")
   (println "  loop N           Run N iterations")
   (println "  swarm [file]     Run multiple worker configs from oompa.json (parallel)")
+  (println "  tasks            Show task status (pending/current/complete)")
   (println "  prompt \"...\"     Run ad-hoc prompt")
   (println "  status           Show last run summary")
   (println "  worktrees        List worktree status")
@@ -302,6 +307,7 @@
   {"run" cmd-run
    "loop" cmd-loop
    "swarm" cmd-swarm
+   "tasks" cmd-tasks
    "prompt" cmd-prompt
    "status" cmd-status
    "worktrees" cmd-worktrees

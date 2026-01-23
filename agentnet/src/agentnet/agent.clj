@@ -125,6 +125,11 @@
     (re-find #"(?i)\bVIOLATION\s*:" output) :needs-changes
     :else nil))
 
+(defn done-signal?
+  "Check if output contains __DONE__ signal"
+  [output]
+  (boolean (re-find #"__DONE__" (or output ""))))
+
 (defn- extract-comments
   "Extract bullet-point comments from output"
   [output]
@@ -203,6 +208,14 @@
     (when (.exists f)
       (slurp f))))
 
+(defn load-custom-prompt
+  "Load a custom prompt file. Returns content or nil."
+  [path]
+  (when path
+    (let [f (io/file path)]
+      (when (.exists f)
+        (slurp f)))))
+
 (defn- tokenize
   "Replace {tokens} in template with values from context map"
   [template tokens]
@@ -221,22 +234,25 @@
      task    - Task map with :id, :summary, :targets
      context - Context map with :queue_md, :recent_files_md, etc.
      role    - :proposer, :reviewer, or :cto
+     opts    - {:custom-prompt \"path/to/prompt.md\"}
 
    Returns prompt string ready for agent"
-  [task context role]
-  (let [template (or (load-template role)
-                     (load-template :engineer))  ; fallback
-        tokens (merge context
-                      {:task_id (:id task)
-                       :summary (:summary task)
-                       :targets (str/join ", " (or (:targets task) ["*"]))
-                       :mode_hint (if (= role :reviewer) "review" "propose")})]
-    (if template
-      (tokenize template tokens)
-      ;; Fallback: simple prompt
-      (str "Task: " (:summary task) "\n"
-           "Targets: " (:targets task) "\n"
-           "Role: " (name role)))))
+  ([task context role] (build-prompt task context role {}))
+  ([task context role {:keys [custom-prompt]}]
+   (let [template (or (load-custom-prompt custom-prompt)
+                      (load-template role)
+                      (load-template :engineer))  ; fallback
+         tokens (merge context
+                       {:task_id (:id task)
+                        :summary (:summary task)
+                        :targets (str/join ", " (or (:targets task) ["*"]))
+                        :mode_hint (if (= role :reviewer) "review" "propose")})]
+     (if template
+       (tokenize template tokens)
+       ;; Fallback: simple prompt
+       (str "Task: " (:summary task) "\n"
+            "Targets: " (:targets task) "\n"
+            "Role: " (name role))))))
 
 ;; =============================================================================
 ;; Agent Health Check
