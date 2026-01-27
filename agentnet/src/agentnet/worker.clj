@@ -4,9 +4,12 @@
    Workers:
    1. Claim tasks from tasks/pending/ (mv → current/)
    2. Execute task in worktree
-   3. Complete task (mv current/ → complete/)
-   4. Can create new tasks in pending/
-   5. Exit on __DONE__ signal
+   3. Commit changes
+   4. Reviewer checks work (if configured)
+   5. If approved → merge to main, complete task
+   6. If rejected → fix & retry → back to reviewer
+   7. Can create new tasks in pending/
+   8. Exit on __DONE__ signal
 
    No separate orchestrator - workers self-organize."
   (:require [agentnet.tasks :as tasks]
@@ -36,6 +39,8 @@
 ;; =============================================================================
 ;; Task Execution
 ;; =============================================================================
+
+(def ^:private max-review-retries 3)
 
 (defn- build-context
   "Build context for agent prompts"
@@ -86,8 +91,139 @@
      :exit (:exit result)
      :done? (agent/done-signal? (:out result))}))
 
+(defn- run-reviewer!
+  "Run reviewer on worktree changes.
+   Returns {:verdict :approved|:needs-changes|:rejected, :comments [...]}"
+  [{:keys [review-harness review-model]} worktree-path]
+  (let [;; Get diff for context
+        diff-result (process/sh ["git" "diff" "main" "--stat"]
+                                {:dir worktree-path :out :string :err :string})
+        diff-summary (:out diff-result)
+
+        ;; Build review prompt
+        review-prompt (str "Review the changes in this worktree.\n\n"
+                           "Diff summary:\n" diff-summary "\n\n"
+                           "Check for:\n"
+                           "- Code correctness\n"
+                           "- Matches the intended task\n"
+                           "- No obvious bugs or issues\n\n"
+                           "Respond with:\n"
+                           "- APPROVED if changes are good\n"
+                           "- NEEDS_CHANGES with bullet points of issues\n"
+                           "- REJECTED if fundamentally wrong")
+
+        ;; Build command
+        cmd (case review-harness
+              :codex (cond-> ["codex" "exec" "--full-auto" "--skip-git-repo-check"
+                              "-C" worktree-path "--sandbox" "workspace-write"]
+                       review-model (into ["--model" review-model])
+                       true (conj "--" review-prompt))
+              :claude (cond-> ["claude" "-p" "--dangerously-skip-permissions"]
+                        review-model (into ["--model" review-model])))
+
+        ;; Run reviewer
+        result (try
+                 (if (= review-harness :claude)
+                   (process/sh cmd {:in review-prompt :out :string :err :string})
+                   (process/sh cmd {:out :string :err :string}))
+                 (catch Exception e
+                   {:exit -1 :out "" :err (.getMessage e)}))
+
+        output (:out result)]
+
+    {:verdict (cond
+                (re-find #"(?i)\bAPPROVED\b" output) :approved
+                (re-find #"(?i)\bREJECTED\b" output) :rejected
+                :else :needs-changes)
+     :comments (when (not= (:exit result) 0)
+                 [(:err result)])
+     :output output}))
+
+(defn- run-fix!
+  "Ask worker to fix issues based on reviewer feedback.
+   Returns {:output string, :exit int}"
+  [{:keys [harness model]} worktree-path feedback]
+  (let [fix-prompt (str "The reviewer found issues with your changes:\n\n"
+                        feedback "\n\n"
+                        "Please fix these issues in the worktree.")
+
+        cmd (case harness
+              :codex (cond-> ["codex" "exec" "--full-auto" "--skip-git-repo-check"
+                              "-C" worktree-path "--sandbox" "workspace-write"]
+                       model (into ["--model" model])
+                       true (conj "--" fix-prompt))
+              :claude (cond-> ["claude" "-p" "--dangerously-skip-permissions"]
+                        model (into ["--model" model])))
+
+        result (try
+                 (if (= harness :claude)
+                   (process/sh cmd {:in fix-prompt :out :string :err :string})
+                   (process/sh cmd {:out :string :err :string}))
+                 (catch Exception e
+                   {:exit -1 :out "" :err (.getMessage e)}))]
+
+    {:output (:out result)
+     :exit (:exit result)}))
+
+(defn- merge-to-main!
+  "Merge worktree changes to main branch"
+  [wt-path wt-id worker-id]
+  (println (format "[%s] Merging changes to main" worker-id))
+  (let [;; Commit in worktree if needed
+        _ (process/sh ["git" "add" "-A"] {:dir wt-path})
+        _ (process/sh ["git" "commit" "-m" (str "Work from " wt-id) "--allow-empty"]
+                      {:dir wt-path})
+        ;; Checkout main and merge
+        checkout-result (process/sh ["git" "checkout" "main"]
+                                    {:out :string :err :string})
+        merge-result (when (zero? (:exit checkout-result))
+                       (process/sh ["git" "merge" wt-id "--no-edit"]
+                                   {:out :string :err :string}))]
+    (and (zero? (:exit checkout-result))
+         (zero? (:exit merge-result)))))
+
+(defn- review-loop!
+  "Run review loop: reviewer checks → if issues, fix & retry → back to reviewer.
+   Returns {:approved? bool, :attempts int}"
+  [worker wt-path worker-id]
+  (if-not (and (:review-harness worker) (:review-model worker))
+    ;; No reviewer configured, auto-approve
+    {:approved? true :attempts 0}
+
+    ;; Run review loop
+    (loop [attempt 1]
+      (println (format "[%s] Review attempt %d/%d" worker-id attempt max-review-retries))
+      (let [{:keys [verdict output]} (run-reviewer! worker wt-path)]
+        (case verdict
+          :approved
+          (do
+            (println (format "[%s] Reviewer APPROVED" worker-id))
+            {:approved? true :attempts attempt})
+
+          :rejected
+          (do
+            (println (format "[%s] Reviewer REJECTED" worker-id))
+            {:approved? false :attempts attempt})
+
+          ;; :needs-changes
+          (if (>= attempt max-review-retries)
+            (do
+              (println (format "[%s] Max review retries reached" worker-id))
+              {:approved? false :attempts attempt})
+            (do
+              (println (format "[%s] Reviewer requested changes, fixing..." worker-id))
+              (run-fix! worker wt-path output)
+              (recur (inc attempt)))))))))
+
 (defn execute-iteration!
   "Execute one iteration of work.
+
+   Flow:
+   1. Create worktree
+   2. Run agent
+   3. If reviewer configured: run review loop (fix → retry → reviewer)
+   4. If approved: merge to main
+   5. Cleanup worktree
 
    Returns {:status :done|:continue|:error, :task task-or-nil}"
   [worker iteration]
@@ -121,11 +257,17 @@
             (println (format "[%s] Agent error (exit %d)" worker-id exit))
             {:status :error :exit exit})
 
-          ;; Success
+          ;; Success - run review loop before merge
           :else
-          (do
-            (println (format "[%s] Iteration %d complete" worker-id iteration))
-            {:status :continue})))
+          (let [{:keys [approved?]} (review-loop! worker wt-path worker-id)]
+            (if approved?
+              (do
+                (merge-to-main! wt-path wt-id worker-id)
+                (println (format "[%s] Iteration %d complete" worker-id iteration))
+                {:status :continue})
+              (do
+                (println (format "[%s] Iteration %d rejected, discarding" worker-id iteration))
+                {:status :continue})))))
 
       (finally
         ;; Cleanup worktree
