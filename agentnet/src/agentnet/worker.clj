@@ -20,6 +20,76 @@
             [clojure.string :as str]))
 
 ;; =============================================================================
+;; codex-persist integration
+;; =============================================================================
+
+(def ^:private persist-cmd* (atom nil))
+(def ^:private persist-missing-warned?* (atom false))
+
+(defn- command-ok?
+  "Return true if command vector is executable (exit code ignored)."
+  [cmd]
+  (try
+    (do
+      (process/sh (vec cmd) {:out :string :err :string})
+      true)
+    (catch Exception _
+      false)))
+
+(defn- resolve-codex-persist-cmd
+  "Resolve codex-persist command vector.
+   Order:
+   1) CODEX_PERSIST_BIN env var
+   2) codex-persist on PATH
+   3) node ~/git/codex-persist/dist/cli.js"
+  []
+  (let [cached @persist-cmd*]
+    (if (some? cached)
+      cached
+      (let [env-bin (System/getenv "CODEX_PERSIST_BIN")
+            env-cmd (when (and env-bin (not (str/blank? env-bin)))
+                      [env-bin])
+            path-cmd ["codex-persist"]
+            local-cli (str (System/getProperty "user.home") "/git/codex-persist/dist/cli.js")
+            local-cmd (when (.exists (io/file local-cli))
+                        ["node" local-cli])
+            cmd (cond
+                  (and env-cmd (command-ok? env-cmd)) env-cmd
+                  (command-ok? path-cmd) path-cmd
+                  (and local-cmd (command-ok? local-cmd)) local-cmd
+                  :else false)]
+        (reset! persist-cmd* cmd)
+        cmd))))
+
+(defn- safe-assistant-content
+  "Pick a non-empty assistant message payload for persistence."
+  [result]
+  (let [out (or (:out result) "")
+        err (or (:err result) "")
+        exit-code (or (:exit result) -1)]
+    (cond
+      (not (str/blank? out)) out
+      (not (str/blank? err)) (str "[agent stderr] " err)
+      :else (str "[agent exit " exit-code "]"))))
+
+(defn- persist-message!
+  "Write a single message to codex-persist; no-op if unavailable."
+  [worker-id session-id cwd role content]
+  (let [resolved (resolve-codex-persist-cmd)]
+    (if (and resolved (not= resolved false))
+      (let [persist-cmd resolved
+            payload (if (str/blank? content) "(empty)" content)
+            result (try
+                     (process/sh (into persist-cmd ["write" session-id cwd role payload])
+                                 {:out :string :err :string})
+                     (catch Exception e
+                       {:exit -1 :out "" :err (.getMessage e)}))]
+        (when-not (zero? (:exit result))
+          (println (format "[%s] codex-persist write failed (%s)" worker-id role))))
+      (when (compare-and-set! persist-missing-warned?* false true)
+        (println "[oompa] codex-persist not found; set CODEX_PERSIST_BIN or install/link codex-persist")))))
+
+;; =============================================================================
 ;; Worker State
 ;; =============================================================================
 
@@ -31,6 +101,7 @@
    :model model
    :iterations (or iterations 10)
    :custom-prompt custom-prompt
+   :persist-session-id (str/lower-case (str (java.util.UUID/randomUUID)))
    :review-harness review-harness
    :review-model review-model
    :completed 0
@@ -57,7 +128,7 @@
 
 (defn- run-agent!
   "Run agent with prompt, return {:output string, :done? bool, :exit int}"
-  [{:keys [harness model custom-prompt]} worktree-path context]
+  [{:keys [id harness model custom-prompt persist-session-id]} worktree-path context iteration]
   (let [;; Load prompt (check config/prompts/ as default)
         prompt-content (or (agent/load-custom-prompt custom-prompt)
                            (agent/load-custom-prompt "config/prompts/worker.md")
@@ -67,6 +138,11 @@
         full-prompt (str "Worktree: " worktree-path "\n"
                          "Task Status: " (:task_status context) "\n\n"
                          prompt-content)
+        abs-worktree (.getAbsolutePath (io/file worktree-path))
+        first-user? (= iteration 1)
+        user-message (if first-user?
+                       (str "[oompa] " full-prompt)
+                       full-prompt)
 
         ;; Build command
         cmd (case harness
@@ -77,6 +153,8 @@
               :claude (cond-> ["claude" "-p" "--dangerously-skip-permissions"]
                         model (into ["--model" model])))
 
+        _ (persist-message! id persist-session-id abs-worktree "user" user-message)
+
         ;; Run agent
         result (try
                  (if (= harness :claude)
@@ -86,6 +164,8 @@
                    (process/sh cmd {:out :string :err :string}))
                  (catch Exception e
                    {:exit -1 :out "" :err (.getMessage e)}))]
+
+    (persist-message! id persist-session-id abs-worktree "assistant" (safe-assistant-content result))
 
     {:output (:out result)
      :exit (:exit result)
@@ -242,7 +322,7 @@
       (let [context (build-context)
 
             ;; Run agent
-            {:keys [output exit done?]} (run-agent! worker wt-path context)]
+            {:keys [output exit done?]} (run-agent! worker wt-path context iteration)]
 
         (cond
           ;; Agent signaled done

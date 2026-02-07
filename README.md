@@ -150,6 +150,21 @@ echo "Build a simple todo API with CRUD endpoints" > spec.md
 ./swarm.bb help             # Show all commands
 ```
 
+## Worker Conversation Persistence
+
+If `codex-persist` is available, each worker writes its prompt/response messages
+to a per-worker session file for external UIs (for example worker panes in
+`claude-web-view`).
+
+- Session ID: random lowercase UUID per worker
+- First user message is prefixed with `[oompa]` (worker detection tag)
+- CWD passed to `codex-persist` is the worker worktree absolute path
+
+Resolution order for the CLI command:
+1. `CODEX_PERSIST_BIN` (if set)
+2. `codex-persist` on `PATH`
+3. `node ~/git/codex-persist/dist/cli.js`
+
 ## Requirements
 
 - [Babashka](https://github.com/babashka/babashka) (bb)
