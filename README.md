@@ -140,15 +140,32 @@ echo "Build a simple todo API with CRUD endpoints" > spec.md
 ./swarm.bb swarm
 ```
 
+## Install (npm)
+
+```bash
+# Run without installing globally
+npx @nbardy/oompa check
+npx @nbardy/oompa swarm
+```
+
+```bash
+# Or install globally
+npm install -g @nbardy/oompa
+oompa check
+oompa swarm
+```
+
 ## Commands
 
 ```bash
-./swarm.bb swarm [file]     # Run from oompa.json (default)
-./swarm.bb tasks            # Show task status
-./swarm.bb check            # Check available backends
-./swarm.bb cleanup          # Remove worktrees
-./swarm.bb help             # Show all commands
+oompa swarm [file]          # Run from oompa.json (default)
+oompa tasks                 # Show task status
+oompa check                 # Check available backends
+oompa cleanup               # Remove worktrees
+oompa help                  # Show all commands
 ```
+
+`./swarm.bb ...` works the same when running from a source checkout.
 
 ## Worker Conversation Persistence
 
@@ -168,6 +185,7 @@ Resolution order for the CLI command:
 
 ## Requirements
 
+- Node.js 18+ (only for npm wrapper / npx usage)
 - [Babashka](https://github.com/babashka/babashka) (bb)
 - Git 2.5+ (for worktrees)
 - One of:

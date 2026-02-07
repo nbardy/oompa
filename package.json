@@ -1,0 +1,45 @@
+{
+  "name": "@nbardy/oompa",
+  "version": "0.1.0",
+  "description": "Git-worktree multi-agent swarm orchestrator for Codex and Claude",
+  "license": "MIT",
+  "type": "commonjs",
+  "bin": {
+    "oompa": "bin/oompa.js"
+  },
+  "files": [
+    "bin/",
+    "swarm.bb",
+    "agentnet/src/",
+    "config/prompts/",
+    "oompa.example.json",
+    "README.md"
+  ],
+  "scripts": {
+    "check": "node bin/oompa.js check",
+    "help": "node bin/oompa.js help",
+    "pack:dry": "npm pack --dry-run"
+  },
+  "engines": {
+    "node": ">=18"
+  },
+  "keywords": [
+    "agents",
+    "swarm",
+    "worktree",
+    "codex",
+    "claude",
+    "babashka"
+  ],
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/nbardy/oompa.git"
+  },
+  "bugs": {
+    "url": "https://github.com/nbardy/oompa/issues"
+  },
+  "homepage": "https://github.com/nbardy/oompa#readme",
+  "publishConfig": {
+    "access": "public"
+  }
+}
