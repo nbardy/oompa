@@ -2,15 +2,15 @@
   "Command-line interface for AgentNet orchestrator.
 
    Usage:
-     ./agentnet.bb run              # Run all tasks once
-     ./agentnet.bb run --workers 4  # With 4 parallel workers
-     ./agentnet.bb run --claude     # Use Claude instead of Codex
-     ./agentnet.bb run --dry-run    # Don't actually merge
-     ./agentnet.bb loop 20          # Run 20 iterations
-     ./agentnet.bb prompt \"...\"     # Ad-hoc task
-     ./agentnet.bb status           # Show last run
-     ./agentnet.bb worktrees        # List worktree status
-     ./agentnet.bb cleanup          # Remove all worktrees"
+     ./swarm.bb run                                    # Run all tasks once
+     ./swarm.bb run --workers 4                        # With 4 parallel workers
+     ./swarm.bb loop 20 --harness claude               # 20 iterations with Claude
+     ./swarm.bb loop --workers claude:5 codex:4 --iterations 20  # Mixed harnesses
+     ./swarm.bb swarm oompa.json                       # Multi-model from config
+     ./swarm.bb prompt \"...\"                          # Ad-hoc task
+     ./swarm.bb status                                 # Show last run
+     ./swarm.bb worktrees                              # List worktree status
+     ./swarm.bb cleanup                                # Remove all worktrees"
   (:require [agentnet.orchestrator :as orchestrator]
             [agentnet.worktree :as worktree]
             [agentnet.worker :as worker]
@@ -29,17 +29,65 @@
     (Integer/parseInt s)
     (catch Exception _ default)))
 
+(defn- make-swarm-id
+  "Generate a short run-level swarm ID."
+  []
+  (subs (str (java.util.UUID/randomUUID)) 0 8))
+
+(defn- parse-worker-spec
+  "Parse 'harness:count' into {:harness :claude, :count 5}.
+   Throws on invalid format."
+  [s]
+  (let [[harness count-str] (str/split s #":" 2)
+        h (keyword harness)
+        cnt (parse-int count-str 0)]
+    (when-not (#{:codex :claude} h)
+      (throw (ex-info (str "Unknown harness in worker spec: " s ". Use 'codex:N' or 'claude:N'") {})))
+    (when (zero? cnt)
+      (throw (ex-info (str "Invalid count in worker spec: " s ". Use format 'harness:count'") {})))
+    {:harness h :count cnt}))
+
+(defn- worker-spec? [s]
+  "Check if string looks like 'harness:count' format"
+  (and (string? s)
+       (not (str/starts-with? s "--"))
+       (str/includes? s ":")
+       (re-matches #"[a-z]+:\d+" s)))
+
+(defn- collect-worker-specs
+  "Collect consecutive worker specs from args. Returns [specs remaining-args]."
+  [args]
+  (loop [specs []
+         remaining args]
+    (if-let [arg (first remaining)]
+      (if (worker-spec? arg)
+        (recur (conj specs (parse-worker-spec arg)) (next remaining))
+        [specs remaining])
+      [specs remaining])))
+
 (defn parse-args [args]
   (loop [opts {:workers 2
                :harness :codex
                :model nil
                :dry-run false
-               :iterations 1}
+               :iterations 1
+               :worker-specs nil}
          remaining args]
     (if-let [arg (first remaining)]
       (cond
+        ;; --workers can take either N or harness:count specs
         (= arg "--workers")
-        (recur (assoc opts :workers (parse-int (second remaining) 2))
+        (let [next-arg (second remaining)]
+          (if (worker-spec? next-arg)
+            ;; Collect all worker specs: --workers claude:5 codex:4
+            (let [[specs rest] (collect-worker-specs (next remaining))]
+              (recur (assoc opts :worker-specs specs) rest))
+            ;; Simple count: --workers 4
+            (recur (assoc opts :workers (parse-int next-arg 2))
+                   (nnext remaining))))
+
+        (= arg "--iterations")
+        (recur (assoc opts :iterations (parse-int (second remaining) 1))
                (nnext remaining))
 
         (= arg "--harness")
@@ -87,18 +135,67 @@
 (defn cmd-run
   "Run orchestrator once"
   [opts args]
-  (orchestrator/run-once! opts))
+  (let [swarm-id (make-swarm-id)]
+    (if-let [specs (:worker-specs opts)]
+    ;; Mixed worker specs: --workers claude:5 codex:4
+    (let [workers (mapcat
+                    (fn [spec]
+                      (let [{:keys [harness count]} spec]
+                        (map-indexed
+                          (fn [idx _]
+                            (worker/create-worker
+                              {:id (format "%s-%d" (name harness) idx)
+                               :swarm-id swarm-id
+                               :harness harness
+                               :model (:model opts)
+                               :iterations 1}))
+                          (range count))))
+                    specs)]
+      (println (format "Running once with mixed workers (swarm %s):" swarm-id))
+      (doseq [spec specs]
+        (println (format "  %dx %s" (:count spec) (name (:harness spec)))))
+      (println)
+      (worker/run-workers! workers))
+    ;; Simple mode
+    (do
+      (println (format "Swarm ID: %s" swarm-id))
+      (orchestrator/run-once! (assoc opts :swarm-id swarm-id))))))
 
 (defn cmd-loop
   "Run orchestrator N times"
   [opts args]
-  (let [iterations (parse-int (first args) 20)
-        model-str (if (:model opts)
-                    (format " (model: %s)" (:model opts))
-                    "")]
-    (println (format "Starting %d iterations with %s harness%s..."
-                     iterations (name (:harness opts)) model-str))
-    (orchestrator/run-loop! iterations opts)))
+  (let [swarm-id (make-swarm-id)
+        iterations (or (some-> (first args) (parse-int nil))
+                       (:iterations opts)
+                       20)]
+    (if-let [specs (:worker-specs opts)]
+      ;; Mixed worker specs: --workers claude:5 codex:4
+      (let [workers (mapcat
+                      (fn [spec]
+                        (let [{:keys [harness count]} spec]
+                          (map-indexed
+                            (fn [idx _]
+                              (worker/create-worker
+                                {:id (format "%s-%d" (name harness) idx)
+                                 :swarm-id swarm-id
+                                 :harness harness
+                                 :model (:model opts)
+                                 :iterations iterations}))
+                            (range count))))
+                      specs)]
+        (println (format "Starting %d iterations with mixed workers (swarm %s):" iterations swarm-id))
+        (doseq [spec specs]
+          (println (format "  %dx %s" (:count spec) (name (:harness spec)))))
+        (println)
+        (worker/run-workers! workers))
+      ;; Simple mode: --workers N --harness X
+      (let [model-str (if (:model opts)
+                        (format " (model: %s)" (:model opts))
+                        "")]
+        (println (format "Starting %d iterations with %s harness%s..."
+                         iterations (name (:harness opts)) model-str))
+        (println (format "Swarm ID: %s" swarm-id))
+        (orchestrator/run-loop! iterations (assoc opts :swarm-id swarm-id))))))
 
 (defn cmd-prompt
   "Run ad-hoc prompt as single task"
@@ -194,7 +291,8 @@
   "Run multiple worker configs from oompa.json in parallel"
   [opts args]
   (let [config-file (or (first args) "oompa.json")
-        f (io/file config-file)]
+        f (io/file config-file)
+        swarm-id (make-swarm-id)]
     (when-not (.exists f)
       (println (format "Config file not found: %s" config-file))
       (println)
@@ -223,6 +321,7 @@
                       (let [{:keys [harness model]} (parse-model-string (:model wc))]
                         (worker/create-worker
                           {:id (str "w" idx)
+                           :swarm-id swarm-id
                            :harness harness
                            :model model
                            :iterations (or (:iterations wc) 10)
@@ -232,6 +331,7 @@
                     expanded-workers)]
 
       (println (format "Swarm config from %s:" config-file))
+      (println (format "  Swarm ID: %s" swarm-id))
       (when review-model
         (println (format "  Review: %s:%s" (name (:harness review-model)) (:model review-model))))
       (println (format "  Workers: %d total" (count workers)))
@@ -288,15 +388,17 @@
   (println "  help             Show this help")
   (println)
   (println "Options:")
-  (println "  --workers N          Number of parallel workers (default: 2)")
-  (println "  --harness {codex,claude}  Agent harness to use (default: codex)")
-  (println "  --model MODEL        Model to use (e.g., codex-5.2, codex-5.2-mini, opus)")
-  (println "  --dry-run            Skip actual merges")
-  (println "  --keep-worktrees     Don't cleanup worktrees after run")
+  (println "  --workers N              Number of parallel workers (default: 2)")
+  (println "  --workers H:N [H:N ...]  Mixed workers by harness (e.g., claude:5 codex:4)")
+  (println "  --iterations N           Number of iterations per worker (default: 1)")
+  (println "  --harness {codex,claude} Agent harness to use (default: codex)")
+  (println "  --model MODEL            Model to use (e.g., codex-5.2, opus-4.5)")
+  (println "  --dry-run                Skip actual merges")
+  (println "  --keep-worktrees         Don't cleanup worktrees after run")
   (println)
   (println "Examples:")
   (println "  ./swarm.bb loop 10 --harness codex --model codex-5.2-mini --workers 3")
-  (println "  ./swarm.bb loop 5 --harness claude --model opus --workers 2")
+  (println "  ./swarm.bb loop --workers claude:5 codex:4 --iterations 20")
   (println "  ./swarm.bb swarm oompa.json  # Run multi-model config"))
 
 ;; =============================================================================

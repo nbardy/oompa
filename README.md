@@ -156,9 +156,10 @@ If `codex-persist` is available, each worker writes its prompt/response messages
 to a per-worker session file for external UIs (for example worker panes in
 `claude-web-view`).
 
-- Session ID: random lowercase UUID per worker
-- First user message is prefixed with `[oompa]` (worker detection tag)
+- Session ID: random lowercase UUID per iteration (one file per iteration)
+- First user message tag format: `[oompa:<swarmId>:<workerId>]`
 - CWD passed to `codex-persist` is the worker worktree absolute path
+- Codex workers use `codex-persist` writes; Claude workers use native `--session-id`
 
 Resolution order for the CLI command:
 1. `CODEX_PERSIST_BIN` (if set)

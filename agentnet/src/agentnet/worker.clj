@@ -31,7 +31,7 @@
   [cmd]
   (try
     (do
-      (process/sh (vec cmd) {:out :string :err :string})
+      (process/sh (vec cmd) {:out :string :err :string :continue true})
       true)
     (catch Exception _
       false)))
@@ -95,13 +95,13 @@
 
 (defn create-worker
   "Create a worker config"
-  [{:keys [id harness model iterations custom-prompt review-harness review-model]}]
+  [{:keys [id swarm-id harness model iterations custom-prompt review-harness review-model]}]
   {:id id
+   :swarm-id swarm-id
    :harness (or harness :codex)
    :model model
    :iterations (or iterations 10)
    :custom-prompt custom-prompt
-   :persist-session-id (str/lower-case (str (java.util.UUID/randomUUID)))
    :review-harness review-harness
    :review-model review-model
    :completed 0
@@ -128,7 +128,7 @@
 
 (defn- run-agent!
   "Run agent with prompt, return {:output string, :done? bool, :exit int}"
-  [{:keys [id harness model custom-prompt persist-session-id]} worktree-path context iteration]
+  [{:keys [id swarm-id harness model custom-prompt]} worktree-path context]
   (let [;; Load prompt (check config/prompts/ as default)
         prompt-content (or (agent/load-custom-prompt custom-prompt)
                            (agent/load-custom-prompt "config/prompts/worker.md")
@@ -138,11 +138,10 @@
         full-prompt (str "Worktree: " worktree-path "\n"
                          "Task Status: " (:task_status context) "\n\n"
                          prompt-content)
+        session-id (str/lower-case (str (java.util.UUID/randomUUID)))
+        swarm-id* (or swarm-id "unknown")
+        tagged-prompt (str "[oompa:" swarm-id* ":" id "] " full-prompt)
         abs-worktree (.getAbsolutePath (io/file worktree-path))
-        first-user? (= iteration 1)
-        user-message (if first-user?
-                       (str "[oompa] " full-prompt)
-                       full-prompt)
 
         ;; Build command
         cmd (case harness
@@ -150,22 +149,25 @@
                               "-C" worktree-path "--sandbox" "workspace-write"]
                        model (into ["--model" model])
                        true (conj "--" full-prompt))
-              :claude (cond-> ["claude" "-p" "--dangerously-skip-permissions"]
+              :claude (cond-> ["claude" "-p" "--dangerously-skip-permissions"
+                               "--session-id" session-id]
                         model (into ["--model" model])))
 
-        _ (persist-message! id persist-session-id abs-worktree "user" user-message)
+        _ (when (= harness :codex)
+            (persist-message! id session-id abs-worktree "user" tagged-prompt))
 
         ;; Run agent
         result (try
                  (if (= harness :claude)
                    ;; Claude reads from stdin
-                   (process/sh cmd {:in full-prompt :out :string :err :string})
+                   (process/sh cmd {:in tagged-prompt :out :string :err :string})
                    ;; Codex takes prompt as arg
                    (process/sh cmd {:out :string :err :string}))
                  (catch Exception e
                    {:exit -1 :out "" :err (.getMessage e)}))]
 
-    (persist-message! id persist-session-id abs-worktree "assistant" (safe-assistant-content result))
+    (when (= harness :codex)
+      (persist-message! id session-id abs-worktree "assistant" (safe-assistant-content result)))
 
     {:output (:out result)
      :exit (:exit result)
@@ -322,7 +324,7 @@
       (let [context (build-context)
 
             ;; Run agent
-            {:keys [output exit done?]} (run-agent! worker wt-path context iteration)]
+            {:keys [output exit done?]} (run-agent! worker wt-path context)]
 
         (cond
           ;; Agent signaled done
