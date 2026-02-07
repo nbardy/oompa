@@ -281,18 +281,18 @@
 
 (defn- merge-to-main!
   "Merge worktree changes to main branch"
-  [wt-path wt-id worker-id]
+  [wt-path wt-id worker-id project-root]
   (println (format "[%s] Merging changes to main" worker-id))
   (let [;; Commit in worktree if needed
         _ (process/sh ["git" "add" "-A"] {:dir wt-path})
         _ (process/sh ["git" "commit" "-m" (str "Work from " wt-id) "--allow-empty"]
                       {:dir wt-path})
-        ;; Checkout main and merge
+        ;; Checkout main and merge (in project root, not worktree)
         checkout-result (process/sh ["git" "checkout" "main"]
-                                    {:out :string :err :string})
+                                    {:dir project-root :out :string :err :string})
         merge-result (when (zero? (:exit checkout-result))
                        (process/sh ["git" "merge" wt-id "--no-edit"]
-                                   {:out :string :err :string}))]
+                                   {:dir project-root :out :string :err :string}))]
     (and (zero? (:exit checkout-result))
          (zero? (:exit merge-result)))))
 
@@ -342,15 +342,17 @@
    Returns {:status :done|:continue|:error, :task task-or-nil}"
   [worker iteration total-iterations]
   (let [worker-id (:id worker)
-        wt-id (format ".w%s-i%d" worker-id iteration)
+        project-root (System/getProperty "user.dir")
+        wt-dir (format ".w%s-i%d" worker-id iteration)
+        wt-branch (format "oompa/%s-i%d" worker-id iteration)
 
         ;; Create worktree
         _ (println (format "[%s] Starting iteration %d/%d" worker-id iteration total-iterations))
-        wt-path (str (System/getProperty "user.dir") "/" wt-id)]
+        wt-path (str project-root "/" wt-dir)]
 
     (try
-      ;; Setup worktree
-      (process/sh ["git" "worktree" "add" wt-id "-b" wt-id])
+      ;; Setup worktree (in project root) — dir starts with . but branch name must be valid
+      (process/sh ["git" "worktree" "add" wt-dir "-b" wt-branch] {:dir project-root})
 
       ;; Build context
       (let [context (build-context)
@@ -376,7 +378,7 @@
           (let [{:keys [approved?]} (review-loop! worker wt-path worker-id)]
             (if approved?
               (do
-                (merge-to-main! wt-path wt-id worker-id)
+                (merge-to-main! wt-path wt-branch worker-id project-root)
                 (println (format "[%s] Iteration %d/%d complete" worker-id iteration total-iterations))
                 {:status :continue})
               (do
@@ -384,8 +386,8 @@
                 {:status :continue})))))
 
       (finally
-        ;; Cleanup worktree
-        (process/sh ["git" "worktree" "remove" wt-id "--force"])))))
+        ;; Cleanup worktree (in project root)
+        (process/sh ["git" "worktree" "remove" wt-dir "--force"] {:dir project-root})))))
 
 ;; =============================================================================
 ;; Worker Loop
