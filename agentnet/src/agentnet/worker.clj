@@ -69,13 +69,12 @@
                          prompt-content)
 
         ;; Build command
-        provider-cmd (agent/provider-command harness)
         cmd (case harness
-              :codex (cond-> [provider-cmd "exec" "--full-auto" "--skip-git-repo-check"
+              :codex (cond-> ["codex" "exec" "--full-auto" "--skip-git-repo-check"
                               "-C" worktree-path "--sandbox" "workspace-write"]
                        model (into ["--model" model])
                        true (conj "--" full-prompt))
-              :claude (cond-> [provider-cmd "-p" "--dangerously-skip-permissions"]
+              :claude (cond-> ["claude" "-p" "--dangerously-skip-permissions"]
                         model (into ["--model" model])))
 
         ;; Run agent
@@ -114,13 +113,12 @@
                            "- REJECTED if fundamentally wrong")
 
         ;; Build command
-        provider-cmd (agent/provider-command review-harness)
         cmd (case review-harness
-              :codex (cond-> [provider-cmd "exec" "--full-auto" "--skip-git-repo-check"
+              :codex (cond-> ["codex" "exec" "--full-auto" "--skip-git-repo-check"
                               "-C" worktree-path "--sandbox" "workspace-write"]
                        review-model (into ["--model" review-model])
                        true (conj "--" review-prompt))
-              :claude (cond-> [provider-cmd "-p" "--dangerously-skip-permissions"]
+              :claude (cond-> ["claude" "-p" "--dangerously-skip-permissions"]
                         review-model (into ["--model" review-model])))
 
         ;; Run reviewer
@@ -150,11 +148,11 @@
                         "Please fix these issues in the worktree.")
 
         cmd (case harness
-              :codex (cond-> [(agent/provider-command :codex) "exec" "--full-auto" "--skip-git-repo-check"
+              :codex (cond-> ["codex" "exec" "--full-auto" "--skip-git-repo-check"
                               "-C" worktree-path "--sandbox" "workspace-write"]
                        model (into ["--model" model])
                        true (conj "--" fix-prompt))
-              :claude (cond-> [(agent/provider-command :claude) "-p" "--dangerously-skip-permissions"]
+              :claude (cond-> ["claude" "-p" "--dangerously-skip-permissions"]
                         model (into ["--model" model])))
 
         result (try
