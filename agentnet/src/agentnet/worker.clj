@@ -187,6 +187,7 @@
                    (process/sh cmd {:dir abs-worktree :in tagged-prompt :out :string :err :string})
                    (process/sh cmd {:dir abs-worktree :out :string :err :string}))
                  (catch Exception e
+                   (println (format "[%s] Agent exception: %s" id (.getMessage e)))
                    {:exit -1 :out "" :err (.getMessage e)}))]
 
     (when (= harness :codex)
@@ -367,7 +368,7 @@
           ;; Agent errored
           (not (zero? exit))
           (do
-            (println (format "[%s] Agent error (exit %d)" worker-id exit))
+            (println (format "[%s] Agent error (exit %d): %s" worker-id exit (subs (or output "") 0 (min 200 (count (or output ""))))))
             {:status :error :exit exit})
 
           ;; Success - run review loop before merge
