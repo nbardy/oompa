@@ -18,7 +18,7 @@ if (!fs.existsSync(swarmScript) || !fs.existsSync(classpath)) {
 const result = spawnSync("bb", ["--classpath", classpath, swarmScript, ...argv], {
   stdio: "inherit",
   cwd: process.cwd(),
-  env: process.env
+  env: { ...process.env, OOMPA_PACKAGE_ROOT: packageRoot }
 });
 
 if (result.error) {

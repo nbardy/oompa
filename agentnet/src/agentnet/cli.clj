@@ -300,10 +300,12 @@
       (println "{")
       (println "  \"review_model\": \"codex:codex-5.2\",")
       (println "  \"workers\": [")
-      (println "    {\"model\": \"codex:codex-5.2-mini\", \"iterations\": 10, \"count\": 3},")
-      (println "    {\"model\": \"codex:codex-5.2\", \"iterations\": 5, \"count\": 1, \"prompt\": \"prompts/planner.md\"}")
+      (println "    {\"model\": \"codex:codex-5.2-mini\", \"prompt\": \"prompts/executor.md\", \"iterations\": 10, \"count\": 3},")
+      (println "    {\"model\": \"claude:opus-4.5\", \"prompt\": [\"prompts/base.md\", \"prompts/planner.md\"], \"count\": 1}")
       (println "  ]")
       (println "}")
+      (println)
+      (println "prompt: string or array of paths — concatenated into one prompt.")
       (System/exit 1))
     (let [config (json/parse-string (slurp f) true)
           review-model (some-> (:review_model config) parse-model-string)
@@ -325,7 +327,7 @@
                            :harness harness
                            :model model
                            :iterations (or (:iterations wc) 10)
-                           :custom-prompt (:prompt wc)
+                           :prompts (:prompt wc)
                            :review-harness (:harness review-model)
                            :review-model (:model review-model)})))
                     expanded-workers)]

@@ -4,15 +4,15 @@
   "workers": [
     {
       "model": "claude:opus-4.5",
+      "prompt": ["config/prompts/planner.md"],
       "iterations": 5,
-      "count": 1,
-      "prompt": "config/prompts/planner.md"
+      "count": 1
     },
     {
       "model": "codex:codex-5.2-mini",
+      "prompt": ["config/prompts/executor.md"],
       "iterations": 10,
-      "count": 3,
-      "prompt": "config/prompts/executor.md"
+      "count": 3
     }
   ]
 }

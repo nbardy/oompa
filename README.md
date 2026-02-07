@@ -79,25 +79,50 @@ This repo has a fleshed out version of the idea. The oompa loompas are organized
 
 ### Configuration
 
-**oompa.json**:
+**oompa.json** — the only file you need:
 ```json
 {
   "review_model": "codex:codex-5.2",
   "workers": [
-    {"model": "claude:opus-4.5", "iterations": 5, "count": 1, "prompt": "config/prompts/planner.md"},
-    {"model": "codex:codex-5.2-mini", "iterations": 10, "count": 3, "prompt": "config/prompts/executor.md"}
+    {"model": "claude:opus-4.5", "prompt": ["config/prompts/planner.md"], "iterations": 5, "count": 1},
+    {"model": "codex:codex-5.2-mini", "prompt": ["config/prompts/executor.md"], "iterations": 10, "count": 3}
   ]
 }
 ```
 
 This spawns:
-- **1 planner** (opus) — creates tasks, doesn't write code
+- **1 planner** (opus) — reads spec, explores codebase, creates/refines tasks
 - **3 executors** (mini) — claims and executes tasks fast
 - **Reviews** done by codex-5.2 before any merge
 
+#### Worker fields
+
+| Field | Required | Description |
+|-------|----------|-------------|
+| `model` | yes | `harness:model` (e.g. `claude:opus-4.5`, `codex:codex-5.2-mini`) |
+| `prompt` | no | String or array of paths — concatenated into one prompt |
+| `iterations` | no | Max iterations per worker (default: 10) |
+| `count` | no | Number of workers with this config (default: 1) |
+
+#### Composable prompts
+
+`prompt` accepts a string or an array. Arrays get concatenated, so you can reuse a shared base across workers:
+
+```json
+{
+  "workers": [
+    {"model": "claude:opus-4.5", "prompt": ["prompts/base.md", "prompts/architect.md"], "count": 1},
+    {"model": "codex:codex-5.2-mini", "prompt": ["prompts/base.md", "prompts/frontend.md"], "count": 2},
+    {"model": "codex:codex-5.2-mini", "prompt": ["prompts/base.md", "prompts/backend.md"], "count": 2}
+  ]
+}
+```
+
+Every worker automatically gets task management instructions injected above your prompts. Your prompts just say *what* the worker should do — the framework handles *how* tasks work.
+
 ### Task System
 
-Workers self-organize via filesystem:
+Workers self-organize via the filesystem. Tasks live at the project root and are shared across all worktrees:
 
 ```
 tasks/
@@ -106,20 +131,31 @@ tasks/
 └── complete/*.edn    # done
 ```
 
-Workers can:
-- **Claim tasks**: `mv pending/task.edn current/`
-- **Complete tasks**: `mv current/task.edn complete/`
-- **Create tasks**: write new `.edn` to `pending/`
+From inside a worktree, workers reach tasks via `../tasks/`:
+- **See tasks**: `ls ../tasks/pending/`
+- **Claim**: `mv ../tasks/pending/task.edn ../tasks/current/`
+- **Complete**: `mv ../tasks/current/task.edn ../tasks/complete/`
+- **Create**: write new `.edn` to `../tasks/pending/`
 
-### Prompts
+Task file format:
+```edn
+{:id "task-001"
+ :summary "Add user authentication"
+ :description "Implement JWT-based auth for the API"
+ :difficulty :medium
+ :files ["src/auth.py" "tests/test_auth.py"]
+ :acceptance ["Login endpoint returns token" "Tests pass"]}
+```
 
-Three built-in worker types:
+### Bundled Prompts
 
-| Prompt | Role | Creates Tasks? | Executes Tasks? |
-|--------|------|----------------|-----------------|
-| `worker.md` | Hybrid | ✓ | ✓ |
-| `planner.md` | Planner | ✓ | ✗ |
-| `executor.md` | Executor | ✗ | ✓ |
+Three prompt files ship with oompa that you can use in your `prompt` arrays:
+
+| Prompt | Creates Tasks? | Executes Tasks? | Best For |
+|--------|----------------|-----------------|----------|
+| `config/prompts/worker.md` (default) | yes | yes | General purpose |
+| `config/prompts/planner.md` | yes | sometimes | Big models — task design |
+| `config/prompts/executor.md` | no | yes | Small/fast models — heads-down work |
 
 ---
 

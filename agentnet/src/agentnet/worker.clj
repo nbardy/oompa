@@ -93,15 +93,29 @@
 ;; Worker State
 ;; =============================================================================
 
+(def ^:private package-root
+  "Root of the oompa package — set by bin/oompa.js, falls back to cwd."
+  (or (System/getenv "OOMPA_PACKAGE_ROOT") "."))
+
+(defn- load-prompt
+  "Load a prompt file. Tries path as-is first, then from package root."
+  [path]
+  (or (agent/load-custom-prompt path)
+      (agent/load-custom-prompt (str package-root "/" path))))
+
 (defn create-worker
-  "Create a worker config"
-  [{:keys [id swarm-id harness model iterations custom-prompt review-harness review-model]}]
+  "Create a worker config.
+   :prompts is a string or vector of strings — paths to prompt files."
+  [{:keys [id swarm-id harness model iterations prompts review-harness review-model]}]
   {:id id
    :swarm-id swarm-id
    :harness (or harness :codex)
    :model model
    :iterations (or iterations 10)
-   :custom-prompt custom-prompt
+   :prompts (cond
+              (vector? prompts) prompts
+              (string? prompts) [prompts]
+              :else [])
    :review-harness review-harness
    :review-model review-model
    :completed 0
@@ -128,25 +142,36 @@
 
 (defn- run-agent!
   "Run agent with prompt, return {:output string, :done? bool, :exit int}"
-  [{:keys [id swarm-id harness model custom-prompt]} worktree-path context]
-  (let [;; Load prompt (check config/prompts/ as default)
-        prompt-content (or (agent/load-custom-prompt custom-prompt)
-                           (agent/load-custom-prompt "config/prompts/worker.md")
-                           "Goal: Match spec.md\nProcess: Create/claim tasks in tasks/{pending,current,complete}/*.edn\nMethod: Isolate changes to your worktree, commit and merge when complete")
+  [{:keys [id swarm-id harness model prompts]} worktree-path context]
+  (let [;; 1. Task header (always, from package)
+        task-header (or (load-prompt "config/prompts/_task_header.md") "")
 
-        ;; Inject worktree and context
-        full-prompt (str "Worktree: " worktree-path "\n"
-                         "Task Status: " (:task_status context) "\n\n"
-                         prompt-content)
+        ;; 2. Load and concatenate all user prompts (string or list)
+        user-prompts (if (seq prompts)
+                       (->> prompts
+                            (map load-prompt)
+                            (remove nil?)
+                            (str/join "\n\n"))
+                       (or (load-prompt "config/prompts/worker.md")
+                           "You are a worker. Claim tasks, execute them, complete them."))
+
+        ;; Assemble: task header + status + user prompts
+        full-prompt (str task-header "\n"
+                         "Task Status: " (:task_status context) "\n"
+                         "Pending: " (:pending_tasks context) "\n\n"
+                         user-prompts)
         session-id (str/lower-case (str (java.util.UUID/randomUUID)))
         swarm-id* (or swarm-id "unknown")
         tagged-prompt (str "[oompa:" swarm-id* ":" id "] " full-prompt)
         abs-worktree (.getAbsolutePath (io/file worktree-path))
 
-        ;; Build command
+        ;; Build command — both harnesses run with cwd=worktree, no sandbox
+        ;; so agents can `..` to reach project root for task management
         cmd (case harness
-              :codex (cond-> ["codex" "exec" "--full-auto" "--skip-git-repo-check"
-                              "-C" worktree-path "--sandbox" "workspace-write"]
+              :codex (cond-> ["codex" "exec"
+                              "--dangerously-bypass-approvals-and-sandbox"
+                              "--skip-git-repo-check"
+                              "-C" abs-worktree]
                        model (into ["--model" model])
                        true (conj "--" full-prompt))
               :claude (cond-> ["claude" "-p" "--dangerously-skip-permissions"
@@ -156,13 +181,11 @@
         _ (when (= harness :codex)
             (persist-message! id session-id abs-worktree "user" tagged-prompt))
 
-        ;; Run agent
+        ;; Run agent — both run with cwd=worktree
         result (try
                  (if (= harness :claude)
-                   ;; Claude reads from stdin
-                   (process/sh cmd {:in tagged-prompt :out :string :err :string})
-                   ;; Codex takes prompt as arg
-                   (process/sh cmd {:out :string :err :string}))
+                   (process/sh cmd {:dir abs-worktree :in tagged-prompt :out :string :err :string})
+                   (process/sh cmd {:dir abs-worktree :out :string :err :string}))
                  (catch Exception e
                    {:exit -1 :out "" :err (.getMessage e)}))]
 
@@ -194,20 +217,24 @@
                            "- NEEDS_CHANGES with bullet points of issues\n"
                            "- REJECTED if fundamentally wrong")
 
-        ;; Build command
+        abs-wt (.getAbsolutePath (io/file worktree-path))
+
+        ;; Build command — cwd=worktree, no sandbox
         cmd (case review-harness
-              :codex (cond-> ["codex" "exec" "--full-auto" "--skip-git-repo-check"
-                              "-C" worktree-path "--sandbox" "workspace-write"]
+              :codex (cond-> ["codex" "exec"
+                              "--dangerously-bypass-approvals-and-sandbox"
+                              "--skip-git-repo-check"
+                              "-C" abs-wt]
                        review-model (into ["--model" review-model])
                        true (conj "--" review-prompt))
               :claude (cond-> ["claude" "-p" "--dangerously-skip-permissions"]
                         review-model (into ["--model" review-model])))
 
-        ;; Run reviewer
+        ;; Run reviewer — cwd=worktree
         result (try
                  (if (= review-harness :claude)
-                   (process/sh cmd {:in review-prompt :out :string :err :string})
-                   (process/sh cmd {:out :string :err :string}))
+                   (process/sh cmd {:dir abs-wt :in review-prompt :out :string :err :string})
+                   (process/sh cmd {:dir abs-wt :out :string :err :string}))
                  (catch Exception e
                    {:exit -1 :out "" :err (.getMessage e)}))
 
@@ -229,9 +256,13 @@
                         feedback "\n\n"
                         "Please fix these issues in the worktree.")
 
+        abs-wt (.getAbsolutePath (io/file worktree-path))
+
         cmd (case harness
-              :codex (cond-> ["codex" "exec" "--full-auto" "--skip-git-repo-check"
-                              "-C" worktree-path "--sandbox" "workspace-write"]
+              :codex (cond-> ["codex" "exec"
+                              "--dangerously-bypass-approvals-and-sandbox"
+                              "--skip-git-repo-check"
+                              "-C" abs-wt]
                        model (into ["--model" model])
                        true (conj "--" fix-prompt))
               :claude (cond-> ["claude" "-p" "--dangerously-skip-permissions"]
@@ -239,8 +270,8 @@
 
         result (try
                  (if (= harness :claude)
-                   (process/sh cmd {:in fix-prompt :out :string :err :string})
-                   (process/sh cmd {:out :string :err :string}))
+                   (process/sh cmd {:dir abs-wt :in fix-prompt :out :string :err :string})
+                   (process/sh cmd {:dir abs-wt :out :string :err :string}))
                  (catch Exception e
                    {:exit -1 :out "" :err (.getMessage e)}))]
 
