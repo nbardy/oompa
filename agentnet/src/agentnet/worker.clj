@@ -393,6 +393,26 @@
 ;; Worker Loop
 ;; =============================================================================
 
+(def ^:private max-wait-for-tasks 60)
+(def ^:private wait-poll-interval 5)
+
+(defn- wait-for-tasks!
+  "Wait up to max-wait-for-tasks seconds for pending tasks to appear.
+   Returns true if tasks found, false if timed out."
+  [worker-id]
+  (loop [waited 0]
+    (cond
+      (pos? (tasks/pending-count)) true
+      (pos? (tasks/current-count)) true
+      (>= waited max-wait-for-tasks)
+      (do (println (format "[%s] No tasks after %ds, proceeding anyway" worker-id waited))
+          false)
+      :else
+      (do (when (zero? (mod waited 15))
+            (println (format "[%s] Waiting for tasks... (%ds)" worker-id waited)))
+          (Thread/sleep (* wait-poll-interval 1000))
+          (recur (+ waited wait-poll-interval))))))
+
 (defn run-worker!
   "Run worker loop until done or iterations exhausted.
 
@@ -405,6 +425,13 @@
                      (name (:harness worker))
                      (or (:model worker) "default")
                      iterations))
+
+    ;; Wait for tasks before first iteration — but not if this worker creates tasks
+    ;; (planner/worker prompts). Only executors need to wait.
+    (let [prompt-str (str/join " " (:prompts worker))]
+      (when-not (or (str/includes? prompt-str "planner")
+                    (str/includes? prompt-str "worker"))
+        (wait-for-tasks! id)))
 
     (loop [iter 1
            completed 0]
