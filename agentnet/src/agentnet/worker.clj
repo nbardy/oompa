@@ -226,12 +226,12 @@
    5. Cleanup worktree
 
    Returns {:status :done|:continue|:error, :task task-or-nil}"
-  [worker iteration]
+  [worker iteration total-iterations]
   (let [worker-id (:id worker)
         wt-id (format ".w%s-i%d" worker-id iteration)
 
         ;; Create worktree
-        _ (println (format "[%s] Starting iteration %d" worker-id iteration))
+        _ (println (format "[%s] Starting iteration %d/%d" worker-id iteration total-iterations))
         wt-path (str (System/getProperty "user.dir") "/" wt-id)]
 
     (try
@@ -263,10 +263,10 @@
             (if approved?
               (do
                 (merge-to-main! wt-path wt-id worker-id)
-                (println (format "[%s] Iteration %d complete" worker-id iteration))
+                (println (format "[%s] Iteration %d/%d complete" worker-id iteration total-iterations))
                 {:status :continue})
               (do
-                (println (format "[%s] Iteration %d rejected, discarding" worker-id iteration))
+                (println (format "[%s] Iteration %d/%d rejected, discarding" worker-id iteration total-iterations))
                 {:status :continue})))))
 
       (finally
@@ -297,16 +297,16 @@
           (println (format "[%s] Completed %d iterations" id completed))
           (assoc worker :completed completed :status :exhausted))
 
-        (let [{:keys [status]} (execute-iteration! worker iter)]
+        (let [{:keys [status]} (execute-iteration! worker iter iterations)]
           (case status
             :done
             (do
-              (println (format "[%s] Worker done after %d iterations" id iter))
+              (println (format "[%s] Worker done after %d/%d iterations" id iter iterations))
               (assoc worker :completed iter :status :done))
 
             :error
             (do
-              (println (format "[%s] Worker error at iteration %d, continuing..." id iter))
+              (println (format "[%s] Worker error at iteration %d/%d, continuing..." id iter iterations))
               (recur (inc iter) completed))
 
             :continue
