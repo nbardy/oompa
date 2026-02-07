@@ -19,6 +19,51 @@
             [clojure.string :as str]))
 
 ;; =============================================================================
+;; Provider command resolution
+;; =============================================================================
+
+(defn- env-bool?
+  "Read env var as boolean with a default.
+   True unless explicitly one of: 0, false, no, off."
+  [name default]
+  (let [v (System/getenv name)]
+    (if (nil? v)
+      default
+      (not (contains? #{"0" "false" "no" "off"} (str/lower-case v))))))
+
+(defn- oompa-home
+  "Resolve Oompa repo path used for helper scripts."
+  []
+  (or (System/getenv "OOMPA_HOME")
+      (let [cwd (System/getProperty "user.dir")
+            candidate (io/file cwd "scripts" "stream_bridge.py")]
+        (when (.exists candidate) cwd))))
+
+(defn raw-provider-command
+  "Raw provider binary name (no wrappers)."
+  [agent-type]
+  (case agent-type
+    :codex "codex"
+    :claude "claude"
+    "echo"))
+
+(defn provider-command
+  "Provider command with optional stream-TUI wrappers when OOMPA_TUI is enabled."
+  [agent-type]
+  (if (and (env-bool? "OOMPA_TUI" false)
+           (contains? #{:codex :claude} agent-type))
+    (if-let [home (oompa-home)]
+      (let [wrapper (io/file home "scripts"
+                             (case agent-type
+                               :codex "codex_tui.sh"
+                               :claude "claude_tui.sh"))]
+        (if (.exists wrapper)
+          (.getAbsolutePath wrapper)
+          (raw-provider-command agent-type)))
+      (raw-provider-command agent-type))
+    (raw-provider-command agent-type)))
+
+;; =============================================================================
 ;; Function Specs
 ;; =============================================================================
 
@@ -58,7 +103,7 @@
 
 (defmethod build-command :codex
   [_ {:keys [model sandbox timeout-seconds]} prompt cwd]
-  (cond-> ["codex" "exec" "--full-auto" "--skip-git-repo-check"]
+  (cond-> [(provider-command :codex) "exec" "--full-auto" "--skip-git-repo-check"]
     model (into ["--model" model])
     cwd (into ["-C" cwd])
     sandbox (into ["--sandbox" (name sandbox)])
@@ -67,7 +112,7 @@
 (defmethod build-command :claude
   [_ {:keys [model timeout-seconds]} prompt cwd]
   ;; Claude uses stdin for prompt via -p flag
-  (cond-> ["claude" "-p"]
+  (cond-> [(provider-command :claude) "-p"]
     model (into ["--model" model])
     true (conj "--dangerously-skip-permissions")))
 
@@ -261,10 +306,7 @@
 (defn check-available
   "Check if agent backend is available"
   [agent-type]
-  (let [cmd (case agent-type
-              :codex ["codex" "--version"]
-              :claude ["claude" "--version"]
-              ["echo" "unknown"])]
+  (let [cmd [(raw-provider-command agent-type) "--version"]]
     (try
       (let [{:keys [exit]} (process/sh cmd {:out :string :err :string})]
         (zero? exit))

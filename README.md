@@ -150,6 +150,21 @@ echo "Build a simple todo API with CRUD endpoints" > spec.md
 ./swarm.bb help             # Show all commands
 ```
 
+## Live TUI Stream (Optional)
+
+Oompa can show a lightweight Ralph-style live stream of tool/text activity while workers run.
+
+Enable it per run:
+
+```bash
+OOMPA_TUI=1 ./swarm.bb swarm
+```
+
+Notes:
+- This is a line-stream view, not a full-screen curses UI.
+- It uses wrappers in `scripts/claude_tui.sh` and `scripts/codex_tui.sh`.
+- Worker-facing stdout remains plain text, so existing `__DONE__`/review parsing still works.
+
 ## Requirements
 
 - [Babashka](https://github.com/babashka/babashka) (bb)
