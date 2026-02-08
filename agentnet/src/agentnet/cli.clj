@@ -141,8 +141,8 @@
   [harness model]
   (try
     (let [cmd (case harness
-                :claude ["claude" "--model" model "-p" "say ok" "--max-turns" "1"]
-                :codex  ["codex" "exec" "--dangerously-bypass-approvals-and-sandbox" "--skip-git-repo-check" "--model" model "--" "say ok"])
+                :claude ["claude" "--model" model "-p" "[oompa:probe] say ok" "--max-turns" "1"]
+                :codex  ["codex" "exec" "--dangerously-bypass-approvals-and-sandbox" "--skip-git-repo-check" "--model" model "--" "[oompa:probe] say ok"])
           null-in (io/input-stream (io/file "/dev/null"))
           proc (process/process cmd {:out :string :err :string :in null-in})
           result (deref proc 30000 :timeout)]
