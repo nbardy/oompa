@@ -132,34 +132,38 @@
 ;; Commands
 ;; =============================================================================
 
+(declare cmd-swarm)
+
 (defn cmd-run
-  "Run orchestrator once"
+  "Run orchestrator — uses oompa.json if present, otherwise simple mode"
   [opts args]
-  (let [swarm-id (make-swarm-id)]
-    (if-let [specs (:worker-specs opts)]
-    ;; Mixed worker specs: --workers claude:5 codex:4
-    (let [workers (mapcat
-                    (fn [spec]
-                      (let [{:keys [harness count]} spec]
-                        (map-indexed
-                          (fn [idx _]
-                            (worker/create-worker
-                              {:id (format "%s-%d" (name harness) idx)
-                               :swarm-id swarm-id
-                               :harness harness
-                               :model (:model opts)
-                               :iterations 1}))
-                          (range count))))
-                    specs)]
-      (println (format "Running once with mixed workers (swarm %s):" swarm-id))
-      (doseq [spec specs]
-        (println (format "  %dx %s" (:count spec) (name (:harness spec)))))
-      (println)
-      (worker/run-workers! workers))
-    ;; Simple mode
-    (do
-      (println (format "Swarm ID: %s" swarm-id))
-      (orchestrator/run-once! (assoc opts :swarm-id swarm-id))))))
+  (if (.exists (io/file "oompa.json"))
+    (cmd-swarm opts (or (seq args) ["oompa.json"]))
+    (let [swarm-id (make-swarm-id)]
+      (if-let [specs (:worker-specs opts)]
+        ;; Mixed worker specs: --workers claude:5 codex:4
+        (let [workers (mapcat
+                        (fn [spec]
+                          (let [{:keys [harness count]} spec]
+                            (map-indexed
+                              (fn [idx _]
+                                (worker/create-worker
+                                  {:id (format "%s-%d" (name harness) idx)
+                                   :swarm-id swarm-id
+                                   :harness harness
+                                   :model (:model opts)
+                                   :iterations 1}))
+                              (range count))))
+                        specs)]
+          (println (format "Running once with mixed workers (swarm %s):" swarm-id))
+          (doseq [spec specs]
+            (println (format "  %dx %s" (:count spec) (name (:harness spec)))))
+          (println)
+          (worker/run-workers! workers))
+        ;; Simple mode
+        (do
+          (println (format "Swarm ID: %s" swarm-id))
+          (orchestrator/run-once! (assoc opts :swarm-id swarm-id)))))))
 
 (defn cmd-loop
   "Run orchestrator N times"
