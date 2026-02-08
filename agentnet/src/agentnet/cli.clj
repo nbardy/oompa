@@ -140,7 +140,7 @@
   [harness model]
   (try
     (let [cmd (case harness
-                :claude ["claude" "--model" model "-p" "say ok"]
+                :claude ["claude" "--model" model "-p" "say ok" "--max-turns" "1"]
                 :codex  ["codex" "exec" "--dangerously-bypass-approvals-and-sandbox" "--skip-git-repo-check" "--model" model "--" "say ok"])
           result (process/sh cmd {:out :string :err :string :timeout 30000})]
       (zero? (:exit result)))
@@ -149,10 +149,13 @@
 (defn- validate-models!
   "Probe each unique harness:model pair. Prints results and exits if any fail."
   [worker-configs review-model]
-  (let [models (cond-> (set (map (fn [wc]
-                                   (parse-model-string (:model wc)))
-                                 worker-configs))
-                 review-model (conj review-model))
+  (let [;; Deduplicate by harness:model only (ignore reasoning level)
+        models (cond-> (->> worker-configs
+                            (map (fn [wc]
+                                   (let [{:keys [harness model]} (parse-model-string (:model wc))]
+                                     {:harness harness :model model})))
+                            set)
+                 review-model (conj (select-keys review-model [:harness :model])))
         _ (println "Validating models...")
         results (pmap (fn [{:keys [harness model]}]
                         (let [ok (probe-model harness model)]
