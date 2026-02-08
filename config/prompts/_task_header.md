@@ -35,13 +35,22 @@ cat > ../tasks/pending/task-NNN.edn << 'EOF'
 EOF
 ```
 
+### Planning vs Executing
+
+**WHEN PLANNING** (task queue is empty or nearly empty):
+- Your FIRST priority is creating tasks for other workers. They are waiting.
+- Read the project spec, identify gaps, and create 5-10 focused, well-detailed tasks.
+- Do NOT execute tasks in the same iteration you create them.
+- Commit the task files and finish your iteration so others can claim them immediately.
+
+**WHEN EXECUTING** (tasks exist in pending):
+- Claim one task, execute it end-to-end, complete it.
+- If work emerges during execution, create new tasks in `../tasks/pending/`.
+
 ### Rules
 
 - Before starting work: read the project spec and all tasks to understand scope.
-- **If `../tasks/pending/` is empty or nearly empty: your FIRST priority is to create tasks.** Read the project spec, identify gaps, and write 3-5 focused tasks before doing anything else. Other workers are waiting for work.
 - Claim your task by moving it to `../tasks/current/`.
 - If the `mv` fails (another worker claimed it first), pick a different task.
 - One task per commit (or a small, tightly-related set with overlapping files).
-- If tasks are missing or underspecified: stop and write tasks before coding.
-- If work emerges during execution: create new tasks in `../tasks/pending/`.
-- Only output __DONE__ if you have completed work AND no more tasks can be derived from the spec. Never __DONE__ on your first action — always create or execute at least one task first.
+- Only output __DONE__ if you have completed work AND no more tasks can be derived from the spec. Never __DONE__ on your first action.

@@ -225,14 +225,16 @@
 (defn- run-reviewer!
   "Run reviewer on worktree changes.
    Returns {:verdict :approved|:needs-changes|:rejected, :comments [...]}"
-  [{:keys [review-harness review-model]} worktree-path]
+  [{:keys [id swarm-id review-harness review-model]} worktree-path]
   (let [;; Get diff for context
         diff-result (process/sh ["git" "diff" "main" "--stat"]
                                 {:dir worktree-path :out :string :err :string})
         diff-summary (:out diff-result)
 
-        ;; Build review prompt
-        review-prompt (str "Review the changes in this worktree.\n\n"
+        ;; Build review prompt (tagged for claude-web-view worker detection)
+        swarm-id* (or swarm-id "unknown")
+        review-prompt (str "[oompa:" swarm-id* ":" id "] "
+                           "Review the changes in this worktree.\n\n"
                            "Diff summary:\n" diff-summary "\n\n"
                            "Check for:\n"
                            "- Code correctness\n"
@@ -277,8 +279,10 @@
 (defn- run-fix!
   "Ask worker to fix issues based on reviewer feedback.
    Returns {:output string, :exit int}"
-  [{:keys [harness model]} worktree-path feedback]
-  (let [fix-prompt (str "The reviewer found issues with your changes:\n\n"
+  [{:keys [id swarm-id harness model]} worktree-path feedback]
+  (let [swarm-id* (or swarm-id "unknown")
+        fix-prompt (str "[oompa:" swarm-id* ":" id "] "
+                        "The reviewer found issues with your changes:\n\n"
                         feedback "\n\n"
                         "Please fix these issues in the worktree.")
 
@@ -394,11 +398,18 @@
             {:keys [output exit done?]} (run-agent! worker wt-path context)]
 
         (cond
-          ;; Agent signaled done
-          done?
+          ;; Agent signaled done — only honor for can_plan workers.
+          ;; Executors (can_plan: false) can't decide work is done.
+          (and done? (:can-plan worker))
           (do
             (println (format "[%s] Received __DONE__ signal" worker-id))
             {:status :done})
+
+          ;; can_plan: false worker said __DONE__ — ignore it, treat as success
+          (and done? (not (:can-plan worker)))
+          (do
+            (println (format "[%s] Ignoring __DONE__ (executor cannot signal done)" worker-id))
+            {:status :continue})
 
           ;; Agent errored
           (not (zero? exit))
