@@ -97,6 +97,26 @@
   "Root of the oompa package — set by bin/oompa.js, falls back to cwd."
   (or (System/getenv "OOMPA_PACKAGE_ROOT") "."))
 
+;; Resolve absolute paths for CLI binaries at first use.
+;; ProcessBuilder with :dir set can fail to find bare command names on some
+;; platforms (macOS + babashka), so we resolve once via `which` and cache.
+(def ^:private binary-paths* (atom {}))
+
+(defn- resolve-binary!
+  "Resolve the absolute path of a CLI binary. Caches result.
+   Throws if binary not found on PATH."
+  [name]
+  (or (get @binary-paths* name)
+      (let [result (try
+                     (process/sh ["which" name] {:out :string :err :string})
+                     (catch Exception _ {:exit -1 :out "" :err ""}))
+            path (when (zero? (:exit result))
+                   (str/trim (:out result)))]
+        (if path
+          (do (swap! binary-paths* assoc name path)
+              path)
+          (throw (ex-info (str "Binary not found on PATH: " name) {:binary name}))))))
+
 (defn- load-prompt
   "Load a prompt file. Tries path as-is first, then from package root."
   [path]
@@ -172,14 +192,14 @@
         ;; Build command — both harnesses run with cwd=worktree, no sandbox
         ;; so agents can `..` to reach project root for task management
         cmd (case harness
-              :codex (cond-> ["codex" "exec"
+              :codex (cond-> [(resolve-binary! "codex") "exec"
                               "--dangerously-bypass-approvals-and-sandbox"
                               "--skip-git-repo-check"
                               "-C" abs-worktree]
                        model (into ["--model" model])
                        reasoning (into ["-c" (str "model_reasoning_effort=\"" reasoning "\"")])
                        true (conj "--" full-prompt))
-              :claude (cond-> ["claude" "-p" "--dangerously-skip-permissions"
+              :claude (cond-> [(resolve-binary! "claude") "-p" "--dangerously-skip-permissions"
                                "--session-id" session-id]
                         model (into ["--model" model])))
 
@@ -227,13 +247,13 @@
 
         ;; Build command — cwd=worktree, no sandbox
         cmd (case review-harness
-              :codex (cond-> ["codex" "exec"
+              :codex (cond-> [(resolve-binary! "codex") "exec"
                               "--dangerously-bypass-approvals-and-sandbox"
                               "--skip-git-repo-check"
                               "-C" abs-wt]
                        review-model (into ["--model" review-model])
                        true (conj "--" review-prompt))
-              :claude (cond-> ["claude" "-p" "--dangerously-skip-permissions"]
+              :claude (cond-> [(resolve-binary! "claude") "-p" "--dangerously-skip-permissions"]
                         review-model (into ["--model" review-model])))
 
         ;; Run reviewer — cwd=worktree
@@ -265,13 +285,13 @@
         abs-wt (.getAbsolutePath (io/file worktree-path))
 
         cmd (case harness
-              :codex (cond-> ["codex" "exec"
+              :codex (cond-> [(resolve-binary! "codex") "exec"
                               "--dangerously-bypass-approvals-and-sandbox"
                               "--skip-git-repo-check"
                               "-C" abs-wt]
                        model (into ["--model" model])
                        true (conj "--" fix-prompt))
-              :claude (cond-> ["claude" "-p" "--dangerously-skip-permissions"]
+              :claude (cond-> [(resolve-binary! "claude") "-p" "--dangerously-skip-permissions"]
                         model (into ["--model" model])))
 
         result (try
