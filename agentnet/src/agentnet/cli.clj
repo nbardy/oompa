@@ -134,6 +134,43 @@
 
 (declare cmd-swarm)
 
+(defn- probe-model
+  "Send 'say ok' to a model via its harness CLI. Returns true if model responds."
+  [harness model]
+  (try
+    (let [cmd (case harness
+                :claude ["claude" "--model" model "-p" "say ok" "--max-turns" "1"]
+                :codex  ["codex" "exec" "--model" model "--" "say ok"])
+          result (process/sh cmd {:out :string :err :string :timeout 30000})]
+      (zero? (:exit result)))
+    (catch Exception _ false)))
+
+(defn- validate-models!
+  "Probe each unique harness:model pair. Prints results and exits if any fail."
+  [worker-configs review-model]
+  (let [models (cond-> (set (map (fn [wc]
+                                   (parse-model-string (:model wc)))
+                                 worker-configs))
+                 review-model (conj review-model))
+        _ (println "Validating models...")
+        results (pmap (fn [{:keys [harness model]}]
+                        (let [ok (probe-model harness model)]
+                          (println (format "  %s:%s %s"
+                                           (name harness) model
+                                           (if ok "OK" "FAIL")))
+                          {:harness harness :model model :ok ok}))
+                      models)
+        failures (filter (complement :ok) results)]
+    (when (seq failures)
+      (println)
+      (println "ERROR: The following models are not accessible:")
+      (doseq [{:keys [harness model]} failures]
+        (println (format "  %s:%s" (name harness) model)))
+      (println)
+      (println "Fix model names in oompa.json and retry.")
+      (System/exit 1))
+    (println)))
+
 (defn cmd-run
   "Run orchestrator — uses oompa.json if present, otherwise simple mode"
   [opts args]
@@ -284,11 +321,15 @@
                        (if available? "✓ available" "✗ not found"))))))
 
 (defn- parse-model-string
-  "Parse 'harness:model' string into {:harness :model}"
+  "Parse model string into {:harness :model :reasoning}.
+   Formats: 'harness:model', 'harness:model:reasoning', or just 'model'."
   [s]
   (if (and s (str/includes? s ":"))
-    (let [[h m] (str/split s #":" 2)]
-      {:harness (keyword h) :model m})
+    (let [parts (str/split s #":" 3)]
+      (case (count parts)
+        2 {:harness (keyword (first parts)) :model (second parts)}
+        3 {:harness (keyword (first parts)) :model (second parts) :reasoning (nth parts 2)}
+        {:harness :codex :model s}))
     {:harness :codex :model s}))
 
 (defn cmd-swarm
@@ -324,12 +365,13 @@
           ;; Convert to worker format
           workers (map-indexed
                     (fn [idx wc]
-                      (let [{:keys [harness model]} (parse-model-string (:model wc))]
+                      (let [{:keys [harness model reasoning]} (parse-model-string (:model wc))]
                         (worker/create-worker
                           {:id (str "w" idx)
                            :swarm-id swarm-id
                            :harness harness
                            :model model
+                           :reasoning reasoning
                            :iterations (or (:iterations wc) 10)
                            :prompts (:prompt wc)
                            :can-plan (:can_plan wc)
@@ -351,6 +393,9 @@
                            (or (:iterations wc) 10)
                            (if (:prompt wc) (str ", " (:prompt wc)) "")))))
       (println)
+
+      ;; Preflight: probe each unique model before launching workers
+      (validate-models! worker-configs review-model)
 
       ;; Run workers using new worker module
       (worker/run-workers! workers))))

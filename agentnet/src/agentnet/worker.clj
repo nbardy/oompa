@@ -106,8 +106,9 @@
 (defn create-worker
   "Create a worker config.
    :prompts is a string or vector of strings — paths to prompt files.
-   :can-plan when false, worker waits for tasks before starting (backpressure)."
-  [{:keys [id swarm-id harness model iterations prompts can-plan review-harness review-model]}]
+   :can-plan when false, worker waits for tasks before starting (backpressure).
+   :reasoning reasoning effort level (e.g. \"low\", \"medium\", \"high\") — codex only."
+  [{:keys [id swarm-id harness model iterations prompts can-plan reasoning review-harness review-model]}]
   {:id id
    :swarm-id swarm-id
    :harness (or harness :codex)
@@ -118,6 +119,7 @@
               (string? prompts) [prompts]
               :else [])
    :can-plan (if (some? can-plan) can-plan true)
+   :reasoning reasoning
    :review-harness review-harness
    :review-model review-model
    :completed 0
@@ -144,7 +146,7 @@
 
 (defn- run-agent!
   "Run agent with prompt, return {:output string, :done? bool, :exit int}"
-  [{:keys [id swarm-id harness model prompts]} worktree-path context]
+  [{:keys [id swarm-id harness model prompts reasoning]} worktree-path context]
   (let [;; 1. Task header (always, from package)
         task-header (or (load-prompt "config/prompts/_task_header.md") "")
 
@@ -175,6 +177,7 @@
                               "--skip-git-repo-check"
                               "-C" abs-worktree]
                        model (into ["--model" model])
+                       reasoning (into ["-c" (str "reasoning_effort=\"" reasoning "\"")])
                        true (conj "--" full-prompt))
               :claude (cond-> ["claude" "-p" "--dangerously-skip-permissions"
                                "--session-id" session-id]

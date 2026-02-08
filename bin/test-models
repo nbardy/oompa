@@ -1,0 +1,78 @@
+#!/usr/bin/env bash
+# test-models — probe all models in oompa.json with a hello-world check
+#
+# Usage: test-models [path/to/oompa.json]
+#
+# Sends "say ok" to each unique model via its harness CLI.
+# Reports pass/fail for each. Exits non-zero if any fail.
+
+set -euo pipefail
+
+CONFIG="${1:-oompa.json}"
+
+if [ ! -f "$CONFIG" ]; then
+  echo "Config not found: $CONFIG"
+  echo "Usage: test-models [path/to/oompa.json]"
+  exit 1
+fi
+
+# Extract unique model strings (harness:model) from workers[] and review_model
+MODELS=$(python3 -c "
+import json, sys
+with open('$CONFIG') as f:
+    cfg = json.load(f)
+models = set()
+if cfg.get('review_model'):
+    models.add(cfg['review_model'])
+for w in cfg.get('workers', []):
+    if 'model' in w:
+        models.add(w['model'])
+for m in sorted(models):
+    print(m)
+")
+
+if [ -z "$MODELS" ]; then
+  echo "No models found in $CONFIG"
+  exit 1
+fi
+
+echo "Probing models from $CONFIG"
+echo ""
+
+PASS=0
+FAIL=0
+
+while IFS= read -r model; do
+  HARNESS="${model%%:*}"
+  MODEL_NAME="${model#*:}"
+
+  printf "  %-30s " "$model"
+
+  case "$HARNESS" in
+    claude)
+      OUTPUT=$(claude --model "$MODEL_NAME" -p "say ok" --max-turns 1 2>&1) && EXIT=$? || EXIT=$?
+      ;;
+    codex)
+      OUTPUT=$(codex exec --model "$MODEL_NAME" -- "say ok" 2>&1) && EXIT=$? || EXIT=$?
+      ;;
+    *)
+      echo "SKIP (unknown harness)"
+      continue
+      ;;
+  esac
+
+  if [ $EXIT -eq 0 ]; then
+    echo "OK"
+    PASS=$((PASS + 1))
+  else
+    echo "FAIL"
+    # Print first line of error for context
+    echo "$OUTPUT" | head -3 | sed 's/^/    /'
+    FAIL=$((FAIL + 1))
+  fi
+done <<< "$MODELS"
+
+echo ""
+echo "$PASS passed, $FAIL failed"
+
+[ "$FAIL" -eq 0 ]

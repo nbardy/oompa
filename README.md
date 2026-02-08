@@ -99,7 +99,7 @@ This spawns:
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `model` | yes | `harness:model` (e.g. `claude:opus-4.5`, `codex:codex-5.2-mini`) |
+| `model` | yes | `harness:model` or `harness:model:reasoning` (e.g. `codex:o3:low`, `claude:opus-4.6`) |
 | `prompt` | no | String or array of paths — concatenated into one prompt |
 | `iterations` | no | Max iterations per worker (default: 10) |
 | `count` | no | Number of workers with this config (default: 1) |
