@@ -455,10 +455,11 @@
   [worker]
   (tasks/ensure-dirs!)
   (let [{:keys [id iterations]} worker]
-    (println (format "[%s] Starting worker (%s:%s, %d iterations)"
+    (println (format "[%s] Starting worker (%s:%s%s, %d iterations)"
                      id
                      (name (:harness worker))
                      (or (:model worker) "default")
+                     (if (:reasoning worker) (str ":" (:reasoning worker)) "")
                      iterations))
 
     ;; Backpressure: workers that can't create tasks wait for tasks to exist

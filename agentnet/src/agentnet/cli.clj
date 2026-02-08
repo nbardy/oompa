@@ -393,11 +393,12 @@
         (println (format "  Review: %s:%s" (name (:harness review-model)) (:model review-model))))
       (println (format "  Workers: %d total" (count workers)))
       (doseq [[idx wc] (map-indexed vector worker-configs)]
-        (let [{:keys [harness model]} (parse-model-string (:model wc))]
-          (println (format "    - %dx %s:%s (%d iters%s)"
+        (let [{:keys [harness model reasoning]} (parse-model-string (:model wc))]
+          (println (format "    - %dx %s:%s%s (%d iters%s)"
                            (or (:count wc) 1)
                            (name harness)
                            model
+                           (if reasoning (str ":" reasoning) "")
                            (or (:iterations wc) 10)
                            (if (:prompt wc) (str ", " (:prompt wc)) "")))))
       (println)
