@@ -105,8 +105,9 @@
 
 (defn create-worker
   "Create a worker config.
-   :prompts is a string or vector of strings — paths to prompt files."
-  [{:keys [id swarm-id harness model iterations prompts review-harness review-model]}]
+   :prompts is a string or vector of strings — paths to prompt files.
+   :can-plan when false, worker waits for tasks before starting (backpressure)."
+  [{:keys [id swarm-id harness model iterations prompts can-plan review-harness review-model]}]
   {:id id
    :swarm-id swarm-id
    :harness (or harness :codex)
@@ -116,6 +117,7 @@
               (vector? prompts) prompts
               (string? prompts) [prompts]
               :else [])
+   :can-plan (if (some? can-plan) can-plan true)
    :review-harness review-harness
    :review-model review-model
    :completed 0
@@ -397,8 +399,8 @@
 (def ^:private wait-poll-interval 5)
 
 (defn- wait-for-tasks!
-  "Wait up to max-wait-for-tasks seconds for pending tasks to appear.
-   Returns true if tasks found, false if timed out."
+  "Wait up to 60s for pending/current tasks to appear. Used for backpressure
+   on workers that can't create their own tasks (can_plan: false)."
   [worker-id]
   (loop [waited 0]
     (cond
@@ -426,12 +428,9 @@
                      (or (:model worker) "default")
                      iterations))
 
-    ;; Wait for tasks before first iteration — but not if this worker creates tasks
-    ;; (planner/worker prompts). Only executors need to wait.
-    (let [prompt-str (str/join " " (:prompts worker))]
-      (when-not (or (str/includes? prompt-str "planner")
-                    (str/includes? prompt-str "worker"))
-        (wait-for-tasks! id)))
+    ;; Backpressure: workers that can't create tasks wait for tasks to exist
+    (when-not (:can-plan worker)
+      (wait-for-tasks! id))
 
     (loop [iter 1
            completed 0]

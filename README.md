@@ -85,7 +85,7 @@ This repo has a fleshed out version of the idea. The oompa loompas are organized
   "review_model": "codex:codex-5.2",
   "workers": [
     {"model": "claude:opus-4.5", "prompt": ["config/prompts/planner.md"], "iterations": 5, "count": 1},
-    {"model": "codex:codex-5.2-mini", "prompt": ["config/prompts/executor.md"], "iterations": 10, "count": 3}
+    {"model": "codex:codex-5.2-mini", "prompt": ["config/prompts/executor.md"], "iterations": 10, "count": 3, "can_plan": false}
   ]
 }
 ```
@@ -103,6 +103,7 @@ This spawns:
 | `prompt` | no | String or array of paths — concatenated into one prompt |
 | `iterations` | no | Max iterations per worker (default: 10) |
 | `count` | no | Number of workers with this config (default: 1) |
+| `can_plan` | no | If `false`, worker waits for tasks before starting (default: `true`) |
 
 #### Composable prompts
 

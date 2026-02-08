@@ -12,7 +12,8 @@
       "model": "codex:codex-5.2-mini",
       "prompt": ["config/prompts/executor.md"],
       "iterations": 10,
-      "count": 3
+      "count": 3,
+      "can_plan": false
     }
   ]
 }

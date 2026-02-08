@@ -300,7 +300,7 @@
       (println "{")
       (println "  \"review_model\": \"codex:codex-5.2\",")
       (println "  \"workers\": [")
-      (println "    {\"model\": \"codex:codex-5.2-mini\", \"prompt\": \"prompts/executor.md\", \"iterations\": 10, \"count\": 3},")
+      (println "    {\"model\": \"codex:codex-5.2-mini\", \"prompt\": \"prompts/executor.md\", \"iterations\": 10, \"count\": 3, \"can_plan\": false},")
       (println "    {\"model\": \"claude:opus-4.5\", \"prompt\": [\"prompts/base.md\", \"prompts/planner.md\"], \"count\": 1}")
       (println "  ]")
       (println "}")
@@ -328,6 +328,7 @@
                            :model model
                            :iterations (or (:iterations wc) 10)
                            :prompts (:prompt wc)
+                           :can-plan (:can_plan wc)
                            :review-harness (:harness review-model)
                            :review-model (:model review-model)})))
                     expanded-workers)]
