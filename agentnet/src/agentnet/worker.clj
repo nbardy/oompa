@@ -308,13 +308,19 @@
     {:output (:out result)
      :exit (:exit result)}))
 
+(defn- worktree-has-changes?
+  "Check if worktree has any uncommitted changes (new/modified/deleted files)."
+  [wt-path]
+  (let [result (process/sh ["git" "status" "--porcelain"] {:dir wt-path :out :string :err :string})]
+    (not (str/blank? (:out result)))))
+
 (defn- merge-to-main!
   "Merge worktree changes to main branch"
   [wt-path wt-id worker-id project-root]
   (println (format "[%s] Merging changes to main" worker-id))
   (let [;; Commit in worktree if needed
         _ (process/sh ["git" "add" "-A"] {:dir wt-path})
-        _ (process/sh ["git" "commit" "-m" (str "Work from " wt-id) "--allow-empty"]
+        _ (process/sh ["git" "commit" "-m" (str "Work from " wt-id)]
                       {:dir wt-path})
         ;; Checkout main and merge (in project root, not worktree)
         checkout-result (process/sh ["git" "checkout" "main"]
@@ -417,7 +423,13 @@
             (println (format "[%s] Agent error (exit %d): %s" worker-id exit (subs (or output "") 0 (min 200 (count (or output ""))))))
             {:status :error :exit exit})
 
-          ;; Success - run review loop before merge
+          ;; Agent produced no file changes — wasted iteration
+          (not (worktree-has-changes? wt-path))
+          (do
+            (println (format "[%s] No changes produced, skipping review" worker-id))
+            {:status :no-changes})
+
+          ;; Success with changes - run review loop before merge
           :else
           (let [{:keys [approved?]} (review-loop! worker wt-path worker-id)]
             (if approved?
@@ -502,6 +514,9 @@
                   (println (format "[%s] Error at iteration %d/%d (%d/%d), continuing..."
                                    id iter iterations errors max-consecutive-errors))
                   (recur (inc iter) completed errors))))
+
+            :no-changes
+            (recur (inc iter) completed consec-errors)
 
             :continue
             (recur (inc iter) (inc completed) 0)))))))

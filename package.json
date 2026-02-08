@@ -1,6 +1,6 @@
 {
   "name": "@nbardy/oompa",
-  "version": "0.5.0",
+  "version": "0.5.1",
   "description": "Git-worktree multi-agent swarm orchestrator for Codex and Claude",
   "license": "MIT",
   "type": "commonjs",
