@@ -82,24 +82,22 @@ This repo has a fleshed out version of the idea. The oompa loompas are organized
 **oompa.json** — the only file you need:
 ```json
 {
-  "review_model": "codex:codex-5.2",
   "workers": [
-    {"model": "claude:opus-4.5", "prompt": ["config/prompts/planner.md"], "iterations": 5, "count": 1},
-    {"model": "codex:codex-5.2-mini", "prompt": ["config/prompts/executor.md"], "iterations": 10, "count": 3, "can_plan": false}
+    {"model": "claude:opus", "prompt": ["config/prompts/planner.md"], "iterations": 5, "count": 1},
+    {"model": "codex:gpt-5.3-codex:medium", "prompt": ["config/prompts/executor.md"], "iterations": 10, "count": 3, "can_plan": false}
   ]
 }
 ```
 
 This spawns:
 - **1 planner** (opus) — reads spec, explores codebase, creates/refines tasks
-- **3 executors** (mini) — claims and executes tasks fast
-- **Reviews** done by codex-5.2 before any merge
+- **3 executors** (gpt-5.3-codex, medium reasoning) — claims and executes tasks fast
 
 #### Worker fields
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `model` | yes | `harness:model` or `harness:model:reasoning` (e.g. `codex:o3:low`, `claude:opus-4.6`) |
+| `model` | yes | `harness:model` or `harness:model:reasoning` (e.g. `codex:gpt-5.3-codex:medium`, `claude:opus`) |
 | `prompt` | no | String or array of paths — concatenated into one prompt |
 | `iterations` | no | Max iterations per worker (default: 10) |
 | `count` | no | Number of workers with this config (default: 1) |

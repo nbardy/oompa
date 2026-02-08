@@ -16,6 +16,7 @@
             [agentnet.worker :as worker]
             [agentnet.tasks :as tasks]
             [agentnet.agent :as agent]
+            [babashka.process :as process]
             [clojure.string :as str]
             [clojure.java.io :as io]
             [cheshire.core :as json]))
@@ -132,15 +133,15 @@
 ;; Commands
 ;; =============================================================================
 
-(declare cmd-swarm)
+(declare cmd-swarm parse-model-string)
 
 (defn- probe-model
   "Send 'say ok' to a model via its harness CLI. Returns true if model responds."
   [harness model]
   (try
     (let [cmd (case harness
-                :claude ["claude" "--model" model "-p" "say ok" "--max-turns" "1"]
-                :codex  ["codex" "exec" "--model" model "--" "say ok"])
+                :claude ["claude" "--model" model "-p" "say ok"]
+                :codex  ["codex" "exec" "--dangerously-bypass-approvals-and-sandbox" "--skip-git-repo-check" "--model" model "--" "say ok"])
           result (process/sh cmd {:out :string :err :string :timeout 30000})]
       (zero? (:exit result)))
     (catch Exception _ false)))
@@ -343,10 +344,9 @@
       (println)
       (println "Create oompa.json with format:")
       (println "{")
-      (println "  \"review_model\": \"codex:codex-5.2\",")
       (println "  \"workers\": [")
-      (println "    {\"model\": \"codex:codex-5.2-mini\", \"prompt\": \"prompts/executor.md\", \"iterations\": 10, \"count\": 3, \"can_plan\": false},")
-      (println "    {\"model\": \"claude:opus-4.5\", \"prompt\": [\"prompts/base.md\", \"prompts/planner.md\"], \"count\": 1}")
+      (println "    {\"model\": \"codex:gpt-5.3-codex:medium\", \"prompt\": \"prompts/executor.md\", \"iterations\": 10, \"count\": 3, \"can_plan\": false},")
+      (println "    {\"model\": \"claude:opus\", \"prompt\": [\"prompts/base.md\", \"prompts/planner.md\"], \"count\": 1}")
       (println "  ]")
       (println "}")
       (println)
@@ -449,7 +449,7 @@
   (println "  --keep-worktrees         Don't cleanup worktrees after run")
   (println)
   (println "Examples:")
-  (println "  ./swarm.bb loop 10 --harness codex --model codex-5.2-mini --workers 3")
+  (println "  ./swarm.bb loop 10 --harness codex --model gpt-5.3-codex --workers 3")
   (println "  ./swarm.bb loop --workers claude:5 codex:4 --iterations 20")
   (println "  ./swarm.bb swarm oompa.json  # Run multi-model config"))
 

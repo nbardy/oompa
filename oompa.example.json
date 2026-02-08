@@ -1,15 +1,13 @@
 {
-  "review_model": "codex:codex-5.2",
-
   "workers": [
     {
-      "model": "claude:opus-4.5",
+      "model": "claude:opus",
       "prompt": ["config/prompts/planner.md"],
       "iterations": 5,
       "count": 1
     },
     {
-      "model": "codex:codex-5.2-mini",
+      "model": "codex:gpt-5.3-codex:medium",
       "prompt": ["config/prompts/executor.md"],
       "iterations": 10,
       "count": 3,
