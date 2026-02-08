@@ -136,14 +136,19 @@
 (declare cmd-swarm parse-model-string)
 
 (defn- probe-model
-  "Send 'say ok' to a model via its harness CLI. Returns true if model responds."
+  "Send 'say ok' to a model via its harness CLI. Returns true if model responds.
+   Claude hangs without /dev/null stdin when spawned from bb."
   [harness model]
   (try
     (let [cmd (case harness
                 :claude ["claude" "--model" model "-p" "say ok" "--max-turns" "1"]
                 :codex  ["codex" "exec" "--dangerously-bypass-approvals-and-sandbox" "--skip-git-repo-check" "--model" model "--" "say ok"])
-          result (process/sh cmd {:out :string :err :string :timeout 30000})]
-      (zero? (:exit result)))
+          null-in (io/input-stream (io/file "/dev/null"))
+          proc (process/process cmd {:out :string :err :string :in null-in})
+          result (deref proc 30000 :timeout)]
+      (if (= result :timeout)
+        (do (.destroyForcibly (:proc proc)) false)
+        (zero? (:exit result))))
     (catch Exception _ false)))
 
 (defn- validate-models!
