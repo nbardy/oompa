@@ -376,8 +376,16 @@
         wt-path (str project-root "/" wt-dir)]
 
     (try
-      ;; Setup worktree (in project root) — dir starts with . but branch name must be valid
-      (process/sh ["git" "worktree" "add" wt-dir "-b" wt-branch] {:dir project-root})
+      ;; Clean stale worktree/branch from previous failed runs before creating
+      (process/sh ["git" "worktree" "remove" wt-dir "--force"] {:dir project-root})
+      (process/sh ["git" "branch" "-D" wt-branch] {:dir project-root})
+
+      ;; Setup worktree (in project root)
+      (let [wt-result (process/sh ["git" "worktree" "add" wt-dir "-b" wt-branch]
+                                  {:dir project-root :out :string :err :string})]
+        (when-not (zero? (:exit wt-result))
+          (throw (ex-info (str "Failed to create worktree: " (:err wt-result))
+                          {:dir wt-dir :branch wt-branch}))))
 
       ;; Build context
       (let [context (build-context)
@@ -411,8 +419,9 @@
                 {:status :continue})))))
 
       (finally
-        ;; Cleanup worktree (in project root)
-        (process/sh ["git" "worktree" "remove" wt-dir "--force"] {:dir project-root})))))
+        ;; Cleanup worktree and branch (in project root)
+        (process/sh ["git" "worktree" "remove" wt-dir "--force"] {:dir project-root})
+        (process/sh ["git" "branch" "-D" wt-branch] {:dir project-root})))))
 
 ;; =============================================================================
 ;; Worker Loop
@@ -420,6 +429,7 @@
 
 (def ^:private max-wait-for-tasks 60)
 (def ^:private wait-poll-interval 5)
+(def ^:private max-consecutive-errors 3)
 
 (defn- wait-for-tasks!
   "Wait up to 60s for pending/current tasks to appear. Used for backpressure
@@ -456,7 +466,8 @@
       (wait-for-tasks! id))
 
     (loop [iter 1
-           completed 0]
+           completed 0
+           consec-errors 0]
       (if (> iter iterations)
         (do
           (println (format "[%s] Completed %d iterations" id completed))
@@ -470,12 +481,18 @@
               (assoc worker :completed iter :status :done))
 
             :error
-            (do
-              (println (format "[%s] Worker error at iteration %d/%d, continuing..." id iter iterations))
-              (recur (inc iter) completed))
+            (let [errors (inc consec-errors)]
+              (if (>= errors max-consecutive-errors)
+                (do
+                  (println (format "[%s] %d consecutive errors, stopping worker" id errors))
+                  (assoc worker :completed completed :status :error))
+                (do
+                  (println (format "[%s] Error at iteration %d/%d (%d/%d), continuing..."
+                                   id iter iterations errors max-consecutive-errors))
+                  (recur (inc iter) completed errors))))
 
             :continue
-            (recur (inc iter) (inc completed))))))))
+            (recur (inc iter) (inc completed) 0))))))))
 
 ;; =============================================================================
 ;; Multi-Worker Execution
