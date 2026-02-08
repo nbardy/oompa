@@ -492,7 +492,7 @@
                   (recur (inc iter) completed errors))))
 
             :continue
-            (recur (inc iter) (inc completed) 0))))))))
+            (recur (inc iter) (inc completed) 0)))))))
 
 ;; =============================================================================
 ;; Multi-Worker Execution
