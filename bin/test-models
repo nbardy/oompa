@@ -37,9 +37,9 @@ if [ -z "$MODELS" ]; then
   exit 1
 fi
 
-# Create results directory
+# Create results directory in /tmp so it doesn't litter the project
 RUN_ID=$(python3 -c "import uuid; print(str(uuid.uuid4())[:8])")
-RESULTS_DIR="tst_results_${RUN_ID}"
+RESULTS_DIR="/tmp/oompa_tst_${RUN_ID}"
 mkdir -p "$RESULTS_DIR"
 
 MODEL_COUNT=$(echo "$MODELS" | wc -l | tr -d ' ')
