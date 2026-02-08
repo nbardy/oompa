@@ -1,10 +1,11 @@
 #!/usr/bin/env bash
-# test-models — probe all models in oompa.json with a hello-world check
+# test-models — end-to-end validation of models in oompa.json
 #
 # Usage: test-models [path/to/oompa.json]
 #
-# Sends "say ok" to each unique model via its harness CLI.
-# Reports pass/fail for each. Exits non-zero if any fail.
+# For each unique model, launches the agent and asks it to write a result
+# file. Then checks all expected files exist. This validates the full
+# pipeline: harness CLI → model access → code execution → file I/O.
 
 set -euo pipefail
 
@@ -16,9 +17,9 @@ if [ ! -f "$CONFIG" ]; then
   exit 1
 fi
 
-# Extract unique model strings (harness:model) from workers[] and review_model
+# Extract unique model strings from workers[] and review_model
 MODELS=$(python3 -c "
-import json, sys
+import json
 with open('$CONFIG') as f:
     cfg = json.load(f)
 models = set()
@@ -36,43 +37,94 @@ if [ -z "$MODELS" ]; then
   exit 1
 fi
 
-echo "Probing models from $CONFIG"
+# Create results directory
+RUN_ID=$(python3 -c "import uuid; print(str(uuid.uuid4())[:8])")
+RESULTS_DIR="tst_results_${RUN_ID}"
+mkdir -p "$RESULTS_DIR"
+
+MODEL_COUNT=$(echo "$MODELS" | wc -l | tr -d ' ')
+echo "Testing $MODEL_COUNT models from $CONFIG"
+echo "Results dir: $RESULTS_DIR"
+echo ""
+
+# Launch all models in parallel
+PIDS=()
+MODEL_NAMES=()
+
+while IFS= read -r model; do
+  HARNESS="${model%%:*}"
+  # Strip reasoning suffix for the model name passed to CLI
+  REST="${model#*:}"
+  MODEL_NAME="${REST%%:*}"
+  # Safe filename: replace slashes and dots
+  SAFE_NAME=$(echo "$model" | tr '/:.' '_')
+
+  MODEL_NAMES+=("$SAFE_NAME")
+  PROMPT="Write a file called ${RESULTS_DIR}/${SAFE_NAME}_DONE with exactly the text DONE. Nothing else. Just create that one file."
+
+  echo "  launching $model ..."
+
+  case "$HARNESS" in
+    claude)
+      claude --model "$MODEL_NAME" -p "$PROMPT" --dangerously-skip-permissions --max-turns 3 \
+        > "${RESULTS_DIR}/${SAFE_NAME}.log" 2>&1 &
+      PIDS+=($!)
+      ;;
+    codex)
+      codex exec --model "$MODEL_NAME" \
+        --dangerously-bypass-approvals-and-sandbox \
+        --skip-git-repo-check \
+        -- "$PROMPT" \
+        > "${RESULTS_DIR}/${SAFE_NAME}.log" 2>&1 &
+      PIDS+=($!)
+      ;;
+    *)
+      echo "    SKIP (unknown harness: $HARNESS)"
+      # Remove from expected list
+      unset 'MODEL_NAMES[${#MODEL_NAMES[@]}-1]'
+      ;;
+  esac
+done <<< "$MODELS"
+
+# Wait for all
+echo ""
+echo "Waiting for all models to complete..."
+for pid in "${PIDS[@]}"; do
+  wait "$pid" 2>/dev/null || true
+done
+
+# Check results
+echo ""
+echo "Results:"
 echo ""
 
 PASS=0
 FAIL=0
 
-while IFS= read -r model; do
-  HARNESS="${model%%:*}"
-  MODEL_NAME="${model#*:}"
+for safe_name in "${MODEL_NAMES[@]}"; do
+  RESULT_FILE="${RESULTS_DIR}/${safe_name}_DONE"
+  printf "  %-40s " "$safe_name"
 
-  printf "  %-30s " "$model"
-
-  case "$HARNESS" in
-    claude)
-      OUTPUT=$(claude --model "$MODEL_NAME" -p "say ok" --max-turns 1 2>&1) && EXIT=$? || EXIT=$?
-      ;;
-    codex)
-      OUTPUT=$(codex exec --model "$MODEL_NAME" -- "say ok" 2>&1) && EXIT=$? || EXIT=$?
-      ;;
-    *)
-      echo "SKIP (unknown harness)"
-      continue
-      ;;
-  esac
-
-  if [ $EXIT -eq 0 ]; then
-    echo "OK"
-    PASS=$((PASS + 1))
+  if [ -f "$RESULT_FILE" ]; then
+    CONTENT=$(cat "$RESULT_FILE" | tr -d '[:space:]')
+    if [ "$CONTENT" = "DONE" ]; then
+      echo "PASS"
+      PASS=$((PASS + 1))
+    else
+      echo "FAIL (file exists but content: '$(head -1 "$RESULT_FILE")')"
+      FAIL=$((FAIL + 1))
+    fi
   else
-    echo "FAIL"
-    # Print first line of error for context
-    echo "$OUTPUT" | head -3 | sed 's/^/    /'
+    echo "FAIL (no result file)"
+    # Show first few lines of log for debugging
+    if [ -f "${RESULTS_DIR}/${safe_name}.log" ]; then
+      head -5 "${RESULTS_DIR}/${safe_name}.log" | sed 's/^/    /'
+    fi
     FAIL=$((FAIL + 1))
   fi
-done <<< "$MODELS"
+done
 
 echo ""
-echo "$PASS passed, $FAIL failed"
+echo "$PASS passed, $FAIL failed (results in $RESULTS_DIR/)"
 
 [ "$FAIL" -eq 0 ]
