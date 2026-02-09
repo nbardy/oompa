@@ -47,10 +47,17 @@ EOF
 - Claim one task, execute it end-to-end, complete it.
 - If work emerges during execution, create new tasks in `../tasks/pending/`.
 
+### Signals
+
+Your session persists across iterations. Keep working until your task is complete.
+
+- **`COMPLETE_AND_READY_FOR_MERGE`**: Output this on its own line when your current work is done and ready for review. Your changes will be reviewed and merged, then you start a fresh session.
+- **`__DONE__`**: Output this only when ALL project work is truly complete and no more tasks can be derived from the spec. This stops your worker entirely.
+
 ### Rules
 
 - Before starting work: read the project spec and all tasks to understand scope.
 - Claim your task by moving it to `../tasks/current/`.
 - If the `mv` fails (another worker claimed it first), pick a different task.
 - One task per commit (or a small, tightly-related set with overlapping files).
-- Only output __DONE__ if you have completed work AND no more tasks can be derived from the spec. Never __DONE__ on your first action.
+- Do NOT output `__DONE__` on your first action. Only use it when you've verified nothing remains.

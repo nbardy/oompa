@@ -130,6 +130,11 @@
   [output]
   (boolean (re-find #"__DONE__" (or output ""))))
 
+(defn merge-signal?
+  "Check if output contains COMPLETE_AND_READY_FOR_MERGE signal"
+  [output]
+  (boolean (re-find #"COMPLETE_AND_READY_FOR_MERGE" (or output ""))))
+
 (defn- extract-comments
   "Extract bullet-point comments from output"
   [output]

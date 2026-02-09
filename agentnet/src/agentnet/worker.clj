@@ -165,32 +165,39 @@
                           (count pending) (count current) (count complete))}))
 
 (defn- run-agent!
-  "Run agent with prompt, return {:output string, :done? bool, :exit int}"
-  [{:keys [id swarm-id harness model prompts reasoning]} worktree-path context]
-  (let [;; 1. Task header (always, from package)
-        task-header (or (load-prompt "config/prompts/_task_header.md") "")
+  "Run agent with prompt, return {:output string, :done? bool, :merge? bool, :exit int, :session-id string}.
+   When resume? is true and harness is :claude, uses --resume to continue the existing session
+   with a lighter prompt (just task status + continue instruction)."
+  [{:keys [id swarm-id harness model prompts reasoning]} worktree-path context session-id resume?]
+  (let [;; Use provided session-id or generate fresh one
+        session-id (or session-id (str/lower-case (str (java.util.UUID/randomUUID))))
 
-        ;; 2. Load and concatenate all user prompts (string or list)
-        user-prompts (if (seq prompts)
-                       (->> prompts
-                            (map load-prompt)
-                            (remove nil?)
-                            (str/join "\n\n"))
-                       (or (load-prompt "config/prompts/worker.md")
-                           "You are a worker. Claim tasks, execute them, complete them."))
+        ;; Build prompt — lighter for resume (agent already has full context)
+        prompt (if resume?
+                 (str "Task Status: " (:task_status context) "\n"
+                      "Pending: " (:pending_tasks context) "\n\n"
+                      "Continue working. Signal COMPLETE_AND_READY_FOR_MERGE when your current task is done and ready for review.")
+                 (let [task-header (or (load-prompt "config/prompts/_task_header.md") "")
+                       user-prompts (if (seq prompts)
+                                      (->> prompts
+                                           (map load-prompt)
+                                           (remove nil?)
+                                           (str/join "\n\n"))
+                                      (or (load-prompt "config/prompts/worker.md")
+                                          "You are a worker. Claim tasks, execute them, complete them."))]
+                   (str task-header "\n"
+                        "Task Status: " (:task_status context) "\n"
+                        "Pending: " (:pending_tasks context) "\n\n"
+                        user-prompts)))
 
-        ;; Assemble: task header + status + user prompts
-        full-prompt (str task-header "\n"
-                         "Task Status: " (:task_status context) "\n"
-                         "Pending: " (:pending_tasks context) "\n\n"
-                         user-prompts)
-        session-id (str/lower-case (str (java.util.UUID/randomUUID)))
         swarm-id* (or swarm-id "unknown")
-        tagged-prompt (str "[oompa:" swarm-id* ":" id "] " full-prompt)
+        tagged-prompt (str "[oompa:" swarm-id* ":" id "] " prompt)
         abs-worktree (.getAbsolutePath (io/file worktree-path))
 
         ;; Build command — both harnesses run with cwd=worktree, no sandbox
         ;; so agents can `..` to reach project root for task management
+        ;; Claude: --resume flag continues existing session-id conversation
+        ;; Codex: no resume support, always fresh (but worktree state persists)
         cmd (case harness
               :codex (cond-> [(resolve-binary! "codex") "exec"
                               "--dangerously-bypass-approvals-and-sandbox"
@@ -198,9 +205,10 @@
                               "-C" abs-worktree]
                        model (into ["--model" model])
                        reasoning (into ["-c" (str "model_reasoning_effort=\"" reasoning "\"")])
-                       true (conj "--" full-prompt))
+                       true (conj "--" tagged-prompt))
               :claude (cond-> [(resolve-binary! "claude") "-p" "--dangerously-skip-permissions"
                                "--session-id" session-id]
+                        resume? (conj "--resume")
                         model (into ["--model" model])))
 
         _ (when (= harness :codex)
@@ -220,7 +228,9 @@
 
     {:output (:out result)
      :exit (:exit result)
-     :done? (agent/done-signal? (:out result))}))
+     :done? (agent/done-signal? (:out result))
+     :merge? (agent/merge-signal? (:out result))
+     :session-id session-id}))
 
 (defn- run-reviewer!
   "Run reviewer on worktree changes.
@@ -314,6 +324,29 @@
   (let [result (process/sh ["git" "status" "--porcelain"] {:dir wt-path :out :string :err :string})]
     (not (str/blank? (:out result)))))
 
+(defn- create-iteration-worktree!
+  "Create a fresh worktree for an iteration. Returns {:dir :branch :path}.
+   Force-removes stale worktree+branch from previous failed runs first."
+  [project-root worker-id iteration]
+  (let [wt-dir (format ".w%s-i%d" worker-id iteration)
+        wt-branch (format "oompa/%s-i%d" worker-id iteration)
+        wt-path (str project-root "/" wt-dir)]
+    ;; Clean stale worktree/branch from previous failed runs
+    (process/sh ["git" "worktree" "remove" wt-dir "--force"] {:dir project-root})
+    (process/sh ["git" "branch" "-D" wt-branch] {:dir project-root})
+    (let [result (process/sh ["git" "worktree" "add" wt-dir "-b" wt-branch]
+                             {:dir project-root :out :string :err :string})]
+      (when-not (zero? (:exit result))
+        (throw (ex-info (str "Failed to create worktree: " (:err result))
+                        {:dir wt-dir :branch wt-branch}))))
+    {:dir wt-dir :branch wt-branch :path wt-path}))
+
+(defn- cleanup-worktree!
+  "Remove worktree and branch."
+  [project-root wt-dir wt-branch]
+  (process/sh ["git" "worktree" "remove" wt-dir "--force"] {:dir project-root})
+  (process/sh ["git" "branch" "-D" wt-branch] {:dir project-root}))
+
 (defn- merge-to-main!
   "Merge worktree changes to main branch"
   [wt-path wt-id worker-id project-root]
@@ -364,88 +397,6 @@
               (run-fix! worker wt-path output)
               (recur (inc attempt)))))))))
 
-(defn execute-iteration!
-  "Execute one iteration of work.
-
-   Flow:
-   1. Create worktree
-   2. Run agent
-   3. If reviewer configured: run review loop (fix → retry → reviewer)
-   4. If approved: merge to main
-   5. Cleanup worktree
-
-   Returns {:status :done|:continue|:error, :task task-or-nil}"
-  [worker iteration total-iterations]
-  (let [worker-id (:id worker)
-        project-root (System/getProperty "user.dir")
-        wt-dir (format ".w%s-i%d" worker-id iteration)
-        wt-branch (format "oompa/%s-i%d" worker-id iteration)
-
-        ;; Create worktree
-        _ (println (format "[%s] Starting iteration %d/%d" worker-id iteration total-iterations))
-        wt-path (str project-root "/" wt-dir)]
-
-    (try
-      ;; Clean stale worktree/branch from previous failed runs before creating
-      (process/sh ["git" "worktree" "remove" wt-dir "--force"] {:dir project-root})
-      (process/sh ["git" "branch" "-D" wt-branch] {:dir project-root})
-
-      ;; Setup worktree (in project root)
-      (let [wt-result (process/sh ["git" "worktree" "add" wt-dir "-b" wt-branch]
-                                  {:dir project-root :out :string :err :string})]
-        (when-not (zero? (:exit wt-result))
-          (throw (ex-info (str "Failed to create worktree: " (:err wt-result))
-                          {:dir wt-dir :branch wt-branch}))))
-
-      ;; Build context
-      (let [context (build-context)
-
-            ;; Run agent
-            {:keys [output exit done?]} (run-agent! worker wt-path context)]
-
-        (cond
-          ;; Agent signaled done — only honor for can_plan workers.
-          ;; Executors (can_plan: false) can't decide work is done.
-          (and done? (:can-plan worker))
-          (do
-            (println (format "[%s] Received __DONE__ signal" worker-id))
-            {:status :done})
-
-          ;; can_plan: false worker said __DONE__ — ignore it, treat as success
-          (and done? (not (:can-plan worker)))
-          (do
-            (println (format "[%s] Ignoring __DONE__ (executor cannot signal done)" worker-id))
-            {:status :continue})
-
-          ;; Agent errored
-          (not (zero? exit))
-          (do
-            (println (format "[%s] Agent error (exit %d): %s" worker-id exit (subs (or output "") 0 (min 200 (count (or output ""))))))
-            {:status :error :exit exit})
-
-          ;; Agent produced no file changes — wasted iteration
-          (not (worktree-has-changes? wt-path))
-          (do
-            (println (format "[%s] No changes produced, skipping review" worker-id))
-            {:status :no-changes})
-
-          ;; Success with changes - run review loop before merge
-          :else
-          (let [{:keys [approved?]} (review-loop! worker wt-path worker-id)]
-            (if approved?
-              (do
-                (merge-to-main! wt-path wt-branch worker-id project-root)
-                (println (format "[%s] Iteration %d/%d complete" worker-id iteration total-iterations))
-                {:status :continue})
-              (do
-                (println (format "[%s] Iteration %d/%d rejected, discarding" worker-id iteration total-iterations))
-                {:status :continue})))))
-
-      (finally
-        ;; Cleanup worktree and branch (in project root)
-        (process/sh ["git" "worktree" "remove" wt-dir "--force"] {:dir project-root})
-        (process/sh ["git" "branch" "-D" wt-branch] {:dir project-root})))))
-
 ;; =============================================================================
 ;; Worker Loop
 ;; =============================================================================
@@ -472,12 +423,17 @@
           (recur (+ waited wait-poll-interval))))))
 
 (defn run-worker!
-  "Run worker loop until done or iterations exhausted.
+  "Run worker loop with persistent sessions.
+
+   Sessions persist across iterations — agents resume where they left off.
+   Worktrees persist until COMPLETE_AND_READY_FOR_MERGE triggers review+merge.
+   __DONE__ stops the worker entirely (planners only).
 
    Returns final worker state."
   [worker]
   (tasks/ensure-dirs!)
-  (let [{:keys [id iterations]} worker]
+  (let [{:keys [id iterations]} worker
+        project-root (System/getProperty "user.dir")]
     (println (format "[%s] Starting worker (%s:%s%s, %d iterations)"
                      id
                      (name (:harness worker))
@@ -491,35 +447,97 @@
 
     (loop [iter 1
            completed 0
-           consec-errors 0]
+           consec-errors 0
+           session-id nil    ;; persistent session-id (nil = start fresh)
+           wt-state nil]     ;; {:dir :branch :path} or nil
       (if (> iter iterations)
         (do
+          ;; Cleanup any lingering worktree
+          (when wt-state
+            (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state)))
           (println (format "[%s] Completed %d iterations" id completed))
           (assoc worker :completed completed :status :exhausted))
 
-        (let [{:keys [status]} (execute-iteration! worker iter iterations)]
-          (case status
-            :done
-            (do
-              (println (format "[%s] Worker done after %d/%d iterations" id iter iterations))
-              (assoc worker :completed iter :status :done))
-
-            :error
+        ;; Ensure worktree exists (create fresh if nil, reuse if persisted)
+        (let [wt-state (try
+                         (or wt-state (create-iteration-worktree! project-root id iter))
+                         (catch Exception e
+                           (println (format "[%s] Worktree creation failed: %s" id (.getMessage e)))
+                           nil))]
+          (if (nil? wt-state)
+            ;; Worktree creation failed — count as error
             (let [errors (inc consec-errors)]
               (if (>= errors max-consecutive-errors)
                 (do
-                  (println (format "[%s] %d consecutive errors, stopping worker" id errors))
+                  (println (format "[%s] %d consecutive errors, stopping" id errors))
                   (assoc worker :completed completed :status :error))
+                (recur (inc iter) completed errors nil nil)))
+
+            ;; Worktree ready — run agent
+            (let [resume? (some? session-id)
+                  _ (println (format "[%s] %s iteration %d/%d"
+                                     id (if resume? "Resuming" "Starting") iter iterations))
+                  context (build-context)
+                  {:keys [output exit done? merge?] :as agent-result}
+                  (run-agent! worker (:path wt-state) context session-id resume?)
+                  new-session-id (:session-id agent-result)]
+
+              (cond
+                ;; Agent errored — cleanup, reset session
+                (not (zero? exit))
+                (let [errors (inc consec-errors)]
+                  (println (format "[%s] Agent error (exit %d): %s"
+                                   id exit (subs (or output "") 0 (min 200 (count (or output ""))))))
+                  (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                  (if (>= errors max-consecutive-errors)
+                    (do
+                      (println (format "[%s] %d consecutive errors, stopping" id errors))
+                      (assoc worker :completed completed :status :error))
+                    (recur (inc iter) completed errors nil nil)))
+
+                ;; COMPLETE_AND_READY_FOR_MERGE — review, merge, reset session
+                merge?
+                (if (worktree-has-changes? (:path wt-state))
+                  (let [{:keys [approved?]} (review-loop! worker (:path wt-state) id)]
+                    (if approved?
+                      (do
+                        (merge-to-main! (:path wt-state) (:branch wt-state) id project-root)
+                        (println (format "[%s] Iteration %d/%d complete" id iter iterations))
+                        (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                        ;; If also __DONE__, stop after merge
+                        (if (and done? (:can-plan worker))
+                          (do
+                            (println (format "[%s] Worker done after merge" id))
+                            (assoc worker :completed (inc completed) :status :done))
+                          (recur (inc iter) (inc completed) 0 nil nil)))
+                      (do
+                        (println (format "[%s] Iteration %d/%d rejected" id iter iterations))
+                        (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                        (recur (inc iter) completed 0 nil nil))))
+                  (do
+                    (println (format "[%s] Merge signaled but no changes, skipping" id))
+                    (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                    (recur (inc iter) completed 0 nil nil)))
+
+                ;; __DONE__ without merge — only honor for planners
+                (and done? (:can-plan worker))
                 (do
-                  (println (format "[%s] Error at iteration %d/%d (%d/%d), continuing..."
-                                   id iter iterations errors max-consecutive-errors))
-                  (recur (inc iter) completed errors))))
+                  (println (format "[%s] Received __DONE__ signal" id))
+                  (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                  (println (format "[%s] Worker done after %d/%d iterations" id iter iterations))
+                  (assoc worker :completed completed :status :done))
 
-            :no-changes
-            (recur (inc iter) completed consec-errors)
+                ;; __DONE__ from executor — ignore, keep working
+                (and done? (not (:can-plan worker)))
+                (do
+                  (println (format "[%s] Ignoring __DONE__ (executor)" id))
+                  (recur (inc iter) completed consec-errors new-session-id wt-state))
 
-            :continue
-            (recur (inc iter) (inc completed) 0)))))))
+                ;; No signal — agent still working, resume next iteration
+                :else
+                (do
+                  (println (format "[%s] Working... (will resume)" id))
+                  (recur (inc iter) completed 0 new-session-id wt-state))))))))))
 
 ;; =============================================================================
 ;; Multi-Worker Execution
