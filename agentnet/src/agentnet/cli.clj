@@ -378,6 +378,20 @@
                           (parse-model-string (:review_model config))
 
                           :else nil)
+
+          ;; Parse planner config — optional dedicated planner
+          ;; Runs in project root, no worktree/review/merge, respects max_pending backpressure
+          planner-config (:planner config)
+          planner-parsed (when planner-config
+                           (let [parsed (parse-model-string (:model planner-config))
+                                 prompts (let [p (:prompt planner-config)]
+                                           (cond (vector? p) p
+                                                 (string? p) [p]
+                                                 :else []))]
+                             (assoc parsed
+                                    :prompts prompts
+                                    :max-pending (or (:max_pending planner-config) 10))))
+
           worker-configs (:workers config)
 
           ;; Expand worker configs by count
@@ -406,6 +420,14 @@
 
       (println (format "Swarm config from %s:" config-file))
       (println (format "  Swarm ID: %s" swarm-id))
+      (when planner-parsed
+        (println (format "  Planner: %s:%s (max_pending: %d%s)"
+                         (name (:harness planner-parsed))
+                         (:model planner-parsed)
+                         (:max-pending planner-parsed)
+                         (if (seq (:prompts planner-parsed))
+                           (str ", prompts: " (str/join ", " (:prompts planner-parsed)))
+                           ""))))
       (when review-parsed
         (println (format "  Reviewer: %s:%s%s"
                          (name (:harness review-parsed))
@@ -426,7 +448,19 @@
       (println)
 
       ;; Preflight: probe each unique model before launching workers
-      (validate-models! worker-configs review-parsed)
+      ;; Include planner model in validation if configured
+      (validate-models! (cond-> worker-configs
+                          planner-config (conj planner-config))
+                        review-parsed)
+
+      ;; Run planner if configured — synchronously before workers
+      (when planner-parsed
+        (println)
+        (println (format "  Planner: %s:%s (max_pending: %d)"
+                         (name (:harness planner-parsed))
+                         (:model planner-parsed)
+                         (:max-pending planner-parsed)))
+        (worker/run-planner! (assoc planner-parsed :swarm-id swarm-id)))
 
       ;; Run workers using new worker module
       (worker/run-workers! workers))))

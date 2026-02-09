@@ -97,6 +97,10 @@
   "Root of the oompa package — set by bin/oompa.js, falls back to cwd."
   (or (System/getenv "OOMPA_PACKAGE_ROOT") "."))
 
+;; Serializes merge-to-main! calls across concurrent workers to prevent
+;; git index corruption from parallel checkout+merge operations.
+(def ^:private merge-lock (Object.))
+
 ;; Resolve absolute paths for CLI binaries at first use.
 ;; ProcessBuilder with :dir set can fail to find bare command names on some
 ;; platforms (macOS + babashka), so we resolve once via `which` and cache.
@@ -406,29 +410,43 @@
   (process/sh ["git" "branch" "-D" wt-branch] {:dir project-root}))
 
 (defn- merge-to-main!
-  "Merge worktree changes to main branch. Returns true on success, throws on failure."
+  "Merge worktree changes to main branch. Serialized via merge-lock to prevent
+   concurrent workers from corrupting the git index. Returns true on success."
   [wt-path wt-id worker-id project-root]
-  (println (format "[%s] Merging changes to main" worker-id))
-  (let [;; Commit in worktree if needed (no-op if already committed)
-        _ (process/sh ["git" "add" "-A"] {:dir wt-path})
-        _ (process/sh ["git" "commit" "-m" (str "Work from " wt-id)]
-                      {:dir wt-path})
-        ;; Checkout main and merge (in project root, not worktree)
-        checkout-result (process/sh ["git" "checkout" "main"]
-                                    {:dir project-root :out :string :err :string})
-        _ (when-not (zero? (:exit checkout-result))
-            (println (format "[%s] MERGE FAILED: could not checkout main: %s"
-                             worker-id (:err checkout-result))))
-        merge-result (when (zero? (:exit checkout-result))
-                       (process/sh ["git" "merge" wt-id "--no-edit"]
-                                   {:dir project-root :out :string :err :string}))
-        success (and (zero? (:exit checkout-result))
-                     (zero? (:exit merge-result)))]
-    (if success
-      (println (format "[%s] Merge successful" worker-id))
-      (when merge-result
-        (println (format "[%s] MERGE FAILED: %s" worker-id (:err merge-result)))))
-    success))
+  (locking merge-lock
+    (println (format "[%s] Merging changes to main" worker-id))
+    (let [;; Commit in worktree if needed (no-op if already committed)
+          _ (process/sh ["git" "add" "-A"] {:dir wt-path})
+          _ (process/sh ["git" "commit" "-m" (str "Work from " wt-id)]
+                        {:dir wt-path})
+          ;; Checkout main and merge (in project root, not worktree)
+          checkout-result (process/sh ["git" "checkout" "main"]
+                                      {:dir project-root :out :string :err :string})
+          _ (when-not (zero? (:exit checkout-result))
+              (println (format "[%s] MERGE FAILED: could not checkout main: %s"
+                               worker-id (:err checkout-result))))
+          merge-result (when (zero? (:exit checkout-result))
+                         (process/sh ["git" "merge" wt-id "--no-edit"]
+                                     {:dir project-root :out :string :err :string}))
+          success (and (zero? (:exit checkout-result))
+                       (zero? (:exit merge-result)))]
+      (if success
+        (println (format "[%s] Merge successful" worker-id))
+        (when merge-result
+          (println (format "[%s] MERGE FAILED: %s" worker-id (:err merge-result)))))
+      success)))
+
+(defn- task-only-diff?
+  "Check if all changes in worktree are task files only (no code changes).
+   Returns true if diff only touches files under tasks/ directory."
+  [wt-path]
+  (let [result (process/sh ["git" "diff" "main" "--name-only"]
+                           {:dir wt-path :out :string :err :string})
+        files (when (zero? (:exit result))
+                (->> (str/split-lines (:out result))
+                     (remove str/blank?)))]
+    (and (seq files)
+         (every? #(str/starts-with? % "tasks/") files))))
 
 (defn- review-loop!
   "Run review loop: reviewer checks → if issues, fix & retry → back to reviewer.
@@ -568,22 +586,35 @@
                 ;; COMPLETE_AND_READY_FOR_MERGE — review, merge, reset session
                 merge?
                 (if (worktree-has-changes? (:path wt-state))
-                  (let [{:keys [approved?]} (review-loop! worker (:path wt-state) id)]
-                    (if approved?
-                      (do
-                        (merge-to-main! (:path wt-state) (:branch wt-state) id project-root)
-                        (println (format "[%s] Iteration %d/%d complete" id iter iterations))
-                        (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                        ;; If also __DONE__, stop after merge
-                        (if (and done? (:can-plan worker))
-                          (do
-                            (println (format "[%s] Worker done after merge" id))
-                            (assoc worker :completed (inc completed) :status :done))
-                          (recur (inc iter) (inc completed) 0 nil nil)))
-                      (do
-                        (println (format "[%s] Iteration %d/%d rejected" id iter iterations))
-                        (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                        (recur (inc iter) completed 0 nil nil))))
+                  (if (task-only-diff? (:path wt-state))
+                    ;; Task-only changes — skip review, auto-merge
+                    (do
+                      (println (format "[%s] Task-only diff, auto-merging" id))
+                      (merge-to-main! (:path wt-state) (:branch wt-state) id project-root)
+                      (println (format "[%s] Iteration %d/%d complete" id iter iterations))
+                      (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                      (if (and done? (:can-plan worker))
+                        (do
+                          (println (format "[%s] Worker done after merge" id))
+                          (assoc worker :completed (inc completed) :status :done))
+                        (recur (inc iter) (inc completed) 0 nil nil)))
+                    ;; Code changes — full review loop
+                    (let [{:keys [approved?]} (review-loop! worker (:path wt-state) id)]
+                      (if approved?
+                        (do
+                          (merge-to-main! (:path wt-state) (:branch wt-state) id project-root)
+                          (println (format "[%s] Iteration %d/%d complete" id iter iterations))
+                          (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                          ;; If also __DONE__, stop after merge
+                          (if (and done? (:can-plan worker))
+                            (do
+                              (println (format "[%s] Worker done after merge" id))
+                              (assoc worker :completed (inc completed) :status :done))
+                            (recur (inc iter) (inc completed) 0 nil nil)))
+                        (do
+                          (println (format "[%s] Iteration %d/%d rejected" id iter iterations))
+                          (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                          (recur (inc iter) completed 0 nil nil)))))
                   (do
                     (println (format "[%s] Merge signaled but no changes, skipping" id))
                     (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
@@ -597,11 +628,14 @@
                   (println (format "[%s] Worker done after %d/%d iterations" id iter iterations))
                   (assoc worker :completed completed :status :done))
 
-                ;; __DONE__ from executor — ignore, keep working
+                ;; __DONE__ from executor — ignore signal, but reset session since
+                ;; the agent process exited. Resuming a dead session causes exit 1
+                ;; which cascades into consecutive errors and premature stopping.
                 (and done? (not (:can-plan worker)))
                 (do
-                  (println (format "[%s] Ignoring __DONE__ (executor)" id))
-                  (recur (inc iter) completed consec-errors new-session-id wt-state))
+                  (println (format "[%s] Ignoring __DONE__ (executor), resetting session" id))
+                  (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                  (recur (inc iter) completed 0 nil nil))
 
                 ;; No signal — agent still working, resume next iteration
                 :else
@@ -640,3 +674,72 @@
                          (name (:status w))
                          (:completed w))))
       results)))
+
+;; =============================================================================
+;; Planner — first-class config concept, NOT a worker
+;; =============================================================================
+;; The planner creates task EDN files in tasks/pending/.
+;; It runs in the project root (no worktree), has no review/merge cycle,
+;; and respects max_pending backpressure to avoid flooding the queue.
+
+(defn run-planner!
+  "Run planner agent to create tasks. No worktree, no review, no merge.
+   Runs in project root. Respects max_pending cap.
+   Returns {:tasks-created N}"
+  [{:keys [harness model prompts max-pending swarm-id]}]
+  (tasks/ensure-dirs!)
+  (let [project-root (System/getProperty "user.dir")
+        pending-before (tasks/pending-count)
+        max-pending (or max-pending 10)]
+    ;; Backpressure: skip if queue is full
+    (if (>= pending-before max-pending)
+      (do
+        (println (format "[planner] Skipping — %d pending tasks (max: %d)" pending-before max-pending))
+        {:tasks-created 0})
+      ;; Run agent
+      (let [context (build-context)
+            prompt-text (str (when (seq prompts)
+                               (->> prompts
+                                    (map load-prompt)
+                                    (remove nil?)
+                                    (str/join "\n\n")))
+                             "\n\nTask Status: " (:task_status context) "\n"
+                             "Pending: " (:pending_tasks context) "\n\n"
+                             "Create tasks in tasks/pending/ as .edn files.\n"
+                             "Maximum " (- max-pending pending-before) " new tasks.\n"
+                             "Signal __DONE__ when finished planning.")
+            swarm-id* (or swarm-id "unknown")
+            tagged-prompt (str "[oompa:" swarm-id* ":planner] " prompt-text)
+            abs-root (.getAbsolutePath (io/file project-root))
+
+            cmd (case harness
+                  :codex (cond-> [(resolve-binary! "codex") "exec"
+                                  "--dangerously-bypass-approvals-and-sandbox"
+                                  "--skip-git-repo-check"
+                                  "-C" abs-root]
+                           model (into ["--model" model])
+                           true (conj "--" tagged-prompt))
+                  :claude (cond-> [(resolve-binary! "claude") "-p" "--dangerously-skip-permissions"]
+                            model (into ["--model" model])))
+
+            _ (println (format "[planner] Running (%s:%s, max_pending: %d, current: %d)"
+                               (name harness) (or model "default") max-pending pending-before))
+
+            result (try
+                     (if (= harness :claude)
+                       (process/sh cmd {:dir abs-root :in tagged-prompt :out :string :err :string})
+                       (process/sh cmd {:dir abs-root :out :string :err :string}))
+                     (catch Exception e
+                       (println (format "[planner] Agent exception: %s" (.getMessage e)))
+                       {:exit -1 :out "" :err (.getMessage e)}))
+
+            ;; Commit any new task files
+            _ (process/sh ["git" "add" "tasks/pending/"] {:dir abs-root})
+            _ (process/sh ["git" "commit" "-m" "Planner: add tasks"]
+                          {:dir abs-root :out :string :err :string})
+
+            pending-after (tasks/pending-count)
+            created (- pending-after pending-before)]
+
+        (println (format "[planner] Done. Created %d tasks (pending: %d)" created pending-after))
+        {:tasks-created created}))))
