@@ -241,12 +241,16 @@
 (defn- run-reviewer!
   "Run reviewer on worktree changes.
    Uses custom review-prompts when configured, otherwise falls back to default.
-   Returns {:verdict :approved|:needs-changes|:rejected, :comments [...]}"
-  [{:keys [id swarm-id review-harness review-model review-prompts]} worktree-path]
-  (let [;; Get diff for context
-        diff-result (process/sh ["git" "diff" "main" "--stat"]
+   prev-feedback: vector of previous review outputs (for multi-round context).
+   Returns {:verdict :approved|:needs-changes|:rejected, :comments [...], :output string}"
+  [{:keys [id swarm-id review-harness review-model review-prompts]} worktree-path prev-feedback]
+  (let [;; Get actual diff content (not just stat) — truncate to 8000 chars for prompt budget
+        diff-result (process/sh ["git" "diff" "main"]
                                 {:dir worktree-path :out :string :err :string})
-        diff-summary (:out diff-result)
+        diff-content (let [d (:out diff-result)]
+                       (if (> (count d) 8000)
+                         (str (subs d 0 8000) "\n... [diff truncated at 8000 chars]")
+                         d))
 
         ;; Build review prompt — use custom prompts if configured, else default
         swarm-id* (or swarm-id "unknown")
@@ -255,23 +259,27 @@
                              (map load-prompt)
                              (remove nil?)
                              (str/join "\n\n")))
-        review-body (if custom-prompt
-                      (str custom-prompt "\n\n"
-                           "Diff summary:\n" diff-summary "\n\n"
-                           "Respond with:\n"
-                           "- APPROVED if changes are good\n"
-                           "- NEEDS_CHANGES with bullet points of issues\n"
-                           "- REJECTED if fundamentally wrong")
-                      (str "Review the changes in this worktree.\n\n"
-                           "Diff summary:\n" diff-summary "\n\n"
-                           "Check for:\n"
-                           "- Code correctness\n"
-                           "- Matches the intended task\n"
-                           "- No obvious bugs or issues\n\n"
-                           "Respond with:\n"
-                           "- APPROVED if changes are good\n"
-                           "- NEEDS_CHANGES with bullet points of issues\n"
-                           "- REJECTED if fundamentally wrong"))
+
+        ;; Include previous review history for multi-round context
+        history-block (when (seq prev-feedback)
+                        (str "\n## Previous Review Rounds\n\n"
+                             "The worker has already attempted fixes based on earlier feedback. "
+                             "Do NOT raise new issues — only verify the original issues are resolved.\n\n"
+                             (->> prev-feedback
+                                  (map-indexed (fn [i fb]
+                                    (str "### Round " (inc i) " feedback:\n" fb)))
+                                  (str/join "\n\n"))
+                             "\n\n"))
+
+        review-body (str (or custom-prompt
+                              (str "Review the changes in this worktree.\n"
+                                   "Focus on architecture and design, not style.\n"))
+                         "\n\nDiff:\n```\n" diff-content "\n```\n"
+                         (when history-block history-block)
+                         "\nYour verdict MUST be on its own line, exactly one of:\n"
+                         "VERDICT: APPROVED\n"
+                         "VERDICT: NEEDS_CHANGES\n"
+                         "VERDICT: REJECTED\n")
         review-prompt (str "[oompa:" swarm-id* ":" id "] " review-body)
 
         abs-wt (.getAbsolutePath (io/file worktree-path))
@@ -295,25 +303,47 @@
                  (catch Exception e
                    {:exit -1 :out "" :err (.getMessage e)}))
 
-        output (:out result)]
+        output (:out result)
 
-    {:verdict (cond
-                (re-find #"(?i)\bAPPROVED\b" output) :approved
-                (re-find #"(?i)\bREJECTED\b" output) :rejected
-                :else :needs-changes)
+        ;; Parse verdict — require explicit VERDICT: prefix to avoid false matches
+        verdict (cond
+                  (re-find #"VERDICT:\s*APPROVED" output) :approved
+                  (re-find #"VERDICT:\s*REJECTED" output) :rejected
+                  (re-find #"VERDICT:\s*NEEDS_CHANGES" output) :needs-changes
+                  ;; Fallback to loose matching if reviewer didn't use prefix
+                  (re-find #"(?i)\bAPPROVED\b" output) :approved
+                  (re-find #"(?i)\bREJECTED\b" output) :rejected
+                  :else :needs-changes)]
+
+    ;; Log reviewer output (truncated) for visibility
+    (println (format "[%s] Reviewer verdict: %s" id (name verdict)))
+    (let [summary (subs output 0 (min 300 (count output)))]
+      (println (format "[%s] Review: %s%s" id summary
+                       (if (> (count output) 300) "..." ""))))
+
+    {:verdict verdict
      :comments (when (not= (:exit result) 0)
                  [(:err result)])
      :output output}))
 
 (defn- run-fix!
   "Ask worker to fix issues based on reviewer feedback.
+   all-feedback: vector of all reviewer outputs so far (accumulated across rounds).
    Returns {:output string, :exit int}"
-  [{:keys [id swarm-id harness model]} worktree-path feedback]
+  [{:keys [id swarm-id harness model]} worktree-path all-feedback]
   (let [swarm-id* (or swarm-id "unknown")
+        feedback-text (if (> (count all-feedback) 1)
+                        (str "The reviewer has given feedback across " (count all-feedback) " rounds.\n"
+                             "Fix ALL outstanding issues:\n\n"
+                             (->> all-feedback
+                                  (map-indexed (fn [i fb]
+                                    (str "--- Round " (inc i) " ---\n" fb)))
+                                  (str/join "\n\n")))
+                        (str "The reviewer found issues with your changes:\n\n"
+                             (first all-feedback)))
         fix-prompt (str "[oompa:" swarm-id* ":" id "] "
-                        "The reviewer found issues with your changes:\n\n"
-                        feedback "\n\n"
-                        "Please fix these issues in the worktree.")
+                        feedback-text "\n\n"
+                        "Fix these issues. Do not add anything the reviewer did not ask for.")
 
         abs-wt (.getAbsolutePath (io/file worktree-path))
 
@@ -402,36 +432,40 @@
 
 (defn- review-loop!
   "Run review loop: reviewer checks → if issues, fix & retry → back to reviewer.
+   Accumulates feedback across rounds so reviewer doesn't raise new issues
+   and fixer has full context of all prior feedback.
    Returns {:approved? bool, :attempts int}"
   [worker wt-path worker-id]
   (if-not (and (:review-harness worker) (:review-model worker))
     ;; No reviewer configured, auto-approve
     {:approved? true :attempts 0}
 
-    ;; Run review loop
-    (loop [attempt 1]
+    ;; Run review loop with accumulated feedback
+    (loop [attempt 1
+           prev-feedback []]
       (println (format "[%s] Review attempt %d/%d" worker-id attempt max-review-retries))
-      (let [{:keys [verdict output]} (run-reviewer! worker wt-path)]
+      (let [{:keys [verdict output]} (run-reviewer! worker wt-path prev-feedback)]
         (case verdict
           :approved
           (do
-            (println (format "[%s] Reviewer APPROVED" worker-id))
+            (println (format "[%s] Reviewer APPROVED (attempt %d)" worker-id attempt))
             {:approved? true :attempts attempt})
 
           :rejected
           (do
-            (println (format "[%s] Reviewer REJECTED" worker-id))
+            (println (format "[%s] Reviewer REJECTED (attempt %d)" worker-id attempt))
             {:approved? false :attempts attempt})
 
           ;; :needs-changes
-          (if (>= attempt max-review-retries)
-            (do
-              (println (format "[%s] Max review retries reached" worker-id))
-              {:approved? false :attempts attempt})
-            (do
-              (println (format "[%s] Reviewer requested changes, fixing..." worker-id))
-              (run-fix! worker wt-path output)
-              (recur (inc attempt)))))))))
+          (let [all-feedback (conj prev-feedback output)]
+            (if (>= attempt max-review-retries)
+              (do
+                (println (format "[%s] Max review retries reached (%d rounds)" worker-id attempt))
+                {:approved? false :attempts attempt})
+              (do
+                (println (format "[%s] Reviewer requested changes, fixing..." worker-id))
+                (run-fix! worker wt-path all-feedback)
+                (recur (inc attempt) all-feedback)))))))))
 
 ;; =============================================================================
 ;; Worker Loop
