@@ -127,8 +127,10 @@
   "Create a worker config.
    :prompts is a string or vector of strings — paths to prompt files.
    :can-plan when false, worker waits for tasks before starting (backpressure).
-   :reasoning reasoning effort level (e.g. \"low\", \"medium\", \"high\") — codex only."
-  [{:keys [id swarm-id harness model iterations prompts can-plan reasoning review-harness review-model]}]
+   :reasoning reasoning effort level (e.g. \"low\", \"medium\", \"high\") — codex only.
+   :review-prompts paths to reviewer prompt files (loaded and concatenated for review)."
+  [{:keys [id swarm-id harness model iterations prompts can-plan reasoning
+           review-harness review-model review-prompts]}]
   {:id id
    :swarm-id swarm-id
    :harness (or harness :codex)
@@ -142,6 +144,10 @@
    :reasoning reasoning
    :review-harness review-harness
    :review-model review-model
+   :review-prompts (cond
+                     (vector? review-prompts) review-prompts
+                     (string? review-prompts) [review-prompts]
+                     :else [])
    :completed 0
    :status :idle})
 
@@ -234,17 +240,29 @@
 
 (defn- run-reviewer!
   "Run reviewer on worktree changes.
+   Uses custom review-prompts when configured, otherwise falls back to default.
    Returns {:verdict :approved|:needs-changes|:rejected, :comments [...]}"
-  [{:keys [id swarm-id review-harness review-model]} worktree-path]
+  [{:keys [id swarm-id review-harness review-model review-prompts]} worktree-path]
   (let [;; Get diff for context
         diff-result (process/sh ["git" "diff" "main" "--stat"]
                                 {:dir worktree-path :out :string :err :string})
         diff-summary (:out diff-result)
 
-        ;; Build review prompt (tagged for claude-web-view worker detection)
+        ;; Build review prompt — use custom prompts if configured, else default
         swarm-id* (or swarm-id "unknown")
-        review-prompt (str "[oompa:" swarm-id* ":" id "] "
-                           "Review the changes in this worktree.\n\n"
+        custom-prompt (when (seq review-prompts)
+                        (->> review-prompts
+                             (map load-prompt)
+                             (remove nil?)
+                             (str/join "\n\n")))
+        review-body (if custom-prompt
+                      (str custom-prompt "\n\n"
+                           "Diff summary:\n" diff-summary "\n\n"
+                           "Respond with:\n"
+                           "- APPROVED if changes are good\n"
+                           "- NEEDS_CHANGES with bullet points of issues\n"
+                           "- REJECTED if fundamentally wrong")
+                      (str "Review the changes in this worktree.\n\n"
                            "Diff summary:\n" diff-summary "\n\n"
                            "Check for:\n"
                            "- Code correctness\n"
@@ -253,7 +271,8 @@
                            "Respond with:\n"
                            "- APPROVED if changes are good\n"
                            "- NEEDS_CHANGES with bullet points of issues\n"
-                           "- REJECTED if fundamentally wrong")
+                           "- REJECTED if fundamentally wrong"))
+        review-prompt (str "[oompa:" swarm-id* ":" id "] " review-body)
 
         abs-wt (.getAbsolutePath (io/file worktree-path))
 
@@ -319,10 +338,19 @@
      :exit (:exit result)}))
 
 (defn- worktree-has-changes?
-  "Check if worktree has any uncommitted changes (new/modified/deleted files)."
+  "Check if worktree has committed OR uncommitted changes vs main.
+   Workers commit before signaling merge, so we must check both:
+   1. Uncommitted changes (git status --porcelain)
+   2. Commits ahead of main (git rev-list --count main..HEAD)"
   [wt-path]
-  (let [result (process/sh ["git" "status" "--porcelain"] {:dir wt-path :out :string :err :string})]
-    (not (str/blank? (:out result)))))
+  (let [uncommitted (process/sh ["git" "status" "--porcelain"]
+                                {:dir wt-path :out :string :err :string})
+        ahead (process/sh ["git" "rev-list" "--count" "main..HEAD"]
+                          {:dir wt-path :out :string :err :string})
+        ahead-count (try (Integer/parseInt (str/trim (:out ahead)))
+                         (catch Exception _ 0))]
+    (or (not (str/blank? (:out uncommitted)))
+        (pos? ahead-count))))
 
 (defn- create-iteration-worktree!
   "Create a fresh worktree for an iteration. Returns {:dir :branch :path}.
@@ -348,21 +376,29 @@
   (process/sh ["git" "branch" "-D" wt-branch] {:dir project-root}))
 
 (defn- merge-to-main!
-  "Merge worktree changes to main branch"
+  "Merge worktree changes to main branch. Returns true on success, throws on failure."
   [wt-path wt-id worker-id project-root]
   (println (format "[%s] Merging changes to main" worker-id))
-  (let [;; Commit in worktree if needed
+  (let [;; Commit in worktree if needed (no-op if already committed)
         _ (process/sh ["git" "add" "-A"] {:dir wt-path})
         _ (process/sh ["git" "commit" "-m" (str "Work from " wt-id)]
                       {:dir wt-path})
         ;; Checkout main and merge (in project root, not worktree)
         checkout-result (process/sh ["git" "checkout" "main"]
                                     {:dir project-root :out :string :err :string})
+        _ (when-not (zero? (:exit checkout-result))
+            (println (format "[%s] MERGE FAILED: could not checkout main: %s"
+                             worker-id (:err checkout-result))))
         merge-result (when (zero? (:exit checkout-result))
                        (process/sh ["git" "merge" wt-id "--no-edit"]
-                                   {:dir project-root :out :string :err :string}))]
-    (and (zero? (:exit checkout-result))
-         (zero? (:exit merge-result)))))
+                                   {:dir project-root :out :string :err :string}))
+        success (and (zero? (:exit checkout-result))
+                     (zero? (:exit merge-result)))]
+    (if success
+      (println (format "[%s] Merge successful" worker-id))
+      (when merge-result
+        (println (format "[%s] MERGE FAILED: %s" worker-id (:err merge-result)))))
+    success))
 
 (defn- review-loop!
   "Run review loop: reviewer checks → if issues, fix & retry → back to reviewer.

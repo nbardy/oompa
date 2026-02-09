@@ -361,7 +361,23 @@
       (println "prompt: string or array of paths — concatenated into one prompt.")
       (System/exit 1))
     (let [config (json/parse-string (slurp f) true)
-          review-model (some-> (:review_model config) parse-model-string)
+          ;; Parse reviewer config — supports both formats:
+          ;; Legacy: {"review_model": "harness:model:reasoning"}
+          ;; New:    {"reviewer": {"model": "harness:model:reasoning", "prompt": ["path.md"]}}
+          reviewer-config (:reviewer config)
+          review-parsed (cond
+                          reviewer-config
+                          (let [parsed (parse-model-string (:model reviewer-config))
+                                prompts (let [p (:prompt reviewer-config)]
+                                          (cond (vector? p) p
+                                                (string? p) [p]
+                                                :else []))]
+                            (assoc parsed :prompts prompts))
+
+                          (:review_model config)
+                          (parse-model-string (:review_model config))
+
+                          :else nil)
           worker-configs (:workers config)
 
           ;; Expand worker configs by count
@@ -383,14 +399,20 @@
                            :iterations (or (:iterations wc) 10)
                            :prompts (:prompt wc)
                            :can-plan (:can_plan wc)
-                           :review-harness (:harness review-model)
-                           :review-model (:model review-model)})))
+                           :review-harness (:harness review-parsed)
+                           :review-model (:model review-parsed)
+                           :review-prompts (:prompts review-parsed)})))
                     expanded-workers)]
 
       (println (format "Swarm config from %s:" config-file))
       (println (format "  Swarm ID: %s" swarm-id))
-      (when review-model
-        (println (format "  Review: %s:%s" (name (:harness review-model)) (:model review-model))))
+      (when review-parsed
+        (println (format "  Reviewer: %s:%s%s"
+                         (name (:harness review-parsed))
+                         (:model review-parsed)
+                         (if (seq (:prompts review-parsed))
+                           (str " (prompts: " (str/join ", " (:prompts review-parsed)) ")")
+                           ""))))
       (println (format "  Workers: %d total" (count workers)))
       (doseq [[idx wc] (map-indexed vector worker-configs)]
         (let [{:keys [harness model reasoning]} (parse-model-string (:model wc))]
@@ -404,7 +426,7 @@
       (println)
 
       ;; Preflight: probe each unique model before launching workers
-      (validate-models! worker-configs review-model)
+      (validate-models! worker-configs review-parsed)
 
       ;; Run workers using new worker module
       (worker/run-workers! workers))))
