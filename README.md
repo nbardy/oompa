@@ -39,7 +39,7 @@ This repo has a fleshed out version of the idea. The oompa loompas are organized
 
 - **Different worker types** — small models for fast execution, big models for planning
 - **Separate review model** — use a smart model to check work before merging
-- **Mixed harnesses** — combine Claude and Codex workers in one swarm
+- **Mixed harnesses** — combine Claude, Codex, and Opencode workers in one swarm
 - **Self-directed tasks** — workers create and claim tasks from shared folders
 
 ### Architecture
@@ -84,20 +84,22 @@ This repo has a fleshed out version of the idea. The oompa loompas are organized
 {
   "workers": [
     {"model": "claude:opus", "prompt": ["config/prompts/planner.md"], "iterations": 5, "count": 1},
-    {"model": "codex:gpt-5.3-codex:medium", "prompt": ["config/prompts/executor.md"], "iterations": 10, "count": 3, "can_plan": false}
+    {"model": "codex:gpt-5.3-codex:medium", "prompt": ["config/prompts/executor.md"], "iterations": 10, "count": 2, "can_plan": false},
+    {"model": "opencode:openai/gpt-5", "prompt": ["config/prompts/executor.md"], "iterations": 10, "count": 1, "can_plan": false}
   ]
 }
 ```
 
 This spawns:
 - **1 planner** (opus) — reads spec, explores codebase, creates/refines tasks
-- **3 executors** (gpt-5.3-codex, medium reasoning) — claims and executes tasks fast
+- **2 codex executors** (gpt-5.3-codex, medium reasoning) — claims and executes tasks fast
+- **1 opencode executor** (openai/gpt-5) — same task loop via `opencode run`
 
 #### Worker fields
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `model` | yes | `harness:model` or `harness:model:reasoning` (e.g. `codex:gpt-5.3-codex:medium`, `claude:opus`) |
+| `model` | yes | `harness:model` or `harness:model:reasoning` (e.g. `codex:gpt-5.3-codex:medium`, `claude:opus`, `opencode:openai/gpt-5`) |
 | `prompt` | no | String or array of paths — concatenated into one prompt |
 | `iterations` | no | Max iterations per worker (default: 10) |
 | `count` | no | Number of workers with this config (default: 1) |
@@ -111,7 +113,7 @@ This spawns:
 {
   "workers": [
     {"model": "claude:opus-4.5", "prompt": ["prompts/base.md", "prompts/architect.md"], "count": 1},
-    {"model": "codex:codex-5.2-mini", "prompt": ["prompts/base.md", "prompts/frontend.md"], "count": 2},
+    {"model": "opencode:openai/gpt-5-mini", "prompt": ["prompts/base.md", "prompts/frontend.md"], "count": 2},
     {"model": "codex:codex-5.2-mini", "prompt": ["prompts/base.md", "prompts/backend.md"], "count": 2}
   ]
 }
@@ -202,21 +204,28 @@ oompa help                  # Show all commands
 
 `./swarm.bb ...` works the same when running from a source checkout.
 
+## Opencode Harness
+
+`opencode` workers use one-shot `opencode run --format json` calls with the same worker prompt tagging:
+
+- First prompt line still starts with `[oompa:<swarmId>:<workerId>]`
+- `-m/--model` is passed when a worker model is configured
+- First iteration starts without `--session`; the worker captures `sessionID` from that exact run output
+- On resumed iterations, workers pass `-s/--session <captured-id> --continue`
+- Oompa does not call `opencode session list` to guess a "latest" session
+- Worker completion markers (`COMPLETE_AND_READY_FOR_MERGE`, `__DONE__`) are evaluated from extracted text events, preserving existing done/merge behavior
+- Optional attach mode: set `OOMPA_OPENCODE_ATTACH` (or `OPENCODE_ATTACH`) to add `--attach <url>`
+
 ## Worker Conversation Persistence
 
-If `codex-persist` is available, each worker writes its prompt/response messages
-to a per-worker session file for external UIs (for example worker panes in
-`claude-web-view`).
+Workers rely on each CLI's native session persistence (no custom mirror writer):
 
-- Session ID: random lowercase UUID per iteration (one file per iteration)
-- First user message tag format: `[oompa:<swarmId>:<workerId>]`
-- CWD passed to `codex-persist` is the worker worktree absolute path
-- Codex workers use `codex-persist` writes; Claude workers use native `--session-id`
+- Codex: native rollouts under `~/.codex/sessions/YYYY/MM/DD/*.jsonl`
+- Claude: native project sessions under `~/.claude/projects/*/*.jsonl`
+- Opencode: native session store managed by `opencode`
 
-Resolution order for the CLI command:
-1. `CODEX_PERSIST_BIN` (if set)
-2. `codex-persist` on `PATH`
-3. `node ~/git/codex-persist/dist/cli.js`
+Oompa still tags the first prompt line with `[oompa:<swarmId>:<workerId>]`
+so downstream UIs can identify and group worker conversations.
 
 ## Requirements
 
@@ -226,6 +235,7 @@ Resolution order for the CLI command:
 - One of:
   - [Claude CLI](https://github.com/anthropics/claude-cli)
   - [Codex CLI](https://github.com/openai/codex)
+  - [Opencode CLI](https://github.com/sst/opencode)
 
 ## License
 

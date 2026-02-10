@@ -15,79 +15,11 @@
   (:require [agentnet.tasks :as tasks]
             [agentnet.agent :as agent]
             [agentnet.worktree :as worktree]
+            [agentnet.runs :as runs]
+            [cheshire.core :as json]
             [babashka.process :as process]
             [clojure.java.io :as io]
             [clojure.string :as str]))
-
-;; =============================================================================
-;; codex-persist integration
-;; =============================================================================
-
-(def ^:private persist-cmd* (atom nil))
-(def ^:private persist-missing-warned?* (atom false))
-
-(defn- command-ok?
-  "Return true if command vector is executable (exit code ignored)."
-  [cmd]
-  (try
-    (do
-      (process/sh (vec cmd) {:out :string :err :string :continue true})
-      true)
-    (catch Exception _
-      false)))
-
-(defn- resolve-codex-persist-cmd
-  "Resolve codex-persist command vector.
-   Order:
-   1) CODEX_PERSIST_BIN env var
-   2) codex-persist on PATH
-   3) node ~/git/codex-persist/dist/cli.js"
-  []
-  (let [cached @persist-cmd*]
-    (if (some? cached)
-      cached
-      (let [env-bin (System/getenv "CODEX_PERSIST_BIN")
-            env-cmd (when (and env-bin (not (str/blank? env-bin)))
-                      [env-bin])
-            path-cmd ["codex-persist"]
-            local-cli (str (System/getProperty "user.home") "/git/codex-persist/dist/cli.js")
-            local-cmd (when (.exists (io/file local-cli))
-                        ["node" local-cli])
-            cmd (cond
-                  (and env-cmd (command-ok? env-cmd)) env-cmd
-                  (command-ok? path-cmd) path-cmd
-                  (and local-cmd (command-ok? local-cmd)) local-cmd
-                  :else false)]
-        (reset! persist-cmd* cmd)
-        cmd))))
-
-(defn- safe-assistant-content
-  "Pick a non-empty assistant message payload for persistence."
-  [result]
-  (let [out (or (:out result) "")
-        err (or (:err result) "")
-        exit-code (or (:exit result) -1)]
-    (cond
-      (not (str/blank? out)) out
-      (not (str/blank? err)) (str "[agent stderr] " err)
-      :else (str "[agent exit " exit-code "]"))))
-
-(defn- persist-message!
-  "Write a single message to codex-persist; no-op if unavailable."
-  [worker-id session-id cwd role content]
-  (let [resolved (resolve-codex-persist-cmd)]
-    (if (and resolved (not= resolved false))
-      (let [persist-cmd resolved
-            payload (if (str/blank? content) "(empty)" content)
-            result (try
-                     (process/sh (into persist-cmd ["write" session-id cwd role payload])
-                                 {:out :string :err :string})
-                     (catch Exception e
-                       {:exit -1 :out "" :err (.getMessage e)}))]
-        (when-not (zero? (:exit result))
-          (println (format "[%s] codex-persist write failed (%s)" worker-id role))))
-      (when (compare-and-set! persist-missing-warned?* false true)
-        (println "[oompa] codex-persist not found; set CODEX_PERSIST_BIN or install/link codex-persist")))))
 
 ;; =============================================================================
 ;; Worker State
@@ -174,13 +106,53 @@
      :task_status (format "Pending: %d, In Progress: %d, Complete: %d"
                           (count pending) (count current) (count complete))}))
 
+(defn- opencode-attach-url
+  "Optional opencode server URL for run --attach mode."
+  []
+  (let [url (or (System/getenv "OOMPA_OPENCODE_ATTACH")
+                (System/getenv "OPENCODE_ATTACH"))]
+    (when (and url (not (str/blank? url)))
+      url)))
+
+(defn- parse-opencode-run-output
+  "Parse `opencode run --format json` output.
+   Returns {:session-id string|nil, :text string|nil}."
+  [s]
+  (let [raw (or s "")
+        events (->> (str/split-lines raw)
+                    (keep (fn [line]
+                            (try
+                              (json/parse-string line true)
+                              (catch Exception _
+                                nil))))
+                    doall)
+        session-id (or (some #(or (:sessionID %)
+                                   (:sessionId %)
+                                   (get-in % [:part :sessionID])
+                                   (get-in % [:part :sessionId]))
+                             events)
+                       (some-> (re-find #"(ses_[A-Za-z0-9]+)" raw) second))
+        text (->> events
+                  (keep (fn [event]
+                          (let [event-type (or (:type event) (get-in event [:part :type]))
+                                chunk (or (:text event) (get-in event [:part :text]))]
+                            (when (and (= event-type "text")
+                                       (string? chunk)
+                                       (not (str/blank? chunk)))
+                              chunk))))
+                  (str/join ""))]
+    {:session-id session-id
+     :text (when-not (str/blank? text) text)}))
+
 (defn- run-agent!
   "Run agent with prompt, return {:output string, :done? bool, :merge? bool, :exit int, :session-id string}.
-   When resume? is true and harness is :claude, uses --resume to continue the existing session
+   When resume? is true and harness is :claude/:opencode, continues the existing session
    with a lighter prompt (just task status + continue instruction)."
   [{:keys [id swarm-id harness model prompts reasoning]} worktree-path context session-id resume?]
-  (let [;; Use provided session-id or generate fresh one
-        session-id (or session-id (str/lower-case (str (java.util.UUID/randomUUID))))
+  (let [;; Use provided session-id, otherwise generate one for harnesses that accept custom IDs.
+        session-id (or session-id
+                       (when (#{:codex :claude} harness)
+                         (str/lower-case (str (java.util.UUID/randomUUID)))))
 
         ;; Build prompt — lighter for resume (agent already has full context)
         prompt (if resume?
@@ -203,11 +175,14 @@
         swarm-id* (or swarm-id "unknown")
         tagged-prompt (str "[oompa:" swarm-id* ":" id "] " prompt)
         abs-worktree (.getAbsolutePath (io/file worktree-path))
+        opencode-attach (opencode-attach-url)
 
-        ;; Build command — both harnesses run with cwd=worktree, no sandbox
+        ;; Build command — all harnesses run with cwd=worktree, no sandbox
         ;; so agents can `..` to reach project root for task management
         ;; Claude: --resume flag continues existing session-id conversation
-        ;; Codex: no resume support, always fresh (but worktree state persists)
+        ;; Opencode: -s/--session + --continue continue existing session
+        ;; and --format json for deterministic per-run session capture.
+        ;; Codex: no native resume support, always fresh (but worktree state persists)
         cmd (case harness
               :codex (cond-> [(resolve-binary! "codex") "exec"
                               "--dangerously-bypass-approvals-and-sandbox"
@@ -219,28 +194,35 @@
               :claude (cond-> [(resolve-binary! "claude") "-p" "--dangerously-skip-permissions"
                                "--session-id" session-id]
                         resume? (conj "--resume")
-                        model (into ["--model" model])))
+                        model (into ["--model" model]))
+              :opencode (cond-> [(resolve-binary! "opencode") "run" "--format" "json"]
+                          model (into ["-m" model])
+                          opencode-attach (into ["--attach" opencode-attach])
+                          (and resume? session-id) (into ["-s" session-id "--continue"])
+                          true (conj tagged-prompt)))
 
-        _ (when (= harness :codex)
-            (persist-message! id session-id abs-worktree "user" tagged-prompt))
-
-        ;; Run agent — both run with cwd=worktree
+        ;; Run agent — all run with cwd=worktree
         result (try
                  (if (= harness :claude)
                    (process/sh cmd {:dir abs-worktree :in tagged-prompt :out :string :err :string})
                    (process/sh cmd {:dir abs-worktree :out :string :err :string}))
                  (catch Exception e
                    (println (format "[%s] Agent exception: %s" id (.getMessage e)))
-                   {:exit -1 :out "" :err (.getMessage e)}))]
+                   {:exit -1 :out "" :err (.getMessage e)}))
+        parsed-opencode (when (= harness :opencode)
+                          (parse-opencode-run-output (:out result)))
+        output (if (= harness :opencode)
+                 (or (:text parsed-opencode) (:out result))
+                 (:out result))
+        session-id' (if (= harness :opencode)
+                      (or (:session-id parsed-opencode) session-id)
+                      session-id)]
 
-    (when (= harness :codex)
-      (persist-message! id session-id abs-worktree "assistant" (safe-assistant-content result)))
-
-    {:output (:out result)
+    {:output output
      :exit (:exit result)
-     :done? (agent/done-signal? (:out result))
-     :merge? (agent/merge-signal? (:out result))
-     :session-id session-id}))
+     :done? (agent/done-signal? output)
+     :merge? (agent/merge-signal? output)
+     :session-id session-id'}))
 
 (defn- run-reviewer!
   "Run reviewer on worktree changes.
@@ -287,6 +269,7 @@
         review-prompt (str "[oompa:" swarm-id* ":" id "] " review-body)
 
         abs-wt (.getAbsolutePath (io/file worktree-path))
+        opencode-attach (opencode-attach-url)
 
         ;; Build command — cwd=worktree, no sandbox
         cmd (case review-harness
@@ -297,7 +280,11 @@
                        review-model (into ["--model" review-model])
                        true (conj "--" review-prompt))
               :claude (cond-> [(resolve-binary! "claude") "-p" "--dangerously-skip-permissions"]
-                        review-model (into ["--model" review-model])))
+                        review-model (into ["--model" review-model]))
+              :opencode (cond-> [(resolve-binary! "opencode") "run"]
+                          review-model (into ["-m" review-model])
+                          opencode-attach (into ["--attach" opencode-attach])
+                          true (conj review-prompt)))
 
         ;; Run reviewer — cwd=worktree
         result (try
@@ -350,6 +337,7 @@
                         "Fix these issues. Do not add anything the reviewer did not ask for.")
 
         abs-wt (.getAbsolutePath (io/file worktree-path))
+        opencode-attach (opencode-attach-url)
 
         cmd (case harness
               :codex (cond-> [(resolve-binary! "codex") "exec"
@@ -359,7 +347,11 @@
                        model (into ["--model" model])
                        true (conj "--" fix-prompt))
               :claude (cond-> [(resolve-binary! "claude") "-p" "--dangerously-skip-permissions"]
-                        model (into ["--model" model])))
+                        model (into ["--model" model]))
+              :opencode (cond-> [(resolve-binary! "opencode") "run"]
+                          model (into ["-m" model])
+                          opencode-attach (into ["--attach" opencode-attach])
+                          true (conj fix-prompt)))
 
         result (try
                  (if (= harness :claude)
@@ -409,10 +401,42 @@
   (process/sh ["git" "worktree" "remove" wt-dir "--force"] {:dir project-root})
   (process/sh ["git" "branch" "-D" wt-branch] {:dir project-root}))
 
+(defn- get-head-hash
+  "Get the short HEAD commit hash."
+  [dir]
+  (let [result (process/sh ["git" "rev-parse" "--short" "HEAD"]
+                           {:dir dir :out :string :err :string})]
+    (when (zero? (:exit result))
+      (str/trim (:out result)))))
+
+(defn- annotate-completed-tasks!
+  "After a successful merge (called under merge-lock), annotate any tasks in
+   complete/ that lack metadata. Adds :completed-by, :completed-at,
+   :review-rounds, :merged-commit."
+  [project-root worker-id review-rounds]
+  (let [commit-hash (get-head-hash project-root)
+        complete-dir (io/file project-root "tasks" "complete")]
+    (when (.exists complete-dir)
+      (doseq [f (.listFiles complete-dir)]
+        (when (str/ends-with? (.getName f) ".edn")
+          (try
+            (let [task (read-string (slurp f))]
+              (when-not (:completed-by task)
+                (spit f (pr-str (assoc task
+                                       :completed-by worker-id
+                                       :completed-at (str (java.time.Instant/now))
+                                       :review-rounds (or review-rounds 0)
+                                       :merged-commit (or commit-hash "unknown"))))))
+            (catch Exception e
+              (println (format "[%s] Failed to annotate task %s: %s"
+                               worker-id (.getName f) (.getMessage e))))))))))
+
 (defn- merge-to-main!
   "Merge worktree changes to main branch. Serialized via merge-lock to prevent
-   concurrent workers from corrupting the git index. Returns true on success."
-  [wt-path wt-id worker-id project-root]
+   concurrent workers from corrupting the git index. On success, annotates any
+   newly-completed tasks with worker metadata. Returns true on success.
+   review-rounds: number of review rounds (0 for auto-merged task-only changes)."
+  [wt-path wt-id worker-id project-root review-rounds]
   (locking merge-lock
     (println (format "[%s] Merging changes to main" worker-id))
     (let [;; Commit in worktree if needed (no-op if already committed)
@@ -431,7 +455,10 @@
           success (and (zero? (:exit checkout-result))
                        (zero? (:exit merge-result)))]
       (if success
-        (println (format "[%s] Merge successful" worker-id))
+        (do
+          (println (format "[%s] Merge successful" worker-id))
+          ;; Annotate completed tasks while still holding merge-lock
+          (annotate-completed-tasks! project-root worker-id review-rounds))
         (when merge-result
           (println (format "[%s] MERGE FAILED: %s" worker-id (:err merge-result)))))
       success)))
@@ -448,12 +475,23 @@
     (and (seq files)
          (every? #(str/starts-with? % "tasks/") files))))
 
+(defn- diff-file-names
+  "Get list of changed file names vs main."
+  [wt-path]
+  (let [result (process/sh ["git" "diff" "main" "--name-only"]
+                           {:dir wt-path :out :string :err :string})]
+    (when (zero? (:exit result))
+      (->> (str/split-lines (:out result))
+           (remove str/blank?)
+           vec))))
+
 (defn- review-loop!
   "Run review loop: reviewer checks → if issues, fix & retry → back to reviewer.
    Accumulates feedback across rounds so reviewer doesn't raise new issues
    and fixer has full context of all prior feedback.
+   Writes review logs to runs/{swarm-id}/reviews/ for post-mortem analysis.
    Returns {:approved? bool, :attempts int}"
-  [worker wt-path worker-id]
+  [worker wt-path worker-id iteration]
   (if-not (and (:review-harness worker) (:review-model worker))
     ;; No reviewer configured, auto-approve
     {:approved? true :attempts 0}
@@ -462,7 +500,16 @@
     (loop [attempt 1
            prev-feedback []]
       (println (format "[%s] Review attempt %d/%d" worker-id attempt max-review-retries))
-      (let [{:keys [verdict output]} (run-reviewer! worker wt-path prev-feedback)]
+      (let [{:keys [verdict output]} (run-reviewer! worker wt-path prev-feedback)
+            diff-files (diff-file-names wt-path)]
+
+        ;; Persist review log for this round
+        (when (:swarm-id worker)
+          (runs/write-review-log! (:swarm-id worker) worker-id iteration attempt
+                                  {:verdict verdict
+                                   :output output
+                                   :diff-files (or diff-files [])}))
+
         (case verdict
           :approved
           (do
@@ -517,7 +564,8 @@
    Worktrees persist until COMPLETE_AND_READY_FOR_MERGE triggers review+merge.
    __DONE__ stops the worker entirely (planners only).
 
-   Returns final worker state."
+   Tracks per-worker metrics: merges, rejections, errors, review-rounds-total.
+   Returns final worker state with metrics attached."
   [worker]
   (tasks/ensure-dirs!)
   (let [{:keys [id iterations]} worker
@@ -533,115 +581,138 @@
     (when-not (:can-plan worker)
       (wait-for-tasks! id))
 
+    ;; metrics tracks: {:merges N :rejections N :errors N :review-rounds-total N}
     (loop [iter 1
            completed 0
            consec-errors 0
+           metrics {:merges 0 :rejections 0 :errors 0 :review-rounds-total 0}
            session-id nil    ;; persistent session-id (nil = start fresh)
            wt-state nil]     ;; {:dir :branch :path} or nil
-      (if (> iter iterations)
-        (do
-          ;; Cleanup any lingering worktree
-          (when wt-state
-            (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state)))
-          (println (format "[%s] Completed %d iterations" id completed))
-          (assoc worker :completed completed :status :exhausted))
+      (let [finish (fn [status]
+                     (assoc worker :completed completed :status status
+                                   :merges (:merges metrics)
+                                   :rejections (:rejections metrics)
+                                   :errors (:errors metrics)
+                                   :review-rounds-total (:review-rounds-total metrics)))]
+        (if (> iter iterations)
+          (do
+            ;; Cleanup any lingering worktree
+            (when wt-state
+              (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state)))
+            (println (format "[%s] Completed %d iterations (%d merges, %d rejections, %d errors)"
+                             id completed (:merges metrics) (:rejections metrics) (:errors metrics)))
+            (finish :exhausted))
 
-        ;; Ensure worktree exists (create fresh if nil, reuse if persisted)
-        (let [wt-state (try
-                         (or wt-state (create-iteration-worktree! project-root id iter))
-                         (catch Exception e
-                           (println (format "[%s] Worktree creation failed: %s" id (.getMessage e)))
-                           nil))]
-          (if (nil? wt-state)
-            ;; Worktree creation failed — count as error
-            (let [errors (inc consec-errors)]
-              (if (>= errors max-consecutive-errors)
-                (do
-                  (println (format "[%s] %d consecutive errors, stopping" id errors))
-                  (assoc worker :completed completed :status :error))
-                (recur (inc iter) completed errors nil nil)))
+          ;; Ensure worktree exists (create fresh if nil, reuse if persisted)
+          (let [wt-state (try
+                           (or wt-state (create-iteration-worktree! project-root id iter))
+                           (catch Exception e
+                             (println (format "[%s] Worktree creation failed: %s" id (.getMessage e)))
+                             nil))]
+            (if (nil? wt-state)
+              ;; Worktree creation failed — count as error
+              (let [errors (inc consec-errors)
+                    metrics (update metrics :errors inc)]
+                (if (>= errors max-consecutive-errors)
+                  (do
+                    (println (format "[%s] %d consecutive errors, stopping" id errors))
+                    (finish :error))
+                  (recur (inc iter) completed errors metrics nil nil)))
 
-            ;; Worktree ready — run agent
-            (let [resume? (some? session-id)
-                  _ (println (format "[%s] %s iteration %d/%d"
-                                     id (if resume? "Resuming" "Starting") iter iterations))
-                  context (build-context)
-                  {:keys [output exit done? merge?] :as agent-result}
-                  (run-agent! worker (:path wt-state) context session-id resume?)
-                  new-session-id (:session-id agent-result)]
+              ;; Worktree ready — run agent
+              (let [resume? (some? session-id)
+                    _ (println (format "[%s] %s iteration %d/%d"
+                                       id (if resume? "Resuming" "Starting") iter iterations))
+                    context (build-context)
+                    {:keys [output exit done? merge?] :as agent-result}
+                    (run-agent! worker (:path wt-state) context session-id resume?)
+                    new-session-id (:session-id agent-result)]
 
-              (cond
-                ;; Agent errored — cleanup, reset session
-                (not (zero? exit))
-                (let [errors (inc consec-errors)]
-                  (println (format "[%s] Agent error (exit %d): %s"
-                                   id exit (subs (or output "") 0 (min 200 (count (or output ""))))))
-                  (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                  (if (>= errors max-consecutive-errors)
-                    (do
-                      (println (format "[%s] %d consecutive errors, stopping" id errors))
-                      (assoc worker :completed completed :status :error))
-                    (recur (inc iter) completed errors nil nil)))
+                (cond
+                  ;; Agent errored — cleanup, reset session
+                  (not (zero? exit))
+                  (let [errors (inc consec-errors)
+                        metrics (update metrics :errors inc)]
+                    (println (format "[%s] Agent error (exit %d): %s"
+                                     id exit (subs (or output "") 0 (min 200 (count (or output ""))))))
+                    (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                    (if (>= errors max-consecutive-errors)
+                      (do
+                        (println (format "[%s] %d consecutive errors, stopping" id errors))
+                        (finish :error))
+                      (recur (inc iter) completed errors metrics nil nil)))
 
-                ;; COMPLETE_AND_READY_FOR_MERGE — review, merge, reset session
-                merge?
-                (if (worktree-has-changes? (:path wt-state))
-                  (if (task-only-diff? (:path wt-state))
-                    ;; Task-only changes — skip review, auto-merge
-                    (do
-                      (println (format "[%s] Task-only diff, auto-merging" id))
-                      (merge-to-main! (:path wt-state) (:branch wt-state) id project-root)
-                      (println (format "[%s] Iteration %d/%d complete" id iter iterations))
-                      (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                      (if (and done? (:can-plan worker))
-                        (do
-                          (println (format "[%s] Worker done after merge" id))
-                          (assoc worker :completed (inc completed) :status :done))
-                        (recur (inc iter) (inc completed) 0 nil nil)))
-                    ;; Code changes — full review loop
-                    (let [{:keys [approved?]} (review-loop! worker (:path wt-state) id)]
-                      (if approved?
-                        (do
-                          (merge-to-main! (:path wt-state) (:branch wt-state) id project-root)
+                  ;; COMPLETE_AND_READY_FOR_MERGE — review, merge, reset session
+                  merge?
+                  (if (worktree-has-changes? (:path wt-state))
+                    (if (task-only-diff? (:path wt-state))
+                      ;; Task-only changes — skip review, auto-merge
+                      (do
+                        (println (format "[%s] Task-only diff, auto-merging" id))
+                        (let [merged? (merge-to-main! (:path wt-state) (:branch wt-state) id project-root 0)
+                              metrics (if merged? (update metrics :merges inc) metrics)]
                           (println (format "[%s] Iteration %d/%d complete" id iter iterations))
                           (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                          ;; If also __DONE__, stop after merge
                           (if (and done? (:can-plan worker))
                             (do
                               (println (format "[%s] Worker done after merge" id))
-                              (assoc worker :completed (inc completed) :status :done))
-                            (recur (inc iter) (inc completed) 0 nil nil)))
-                        (do
-                          (println (format "[%s] Iteration %d/%d rejected" id iter iterations))
-                          (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                          (recur (inc iter) completed 0 nil nil)))))
+                              (assoc worker :completed (inc completed) :status :done
+                                            :merges (:merges metrics)
+                                            :rejections (:rejections metrics)
+                                            :errors (:errors metrics)
+                                            :review-rounds-total (:review-rounds-total metrics)))
+                            (recur (inc iter) (inc completed) 0 metrics nil nil))))
+                      ;; Code changes — full review loop
+                      (let [{:keys [approved? attempts]} (review-loop! worker (:path wt-state) id iter)
+                            metrics (-> metrics
+                                        (update :review-rounds-total + (or attempts 0))
+                                        (update (if approved? :merges :rejections) inc))]
+                        (if approved?
+                          (do
+                            (merge-to-main! (:path wt-state) (:branch wt-state) id project-root (or attempts 0))
+                            (println (format "[%s] Iteration %d/%d complete" id iter iterations))
+                            (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                            ;; If also __DONE__, stop after merge
+                            (if (and done? (:can-plan worker))
+                              (do
+                                (println (format "[%s] Worker done after merge" id))
+                                (assoc worker :completed (inc completed) :status :done
+                                              :merges (:merges metrics)
+                                              :rejections (:rejections metrics)
+                                              :errors (:errors metrics)
+                                              :review-rounds-total (:review-rounds-total metrics)))
+                              (recur (inc iter) (inc completed) 0 metrics nil nil)))
+                          (do
+                            (println (format "[%s] Iteration %d/%d rejected" id iter iterations))
+                            (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                            (recur (inc iter) completed 0 metrics nil nil)))))
+                    (do
+                      (println (format "[%s] Merge signaled but no changes, skipping" id))
+                      (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                      (recur (inc iter) completed 0 metrics nil nil)))
+
+                  ;; __DONE__ without merge — only honor for planners
+                  (and done? (:can-plan worker))
                   (do
-                    (println (format "[%s] Merge signaled but no changes, skipping" id))
+                    (println (format "[%s] Received __DONE__ signal" id))
                     (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                    (recur (inc iter) completed 0 nil nil)))
+                    (println (format "[%s] Worker done after %d/%d iterations" id iter iterations))
+                    (finish :done))
 
-                ;; __DONE__ without merge — only honor for planners
-                (and done? (:can-plan worker))
-                (do
-                  (println (format "[%s] Received __DONE__ signal" id))
-                  (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                  (println (format "[%s] Worker done after %d/%d iterations" id iter iterations))
-                  (assoc worker :completed completed :status :done))
+                  ;; __DONE__ from executor — ignore signal, but reset session since
+                  ;; the agent process exited. Resuming a dead session causes exit 1
+                  ;; which cascades into consecutive errors and premature stopping.
+                  (and done? (not (:can-plan worker)))
+                  (do
+                    (println (format "[%s] Ignoring __DONE__ (executor), resetting session" id))
+                    (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                    (recur (inc iter) completed 0 metrics nil nil))
 
-                ;; __DONE__ from executor — ignore signal, but reset session since
-                ;; the agent process exited. Resuming a dead session causes exit 1
-                ;; which cascades into consecutive errors and premature stopping.
-                (and done? (not (:can-plan worker)))
-                (do
-                  (println (format "[%s] Ignoring __DONE__ (executor), resetting session" id))
-                  (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                  (recur (inc iter) completed 0 nil nil))
-
-                ;; No signal — agent still working, resume next iteration
-                :else
-                (do
-                  (println (format "[%s] Working... (will resume)" id))
-                  (recur (inc iter) completed 0 new-session-id wt-state))))))))))
+                  ;; No signal — agent still working, resume next iteration
+                  :else
+                  (do
+                    (println (format "[%s] Working... (will resume)" id))
+                    (recur (inc iter) completed 0 metrics new-session-id wt-state)))))))))))
 
 ;; =============================================================================
 ;; Multi-Worker Execution
@@ -649,6 +720,7 @@
 
 (defn run-workers!
   "Run multiple workers in parallel.
+   Writes swarm summary to runs/{swarm-id}/summary.edn on completion.
 
    Arguments:
      workers - seq of worker configs
@@ -656,24 +728,35 @@
    Returns seq of final worker states."
   [workers]
   (tasks/ensure-dirs!)
-  (println (format "Launching %d workers..." (count workers)))
+  (let [swarm-id (-> workers first :swarm-id)]
+    (println (format "Launching %d workers..." (count workers)))
 
-  (let [futures (doall
-                  (map-indexed
-                    (fn [idx worker]
-                      (let [worker (assoc worker :id (or (:id worker) (str "w" idx)))]
-                        (future (run-worker! worker))))
-                    workers))]
+    (let [futures (doall
+                    (map-indexed
+                      (fn [idx worker]
+                        (let [worker (assoc worker :id (or (:id worker) (str "w" idx)))]
+                          (future (run-worker! worker))))
+                      workers))]
 
-    (println "All workers launched. Waiting for completion...")
-    (let [results (mapv deref futures)]
-      (println "\nAll workers complete.")
-      (doseq [w results]
-        (println (format "  [%s] %s - %d iterations"
-                         (:id w)
-                         (name (:status w))
-                         (:completed w))))
-      results)))
+      (println "All workers launched. Waiting for completion...")
+      (let [results (mapv deref futures)]
+        (println "\nAll workers complete.")
+        (doseq [w results]
+          (println (format "  [%s] %s - %d completed, %d merges, %d rejections, %d errors, %d review rounds"
+                           (:id w)
+                           (name (:status w))
+                           (:completed w)
+                           (or (:merges w) 0)
+                           (or (:rejections w) 0)
+                           (or (:errors w) 0)
+                           (or (:review-rounds-total w) 0))))
+
+        ;; Write swarm summary to disk
+        (when swarm-id
+          (runs/write-summary! swarm-id results)
+          (println (format "\nSwarm summary written to runs/%s/summary.edn" swarm-id)))
+
+        results))))
 
 ;; =============================================================================
 ;; Planner — first-class config concept, NOT a worker
@@ -711,6 +794,7 @@
             swarm-id* (or swarm-id "unknown")
             tagged-prompt (str "[oompa:" swarm-id* ":planner] " prompt-text)
             abs-root (.getAbsolutePath (io/file project-root))
+            opencode-attach (opencode-attach-url)
 
             cmd (case harness
                   :codex (cond-> [(resolve-binary! "codex") "exec"
@@ -720,7 +804,11 @@
                            model (into ["--model" model])
                            true (conj "--" tagged-prompt))
                   :claude (cond-> [(resolve-binary! "claude") "-p" "--dangerously-skip-permissions"]
-                            model (into ["--model" model])))
+                            model (into ["--model" model]))
+                  :opencode (cond-> [(resolve-binary! "opencode") "run"]
+                              model (into ["-m" model])
+                              opencode-attach (into ["--attach" opencode-attach])
+                              true (conj tagged-prompt)))
 
             _ (println (format "[planner] Running (%s:%s, max_pending: %d, current: %d)"
                                (name harness) (or model "default") max-pending pending-before))

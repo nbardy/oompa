@@ -325,7 +325,7 @@
   "Convenience: create orchestrator, run, save log, shutdown.
 
    Arguments:
-     opts - {:workers N, :harness :codex|:claude, :model string,
+     opts - {:workers N, :harness :codex|:claude|:opencode, :model string,
              :review-harness keyword, :review-model string,
              :custom-prompt string, :dry-run bool}
 

@@ -10,7 +10,14 @@
       "model": "codex:gpt-5.3-codex:medium",
       "prompt": ["config/prompts/executor.md"],
       "iterations": 10,
-      "count": 3,
+      "count": 2,
+      "can_plan": false
+    },
+    {
+      "model": "opencode:openai/gpt-5",
+      "prompt": ["config/prompts/executor.md"],
+      "iterations": 10,
+      "count": 1,
       "can_plan": false
     }
   ]

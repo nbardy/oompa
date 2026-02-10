@@ -12,7 +12,8 @@
 
    Supported Backends:
      :codex  - OpenAI Codex CLI (codex exec)
-     :claude - Anthropic Claude CLI (claude -p)"
+     :claude - Anthropic Claude CLI (claude -p)
+     :opencode - opencode CLI (opencode run)"
   (:require [agentnet.schema :as schema]
             [babashka.process :as process]
             [clojure.java.io :as io]
@@ -70,6 +71,22 @@
   (cond-> ["claude" "-p"]
     model (into ["--model" model])
     true (conj "--dangerously-skip-permissions")))
+
+(defn- opencode-attach-url
+  "Optional opencode server URL for run --attach mode."
+  []
+  (let [url (or (System/getenv "OOMPA_OPENCODE_ATTACH")
+                (System/getenv "OPENCODE_ATTACH"))]
+    (when (and url (not (str/blank? url)))
+      url)))
+
+(defmethod build-command :opencode
+  [_ {:keys [model]} prompt cwd]
+  (let [attach (opencode-attach-url)]
+    (cond-> ["opencode" "run"]
+      model (into ["-m" model])
+      attach (into ["--attach" attach])
+      true (conj prompt))))
 
 (defmethod build-command :default
   [agent-type _ _ _]
@@ -269,6 +286,7 @@
   (let [cmd (case agent-type
               :codex ["codex" "--version"]
               :claude ["claude" "--version"]
+              :opencode ["opencode" "--version"]
               ["echo" "unknown"])]
     (try
       (let [{:keys [exit]} (process/sh cmd {:out :string :err :string})]

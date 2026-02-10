@@ -40,7 +40,7 @@
 ;; Enum Validators
 ;; =============================================================================
 
-(def agent-types #{:codex :claude})
+(def agent-types #{:codex :claude :opencode})
 (def agent-roles #{:proposer :reviewer :cto})
 (def task-statuses #{:pending :in-progress :review :approved :merged :failed :blocked})
 (def worktree-statuses #{:available :busy :dirty :stale})
@@ -123,7 +123,7 @@
 ;; =============================================================================
 
 ;; TaskId          <- non-blank-string?
-;; AgentType       <- agent-type? (:codex, :claude)
+;; AgentType       <- agent-type? (:codex, :claude, :opencode)
 ;; AgentRole       <- agent-role? (:proposer, :reviewer, :cto)
 ;; TaskStatus      <- task-status?
 ;; WorktreeStatus  <- worktree-status?
@@ -135,7 +135,7 @@
 ;;
 ;; Task            <- {:id string, :summary string, :targets [string], ...}
 ;; Worktree        <- {:id string, :path string, :branch string, :status keyword}
-;; AgentConfig     <- {:type :codex|:claude, :model string, :sandbox keyword}
+;; AgentConfig     <- {:type :codex|:claude|:opencode, :model string, :sandbox keyword}
 ;; ReviewFeedback  <- {:verdict :approved|:needs-changes|:rejected, :comments [string]}
 ;; MergeResult     <- {:status :merged|:conflict|:failed, :source-branch string, ...}
-;; OrchestratorConfig <- {:worker-count int, :harness :codex|:claude, :model string, :dry-run bool}
+;; OrchestratorConfig <- {:worker-count int, :harness :codex|:claude|:opencode, :model string, :dry-run bool}

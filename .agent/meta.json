@@ -1,9 +1,7 @@
 {
-  "task_id": "prompt-1763113713839",
-  "summary": "Implement the factorial helper and CLI with stronger validation and regression tests.",
-  "files": [
-    "src/factorial.py",
-    "tests/test_factorial.py"
-  ],
-  "generated_at": 1763113713839
+  "task_id": "fact-001",
+  "summary": "No source patch needed: src/factorial.py already provides factorial(n) and CLI usage python src/factorial.py 5 -> 120.",
+  "files": [],
+  "generated_at": 1770695639000,
+  "status": "noop"
 }

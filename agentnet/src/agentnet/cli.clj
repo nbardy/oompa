@@ -5,7 +5,7 @@
      ./swarm.bb run                                    # Run all tasks once
      ./swarm.bb run --workers 4                        # With 4 parallel workers
      ./swarm.bb loop 20 --harness claude               # 20 iterations with Claude
-     ./swarm.bb loop --workers claude:5 codex:4 --iterations 20  # Mixed harnesses
+     ./swarm.bb loop --workers claude:5 opencode:2 --iterations 20  # Mixed harnesses
      ./swarm.bb swarm oompa.json                       # Multi-model from config
      ./swarm.bb prompt \"...\"                          # Ad-hoc task
      ./swarm.bb status                                 # Show last run
@@ -16,6 +16,7 @@
             [agentnet.worker :as worker]
             [agentnet.tasks :as tasks]
             [agentnet.agent :as agent]
+            [agentnet.runs :as runs]
             [babashka.process :as process]
             [clojure.string :as str]
             [clojure.java.io :as io]
@@ -30,20 +31,22 @@
     (Integer/parseInt s)
     (catch Exception _ default)))
 
+(def ^:private harnesses #{:codex :claude :opencode})
+
 (defn- make-swarm-id
   "Generate a short run-level swarm ID."
   []
   (subs (str (java.util.UUID/randomUUID)) 0 8))
 
 (defn- parse-worker-spec
-  "Parse 'harness:count' into {:harness :claude, :count 5}.
+  "Parse 'harness:count' into {:harness :opencode, :count 5}.
    Throws on invalid format."
   [s]
   (let [[harness count-str] (str/split s #":" 2)
         h (keyword harness)
         cnt (parse-int count-str 0)]
-    (when-not (#{:codex :claude} h)
-      (throw (ex-info (str "Unknown harness in worker spec: " s ". Use 'codex:N' or 'claude:N'") {})))
+    (when-not (harnesses h)
+      (throw (ex-info (str "Unknown harness in worker spec: " s ". Use 'codex:N', 'claude:N', or 'opencode:N'") {})))
     (when (zero? cnt)
       (throw (ex-info (str "Invalid count in worker spec: " s ". Use format 'harness:count'") {})))
     {:harness h :count cnt}))
@@ -80,7 +83,7 @@
         (= arg "--workers")
         (let [next-arg (second remaining)]
           (if (worker-spec? next-arg)
-            ;; Collect all worker specs: --workers claude:5 codex:4
+            ;; Collect all worker specs: --workers claude:5 opencode:2
             (let [[specs rest] (collect-worker-specs (next remaining))]
               (recur (assoc opts :worker-specs specs) rest))
             ;; Simple count: --workers 4
@@ -93,8 +96,8 @@
 
         (= arg "--harness")
         (let [h (keyword (second remaining))]
-          (when-not (#{:codex :claude} h)
-            (throw (ex-info (str "Unknown harness: " (second remaining) ". Use 'codex' or 'claude'") {})))
+          (when-not (harnesses h)
+            (throw (ex-info (str "Unknown harness: " (second remaining) ". Use 'codex', 'claude', or 'opencode'") {})))
           (recur (assoc opts :harness h)
                  (nnext remaining)))
 
@@ -135,6 +138,21 @@
 
 (declare cmd-swarm parse-model-string)
 
+(defn- check-git-clean!
+  "Abort if git working tree is dirty. Dirty index causes merge conflicts
+   and wasted worker iterations."
+  []
+  (let [result (process/sh ["git" "status" "--porcelain"]
+                           {:out :string :err :string})
+        output (str/trim (:out result))]
+    (when (and (zero? (:exit result)) (not (str/blank? output)))
+      (println "ERROR: Git working tree is dirty. Resolve before running swarm.")
+      (println)
+      (println output)
+      (println)
+      (println "Run 'git stash' or 'git commit' first.")
+      (System/exit 1))))
+
 (defn- probe-model
   "Send 'say ok' to a model via its harness CLI. Returns true if model responds.
    Claude hangs without /dev/null stdin when spawned from bb."
@@ -142,7 +160,8 @@
   (try
     (let [cmd (case harness
                 :claude ["claude" "--model" model "-p" "[oompa:probe] say ok" "--max-turns" "1"]
-                :codex  ["codex" "exec" "--dangerously-bypass-approvals-and-sandbox" "--skip-git-repo-check" "--model" model "--" "[oompa:probe] say ok"])
+                :codex  ["codex" "exec" "--dangerously-bypass-approvals-and-sandbox" "--skip-git-repo-check" "--model" model "--" "[oompa:probe] say ok"]
+                :opencode ["opencode" "run" "-m" model "[oompa:probe] say ok"])
           null-in (io/input-stream (io/file "/dev/null"))
           proc (process/process cmd {:out :string :err :string :in null-in})
           result (deref proc 30000 :timeout)]
@@ -187,7 +206,7 @@
     (cmd-swarm opts (or (seq args) ["oompa.json"]))
     (let [swarm-id (make-swarm-id)]
       (if-let [specs (:worker-specs opts)]
-        ;; Mixed worker specs: --workers claude:5 codex:4
+        ;; Mixed worker specs: --workers claude:5 opencode:2
         (let [workers (mapcat
                         (fn [spec]
                           (let [{:keys [harness count]} spec]
@@ -219,7 +238,7 @@
                        (:iterations opts)
                        20)]
     (if-let [specs (:worker-specs opts)]
-      ;; Mixed worker specs: --workers claude:5 codex:4
+      ;; Mixed worker specs: --workers claude:5 opencode:2
       (let [workers (mapcat
                       (fn [spec]
                         (let [{:keys [harness count]} spec]
@@ -265,25 +284,65 @@
       (orchestrator/run-once! opts))))
 
 (defn cmd-status
-  "Show status of last run"
+  "Show status of last run — reads structured runs/{swarm-id}/ data."
   [opts args]
-  (let [runs-dir (io/file "runs")
-        files (when (.exists runs-dir)
-                (->> (.listFiles runs-dir)
-                     (filter #(.isFile %))
-                     (sort-by #(.lastModified %) >)))]
-    (if-let [latest (first files)]
-      (do
-        (println (format "Latest run: %s" (.getName latest)))
+  (let [run-ids (runs/list-runs)]
+    (if (seq run-ids)
+      (let [swarm-id (or (first args) (first run-ids))
+            run-log (runs/read-run-log swarm-id)
+            summary (runs/read-summary swarm-id)
+            reviews (runs/list-reviews swarm-id)]
+        (println (format "Swarm: %s" swarm-id))
+        (when run-log
+          (println (format "  Started: %s" (:started-at run-log)))
+          (println (format "  Config:  %s" (or (:config-file run-log) "N/A")))
+          (println (format "  Workers: %d" (count (:workers run-log)))))
         (println)
-        (with-open [r (io/reader latest)]
-          (let [entries (mapv #(json/parse-string % true) (line-seq r))
-                by-status (group-by :status entries)]
-            (doseq [[status tasks] (sort-by first by-status)]
-              (println (format "%s: %d" (name status) (count tasks))))
+        (if summary
+          (do
+            (println (format "Summary (finished %s):" (:finished-at summary)))
+            (println (format "  Total completed: %d/%d iterations"
+                             (:total-completed summary) (:total-iterations summary)))
+            (println (format "  Status counts: %s" (pr-str (:status-counts summary))))
             (println)
-            (println (format "Total: %d tasks" (count entries))))))
-      (println "No runs found."))))
+            (println "Per-worker:")
+            (doseq [w (:workers summary)]
+              (println (format "  [%s] %s:%s — %s, %d completed, %d merges, %d rejections, %d errors, %d review rounds"
+                               (:id w)
+                               (or (:harness w) "unknown")
+                               (or (:model w) "default")
+                               (or (:status w) "unknown")
+                               (or (:completed w) 0)
+                               (or (:merges w) 0)
+                               (or (:rejections w) 0)
+                               (or (:errors w) 0)
+                               (or (:review-rounds-total w) 0)))))
+          (println "  (still running — no summary yet)"))
+        (when (seq reviews)
+          (println)
+          (println (format "Reviews: %d total" (count reviews)))
+          (doseq [r reviews]
+            (println (format "  %s-i%d-r%d: %s"
+                             (:worker-id r) (:iteration r) (:round r)
+                             (:verdict r))))))
+      ;; Fall back to legacy JSONL format
+      (let [runs-dir (io/file "runs")
+            files (when (.exists runs-dir)
+                    (->> (.listFiles runs-dir)
+                         (filter #(.isFile %))
+                         (sort-by #(.lastModified %) >)))]
+        (if-let [latest (first files)]
+          (do
+            (println (format "Latest run (legacy): %s" (.getName latest)))
+            (println)
+            (with-open [r (io/reader latest)]
+              (let [entries (mapv #(json/parse-string % true) (line-seq r))
+                    by-status (group-by :status entries)]
+                (doseq [[status tasks] (sort-by first by-status)]
+                  (println (format "%s: %d" (name status) (count tasks))))
+                (println)
+                (println (format "Total: %d tasks" (count entries))))))
+          (println "No runs found."))))))
 
 (defn cmd-worktrees
   "List worktree status"
@@ -323,7 +382,7 @@
   "Check if agent backends are available"
   [opts args]
   (println "Checking agent backends...")
-  (doseq [agent-type [:codex :claude]]
+  (doseq [agent-type [:codex :claude :opencode]]
     (let [available? (agent/check-available agent-type)]
       (println (format "  %s: %s"
                        (name agent-type)
@@ -354,12 +413,16 @@
       (println "{")
       (println "  \"workers\": [")
       (println "    {\"model\": \"codex:gpt-5.3-codex:medium\", \"prompt\": \"prompts/executor.md\", \"iterations\": 10, \"count\": 3, \"can_plan\": false},")
-      (println "    {\"model\": \"claude:opus\", \"prompt\": [\"prompts/base.md\", \"prompts/planner.md\"], \"count\": 1}")
+      (println "    {\"model\": \"claude:opus\", \"prompt\": [\"prompts/base.md\", \"prompts/planner.md\"], \"count\": 1},")
+      (println "    {\"model\": \"opencode:openai/gpt-5\", \"prompt\": [\"prompts/executor.md\"], \"count\": 1}")
       (println "  ]")
       (println "}")
       (println)
       (println "prompt: string or array of paths — concatenated into one prompt.")
       (System/exit 1))
+    ;; Preflight: abort if git is dirty to prevent merge conflicts
+    (check-git-clean!)
+
     (let [config (json/parse-string (slurp f) true)
           ;; Parse reviewer config — supports both formats:
           ;; Legacy: {"review_model": "harness:model:reasoning"}
@@ -453,6 +516,14 @@
                           planner-config (conj planner-config))
                         review-parsed)
 
+      ;; Write run log to runs/{swarm-id}/run.edn
+      (runs/write-run-log! swarm-id
+                           {:workers workers
+                            :planner-config planner-parsed
+                            :reviewer-config review-parsed
+                            :config-file config-file})
+      (println (format "\nRun log written to runs/%s/run.edn" swarm-id))
+
       ;; Run planner if configured — synchronously before workers
       (when planner-parsed
         (println)
@@ -506,16 +577,16 @@
   (println)
   (println "Options:")
   (println "  --workers N              Number of parallel workers (default: 2)")
-  (println "  --workers H:N [H:N ...]  Mixed workers by harness (e.g., claude:5 codex:4)")
+  (println "  --workers H:N [H:N ...]  Mixed workers by harness (e.g., claude:5 opencode:2)")
   (println "  --iterations N           Number of iterations per worker (default: 1)")
-  (println "  --harness {codex,claude} Agent harness to use (default: codex)")
-  (println "  --model MODEL            Model to use (e.g., codex-5.2, opus-4.5)")
+  (println "  --harness {codex,claude,opencode} Agent harness to use (default: codex)")
+  (println "  --model MODEL            Model to use (e.g., codex-5.2, opus-4.5, openai/gpt-5)")
   (println "  --dry-run                Skip actual merges")
   (println "  --keep-worktrees         Don't cleanup worktrees after run")
   (println)
   (println "Examples:")
   (println "  ./swarm.bb loop 10 --harness codex --model gpt-5.3-codex --workers 3")
-  (println "  ./swarm.bb loop --workers claude:5 codex:4 --iterations 20")
+  (println "  ./swarm.bb loop --workers claude:5 opencode:2 --iterations 20")
   (println "  ./swarm.bb swarm oompa.json  # Run multi-model config"))
 
 ;; =============================================================================

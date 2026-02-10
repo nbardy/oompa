@@ -23,9 +23,4 @@ See `CLAUDE.md` for the full docs/ vs notes/ convention.
 
 ## Current Documentation
 
-*TODO: Add living documentation as the project matures*
-
-- Overview and purpose
-- Installation guide
-- Configuration reference
-- Architecture overview (kept current)
+- `opencode-harness.md` - exact OpenCode worker run/continue/session behavior
