@@ -1,7 +1,7 @@
 {
   "name": "@nbardy/oompa",
-  "version": "0.6.0",
-  "description": "Git-worktree multi-agent swarm orchestrator for Codex and Claude",
+  "version": "0.7.0",
+  "description": "Git-worktree multi-agent swarm orchestrator for Codex, Claude, and Opencode",
   "license": "MIT",
   "type": "commonjs",
   "bin": {
@@ -30,6 +30,7 @@
     "worktree",
     "codex",
     "claude",
+    "opencode",
     "babashka"
   ],
   "repository": {
