@@ -189,7 +189,7 @@
                               "--skip-git-repo-check"
                               "-C" abs-worktree]
                        model (into ["--model" model])
-                       reasoning (into ["-c" (str "model_reasoning_effort=\"" reasoning "\"")])
+                       reasoning (into ["-c" (str "reasoning.effort=\"" reasoning "\"")])
                        true (conj "--" tagged-prompt))
               :claude (cond-> [(resolve-binary! "claude") "-p" "--dangerously-skip-permissions"
                                "--session-id" session-id]

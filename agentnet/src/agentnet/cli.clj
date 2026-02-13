@@ -159,9 +159,9 @@
   [harness model]
   (try
     (let [cmd (case harness
-                :claude ["claude" "--model" model "-p" "[oompa:probe] say ok" "--max-turns" "1"]
-                :codex  ["codex" "exec" "--dangerously-bypass-approvals-and-sandbox" "--skip-git-repo-check" "--model" model "--" "[oompa:probe] say ok"]
-                :opencode ["opencode" "run" "-m" model "[oompa:probe] say ok"])
+                :claude ["claude" "--model" model "-p" "[_HIDE_TEST_] say ok" "--max-turns" "1"]
+                :codex  ["codex" "exec" "--dangerously-bypass-approvals-and-sandbox" "--skip-git-repo-check" "--model" model "--" "[_HIDE_TEST_] say ok"]
+                :opencode ["opencode" "run" "-m" model "[_HIDE_TEST_] say ok"])
           null-in (io/input-stream (io/file "/dev/null"))
           proc (process/process cmd {:out :string :err :string :in null-in})
           result (deref proc 30000 :timeout)]
@@ -388,15 +388,37 @@
                        (name agent-type)
                        (if available? "✓ available" "✗ not found"))))))
 
+(def ^:private reasoning-variants
+  #{"minimal" "low" "medium" "high" "max"})
+
 (defn- parse-model-string
   "Parse model string into {:harness :model :reasoning}.
-   Formats: 'harness:model', 'harness:model:reasoning', or just 'model'."
+
+   Supported formats:
+   - harness:model
+   - harness:model:reasoning (codex only)
+   - model (defaults harness to :codex)
+
+   Note: non-codex model identifiers may contain ':' (for example
+   openrouter/...:free). Those suffixes are preserved in :model."
   [s]
   (if (and s (str/includes? s ":"))
-    (let [parts (str/split s #":" 3)]
-      (case (count parts)
-        2 {:harness (keyword (first parts)) :model (second parts)}
-        3 {:harness (keyword (first parts)) :model (second parts) :reasoning (nth parts 2)}
+    (let [[harness-str rest*] (str/split s #":" 2)
+          harness (keyword harness-str)]
+      (if (contains? harnesses harness)
+        (if (= harness :codex)
+          ;; Codex may include a reasoning suffix at the end. Only treat the
+          ;; last segment as reasoning if it matches a known variant.
+          (if-let [idx (str/last-index-of rest* ":")]
+            (let [model* (subs rest* 0 idx)
+                  reasoning* (subs rest* (inc idx))]
+              (if (contains? reasoning-variants reasoning*)
+                {:harness harness :model model* :reasoning reasoning*}
+                {:harness harness :model rest*}))
+            {:harness harness :model rest*})
+          ;; Non-codex: preserve full model string (including any ':suffix').
+          {:harness harness :model rest*})
+        ;; Not a known harness prefix, treat as raw model on default harness.
         {:harness :codex :model s}))
     {:harness :codex :model s}))
 

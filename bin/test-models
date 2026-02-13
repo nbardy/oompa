@@ -60,7 +60,7 @@ while IFS= read -r model; do
   SAFE_NAME=$(echo "$model" | tr '/:.' '_')
 
   MODEL_NAMES+=("$SAFE_NAME")
-  PROMPT="Write a file called ${RESULTS_DIR}/${SAFE_NAME}_DONE with exactly the text DONE. Nothing else. Just create that one file."
+  PROMPT="[_HIDE_TEST_] Write a file called ${RESULTS_DIR}/${SAFE_NAME}_DONE with exactly the text DONE. Nothing else. Just create that one file."
 
   echo "  launching $model ..."
 
