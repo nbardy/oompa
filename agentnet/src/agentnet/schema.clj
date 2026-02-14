@@ -40,7 +40,7 @@
 ;; Enum Validators
 ;; =============================================================================
 
-(def agent-types #{:codex :claude :opencode})
+(def agent-types #{:codex :claude :opencode :gemini})
 (def agent-roles #{:proposer :reviewer :cto})
 (def task-statuses #{:pending :in-progress :review :approved :merged :failed :blocked})
 (def worktree-statuses #{:available :busy :dirty :stale})

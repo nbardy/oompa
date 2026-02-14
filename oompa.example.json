@@ -19,6 +19,13 @@
       "iterations": 10,
       "count": 1,
       "can_plan": false
+    },
+    {
+      "model": "gemini:gemini-3-pro-preview",
+      "prompt": ["config/prompts/executor.md"],
+      "iterations": 10,
+      "count": 1,
+      "can_plan": false
     }
   ]
 }

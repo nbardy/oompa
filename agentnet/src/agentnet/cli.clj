@@ -16,6 +16,7 @@
             [agentnet.worker :as worker]
             [agentnet.tasks :as tasks]
             [agentnet.agent :as agent]
+            [agentnet.harness :as harness]
             [agentnet.runs :as runs]
             [babashka.process :as process]
             [clojure.string :as str]
@@ -31,7 +32,7 @@
     (Integer/parseInt s)
     (catch Exception _ default)))
 
-(def ^:private harnesses #{:codex :claude :opencode})
+(def ^:private harnesses (harness/known-harnesses))
 
 (defn- make-swarm-id
   "Generate a short run-level swarm ID."
@@ -46,7 +47,7 @@
         h (keyword harness)
         cnt (parse-int count-str 0)]
     (when-not (harnesses h)
-      (throw (ex-info (str "Unknown harness in worker spec: " s ". Use 'codex:N', 'claude:N', or 'opencode:N'") {})))
+      (throw (ex-info (str "Unknown harness in worker spec: " s ". Known: " (str/join ", " (map name (sort harnesses)))) {})))
     (when (zero? cnt)
       (throw (ex-info (str "Invalid count in worker spec: " s ". Use format 'harness:count'") {})))
     {:harness h :count cnt}))
@@ -97,7 +98,7 @@
         (= arg "--harness")
         (let [h (keyword (second remaining))]
           (when-not (harnesses h)
-            (throw (ex-info (str "Unknown harness: " (second remaining) ". Use 'codex', 'claude', or 'opencode'") {})))
+            (throw (ex-info (str "Unknown harness: " (second remaining) ". Known: " (str/join ", " (map name (sort harnesses)))) {})))
           (recur (assoc opts :harness h)
                  (nnext remaining)))
 
@@ -155,13 +156,10 @@
 
 (defn- probe-model
   "Send 'say ok' to a model via its harness CLI. Returns true if model responds.
-   Claude hangs without /dev/null stdin when spawned from bb."
-  [harness model]
+   Uses harness/build-probe-cmd for the command, /dev/null stdin to prevent hang."
+  [harness-kw model]
   (try
-    (let [cmd (case harness
-                :claude ["claude" "--model" model "-p" "[_HIDE_TEST_] say ok" "--max-turns" "1"]
-                :codex  ["codex" "exec" "--dangerously-bypass-approvals-and-sandbox" "--skip-git-repo-check" "--model" model "--" "[_HIDE_TEST_] say ok"]
-                :opencode ["opencode" "run" "-m" model "[_HIDE_TEST_] say ok"])
+    (let [cmd (harness/build-probe-cmd harness-kw model)
           null-in (io/input-stream (io/file "/dev/null"))
           proc (process/process cmd {:out :string :err :string :in null-in})
           result (deref proc 30000 :timeout)]
@@ -382,10 +380,10 @@
   "Check if agent backends are available"
   [opts args]
   (println "Checking agent backends...")
-  (doseq [agent-type [:codex :claude :opencode]]
-    (let [available? (agent/check-available agent-type)]
+  (doseq [harness-kw (sort (harness/known-harnesses))]
+    (let [available? (harness/check-available harness-kw)]
       (println (format "  %s: %s"
-                       (name agent-type)
+                       (name harness-kw)
                        (if available? "✓ available" "✗ not found"))))))
 
 (def ^:private reasoning-variants
@@ -436,7 +434,7 @@
       (println "  \"workers\": [")
       (println "    {\"model\": \"codex:gpt-5.3-codex:medium\", \"prompt\": \"prompts/executor.md\", \"iterations\": 10, \"count\": 3, \"can_plan\": false},")
       (println "    {\"model\": \"claude:opus\", \"prompt\": [\"prompts/base.md\", \"prompts/planner.md\"], \"count\": 1},")
-      (println "    {\"model\": \"opencode:opencode/kimi-k2.5-free\", \"prompt\": [\"prompts/executor.md\"], \"count\": 1}")
+      (println "    {\"model\": \"gemini:gemini-3-pro-preview\", \"prompt\": [\"prompts/executor.md\"], \"count\": 1}")
       (println "  ]")
       (println "}")
       (println)
@@ -601,8 +599,8 @@
   (println "  --workers N              Number of parallel workers (default: 2)")
   (println "  --workers H:N [H:N ...]  Mixed workers by harness (e.g., claude:5 opencode:2)")
   (println "  --iterations N           Number of iterations per worker (default: 1)")
-  (println "  --harness {codex,claude,opencode} Agent harness to use (default: codex)")
-  (println "  --model MODEL            Model to use (e.g., codex:gpt-5.3-codex:medium, claude:opus, opencode:opencode/kimi-k2.5-free)")
+  (println (str "  --harness {" (str/join "," (map name (sort harnesses))) "} Agent harness to use (default: codex)"))
+  (println "  --model MODEL            Model to use (e.g., codex:gpt-5.3-codex:medium, claude:opus, gemini:gemini-3-pro-preview)")
   (println "  --dry-run                Skip actual merges")
   (println "  --keep-worktrees         Don't cleanup worktrees after run")
   (println)

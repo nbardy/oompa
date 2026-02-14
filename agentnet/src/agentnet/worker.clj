@@ -14,9 +14,9 @@
    No separate orchestrator - workers self-organize."
   (:require [agentnet.tasks :as tasks]
             [agentnet.agent :as agent]
+            [agentnet.harness :as harness]
             [agentnet.worktree :as worktree]
             [agentnet.runs :as runs]
-            [cheshire.core :as json]
             [babashka.process :as process]
             [clojure.java.io :as io]
             [clojure.set]
@@ -33,26 +33,6 @@
 ;; Serializes merge-to-main! calls across concurrent workers to prevent
 ;; git index corruption from parallel checkout+merge operations.
 (def ^:private merge-lock (Object.))
-
-;; Resolve absolute paths for CLI binaries at first use.
-;; ProcessBuilder with :dir set can fail to find bare command names on some
-;; platforms (macOS + babashka), so we resolve once via `which` and cache.
-(def ^:private binary-paths* (atom {}))
-
-(defn- resolve-binary!
-  "Resolve the absolute path of a CLI binary. Caches result.
-   Throws if binary not found on PATH."
-  [name]
-  (or (get @binary-paths* name)
-      (let [result (try
-                     (process/sh ["which" name] {:out :string :err :string})
-                     (catch Exception _ {:exit -1 :out "" :err ""}))
-            path (when (zero? (:exit result))
-                   (str/trim (:out result)))]
-        (if path
-          (do (swap! binary-paths* assoc name path)
-              path)
-          (throw (ex-info (str "Binary not found on PATH: " name) {:binary name}))))))
 
 (defn- load-prompt
   "Load a prompt file. Tries path as-is first, then from package root."
@@ -123,53 +103,14 @@
      :task_status (format "Pending: %d, In Progress: %d, Complete: %d"
                           (count pending) (count current) (count complete))}))
 
-(defn- opencode-attach-url
-  "Optional opencode server URL for run --attach mode."
-  []
-  (let [url (or (System/getenv "OOMPA_OPENCODE_ATTACH")
-                (System/getenv "OPENCODE_ATTACH"))]
-    (when (and url (not (str/blank? url)))
-      url)))
-
-(defn- parse-opencode-run-output
-  "Parse `opencode run --format json` output.
-   Returns {:session-id string|nil, :text string|nil}."
-  [s]
-  (let [raw (or s "")
-        events (->> (str/split-lines raw)
-                    (keep (fn [line]
-                            (try
-                              (json/parse-string line true)
-                              (catch Exception _
-                                nil))))
-                    doall)
-        session-id (or (some #(or (:sessionID %)
-                                   (:sessionId %)
-                                   (get-in % [:part :sessionID])
-                                   (get-in % [:part :sessionId]))
-                             events)
-                       (some-> (re-find #"(ses_[A-Za-z0-9]+)" raw) second))
-        text (->> events
-                  (keep (fn [event]
-                          (let [event-type (or (:type event) (get-in event [:part :type]))
-                                chunk (or (:text event) (get-in event [:part :text]))]
-                            (when (and (= event-type "text")
-                                       (string? chunk)
-                                       (not (str/blank? chunk)))
-                              chunk))))
-                  (str/join ""))]
-    {:session-id session-id
-     :text (when-not (str/blank? text) text)}))
 
 (defn- run-agent!
   "Run agent with prompt, return {:output string, :done? bool, :merge? bool, :exit int, :session-id string}.
-   When resume? is true and harness is :claude/:opencode, continues the existing session
-   with a lighter prompt (just task status + continue instruction)."
+   When resume? is true, continues the existing session with a lighter prompt
+   (just task status + continue instruction). All harness-specific CLI knowledge
+   is delegated to harness/build-cmd."
   [{:keys [id swarm-id harness model prompts reasoning]} worktree-path context session-id resume?]
-  (let [;; Use provided session-id, otherwise generate one for harnesses that accept custom IDs.
-        session-id (or session-id
-                       (when (#{:codex :claude} harness)
-                         (str/lower-case (str (java.util.UUID/randomUUID)))))
+  (let [session-id (or session-id (harness/make-session-id harness))
 
         ;; Build prompt — lighter for resume (agent already has full context)
         prompt (if resume?
@@ -194,57 +135,28 @@
         swarm-id* (or swarm-id "unknown")
         tagged-prompt (str "[oompa:" swarm-id* ":" id "] " prompt)
         abs-worktree (.getAbsolutePath (io/file worktree-path))
-        opencode-attach (opencode-attach-url)
 
-        ;; Build command — all harnesses run with cwd=worktree, no sandbox
-        ;; so agents can `..` to reach project root for task management
-        ;; Claude: --resume flag continues existing session-id conversation
-        ;; Opencode: -s/--session + --continue continue existing session
-        ;; and --format json for deterministic per-run session capture.
-        ;; Codex: no native resume support, always fresh (but worktree state persists)
-        cmd (case harness
-              :codex (cond-> [(resolve-binary! "codex") "exec"
-                              "--dangerously-bypass-approvals-and-sandbox"
-                              "--skip-git-repo-check"
-                              "-C" abs-worktree]
-                       model (into ["--model" model])
-                       reasoning (into ["-c" (str "reasoning.effort=\"" reasoning "\"")])
-                       true (conj "--" tagged-prompt))
-              :claude (cond-> [(resolve-binary! "claude") "-p" "--dangerously-skip-permissions"
-                               "--session-id" session-id]
-                        resume? (conj "--resume")
-                        model (into ["--model" model]))
-              :opencode (cond-> [(resolve-binary! "opencode") "run" "--format" "json"
-                                 "--print-logs" "--log-level" "WARN"]
-                          model (into ["-m" model])
-                          opencode-attach (into ["--attach" opencode-attach])
-                          (and resume? session-id) (into ["-s" session-id "--continue"])
-                          true (conj tagged-prompt)))
+        cmd (harness/build-cmd harness
+              {:cwd abs-worktree :model model :reasoning reasoning
+               :session-id session-id :resume? resume?
+               :prompt tagged-prompt :format? true})
 
-        ;; Run agent — all run with cwd=worktree
-        ;; NOTE: :in "" closes stdin immediately. Without this, opencode hangs
-        ;; forever waiting on an open pipe. Claude needs :in for its prompt.
         result (try
-                 (if (= harness :claude)
-                   (process/sh cmd {:dir abs-worktree :in tagged-prompt :out :string :err :string})
-                   (process/sh cmd {:dir abs-worktree :in "" :out :string :err :string}))
+                 (process/sh cmd {:dir abs-worktree
+                                  :in (harness/process-stdin harness tagged-prompt)
+                                  :out :string :err :string})
                  (catch Exception e
                    (println (format "[%s] Agent exception: %s" id (.getMessage e)))
                    {:exit -1 :out "" :err (.getMessage e)}))
-        parsed-opencode (when (= harness :opencode)
-                          (parse-opencode-run-output (:out result)))
-        output (if (= harness :opencode)
-                 (or (:text parsed-opencode) (:out result))
-                 (:out result))
-        session-id' (if (= harness :opencode)
-                      (or (:session-id parsed-opencode) session-id)
-                      session-id)]
+
+        {:keys [output session-id]}
+        (harness/parse-output harness (:out result) session-id)]
 
     {:output output
      :exit (:exit result)
      :done? (agent/done-signal? output)
      :merge? (agent/merge-signal? output)
-     :session-id session-id'}))
+     :session-id session-id}))
 
 (defn- run-reviewer!
   "Run reviewer on worktree changes.
@@ -260,7 +172,6 @@
                          (str (subs d 0 8000) "\n... [diff truncated at 8000 chars]")
                          d))
 
-        ;; Build review prompt — use custom prompts if configured, else default
         swarm-id* (or swarm-id "unknown")
         custom-prompt (when (seq review-prompts)
                         (->> review-prompts
@@ -268,7 +179,6 @@
                              (remove nil?)
                              (str/join "\n\n")))
 
-        ;; Include previous review history for multi-round context
         history-block (when (seq prev-feedback)
                         (str "\n## Previous Review Rounds\n\n"
                              "The worker has already attempted fixes based on earlier feedback. "
@@ -291,29 +201,15 @@
         review-prompt (str "[oompa:" swarm-id* ":" id "] " review-body)
 
         abs-wt (.getAbsolutePath (io/file worktree-path))
-        opencode-attach (opencode-attach-url)
 
-        ;; Build command — cwd=worktree, no sandbox
-        cmd (case review-harness
-              :codex (cond-> [(resolve-binary! "codex") "exec"
-                              "--dangerously-bypass-approvals-and-sandbox"
-                              "--skip-git-repo-check"
-                              "-C" abs-wt]
-                       review-model (into ["--model" review-model])
-                       true (conj "--" review-prompt))
-              :claude (cond-> [(resolve-binary! "claude") "-p" "--dangerously-skip-permissions"]
-                        review-model (into ["--model" review-model]))
-              :opencode (cond-> [(resolve-binary! "opencode") "run"
-                                 "--print-logs" "--log-level" "WARN"]
-                          review-model (into ["-m" review-model])
-                          opencode-attach (into ["--attach" opencode-attach])
-                          true (conj review-prompt)))
+        ;; No session, no resume, no format flags — reviewer is stateless one-shot
+        cmd (harness/build-cmd review-harness
+              {:cwd abs-wt :model review-model :prompt review-prompt})
 
-        ;; Run reviewer — cwd=worktree (:in "" closes stdin for non-claude harnesses)
         result (try
-                 (if (= review-harness :claude)
-                   (process/sh cmd {:dir abs-wt :in review-prompt :out :string :err :string})
-                   (process/sh cmd {:dir abs-wt :in "" :out :string :err :string}))
+                 (process/sh cmd {:dir abs-wt
+                                  :in (harness/process-stdin review-harness review-prompt)
+                                  :out :string :err :string})
                  (catch Exception e
                    {:exit -1 :out "" :err (.getMessage e)}))
 
@@ -324,12 +220,10 @@
                   (re-find #"VERDICT:\s*APPROVED" output) :approved
                   (re-find #"VERDICT:\s*REJECTED" output) :rejected
                   (re-find #"VERDICT:\s*NEEDS_CHANGES" output) :needs-changes
-                  ;; Fallback to loose matching if reviewer didn't use prefix
                   (re-find #"(?i)\bAPPROVED\b" output) :approved
                   (re-find #"(?i)\bREJECTED\b" output) :rejected
                   :else :needs-changes)]
 
-    ;; Log reviewer output (truncated) for visibility
     (println (format "[%s] Reviewer verdict: %s" id (name verdict)))
     (let [summary (subs output 0 (min 300 (count output)))]
       (println (format "[%s] Review: %s%s" id summary
@@ -360,28 +254,14 @@
                         "Fix these issues. Do not add anything the reviewer did not ask for.")
 
         abs-wt (.getAbsolutePath (io/file worktree-path))
-        opencode-attach (opencode-attach-url)
 
-        cmd (case harness
-              :codex (cond-> [(resolve-binary! "codex") "exec"
-                              "--dangerously-bypass-approvals-and-sandbox"
-                              "--skip-git-repo-check"
-                              "-C" abs-wt]
-                       model (into ["--model" model])
-                       true (conj "--" fix-prompt))
-              :claude (cond-> [(resolve-binary! "claude") "-p" "--dangerously-skip-permissions"]
-                        model (into ["--model" model]))
-              :opencode (cond-> [(resolve-binary! "opencode") "run"
-                                 "--print-logs" "--log-level" "WARN"]
-                          model (into ["-m" model])
-                          opencode-attach (into ["--attach" opencode-attach])
-                          true (conj fix-prompt)))
+        cmd (harness/build-cmd harness
+              {:cwd abs-wt :model model :prompt fix-prompt})
 
-        ;; :in "" closes stdin for non-claude harnesses (opencode hangs on open pipe)
         result (try
-                 (if (= harness :claude)
-                   (process/sh cmd {:dir abs-wt :in fix-prompt :out :string :err :string})
-                   (process/sh cmd {:dir abs-wt :in "" :out :string :err :string}))
+                 (process/sh cmd {:dir abs-wt
+                                  :in (harness/process-stdin harness fix-prompt)
+                                  :out :string :err :string})
                  (catch Exception e
                    {:exit -1 :out "" :err (.getMessage e)}))]
 
@@ -906,31 +786,17 @@
             swarm-id* (or swarm-id "unknown")
             tagged-prompt (str "[oompa:" swarm-id* ":planner] " prompt-text)
             abs-root (.getAbsolutePath (io/file project-root))
-            opencode-attach (opencode-attach-url)
 
-            cmd (case harness
-                  :codex (cond-> [(resolve-binary! "codex") "exec"
-                                  "--dangerously-bypass-approvals-and-sandbox"
-                                  "--skip-git-repo-check"
-                                  "-C" abs-root]
-                           model (into ["--model" model])
-                           true (conj "--" tagged-prompt))
-                  :claude (cond-> [(resolve-binary! "claude") "-p" "--dangerously-skip-permissions"]
-                            model (into ["--model" model]))
-                  :opencode (cond-> [(resolve-binary! "opencode") "run"
-                                     "--print-logs" "--log-level" "WARN"]
-                              model (into ["-m" model])
-                              opencode-attach (into ["--attach" opencode-attach])
-                              true (conj tagged-prompt)))
+            cmd (harness/build-cmd harness
+                  {:cwd abs-root :model model :prompt tagged-prompt})
 
             _ (println (format "[planner] Running (%s:%s, max_pending: %d, current: %d)"
                                (name harness) (or model "default") max-pending pending-before))
 
-            ;; :in "" closes stdin for non-claude harnesses (opencode hangs on open pipe)
             result (try
-                     (if (= harness :claude)
-                       (process/sh cmd {:dir abs-root :in tagged-prompt :out :string :err :string})
-                       (process/sh cmd {:dir abs-root :in "" :out :string :err :string}))
+                     (process/sh cmd {:dir abs-root
+                                      :in (harness/process-stdin harness tagged-prompt)
+                                      :out :string :err :string})
                      (catch Exception e
                        (println (format "[planner] Agent exception: %s" (.getMessage e)))
                        {:exit -1 :out "" :err (.getMessage e)}))

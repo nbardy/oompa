@@ -88,6 +88,12 @@
       attach (into ["--attach" attach])
       true (conj prompt))))
 
+(defmethod build-command :gemini
+  [_ {:keys [model]} prompt cwd]
+  (cond-> ["gemini" "--yolo"]
+    model (into ["-m" model])
+    true (into ["-p" prompt])))
+
 (defmethod build-command :default
   [agent-type _ _ _]
   (throw (ex-info (str "Unknown agent type: " agent-type)
@@ -287,12 +293,18 @@
               :codex ["codex" "--version"]
               :claude ["claude" "--version"]
               :opencode ["opencode" "--version"]
+              :gemini ["gemini" "--version"]
               ["echo" "unknown"])]
     (try
       (let [{:keys [exit]} (process/sh cmd {:out :string :err :string})]
         (zero? exit))
       (catch Exception _
-        false))))
+        ;; Some CLIs (like gemini) may error on --version due to config issues
+        ;; but still exist on PATH. Fall back to `which`.
+        (try
+          (let [{:keys [exit]} (process/sh ["which" (first cmd)] {:out :string :err :string})]
+            (zero? exit))
+          (catch Exception _ false))))))
 
 (defn select-backend
   "Select first available backend from preference list"
