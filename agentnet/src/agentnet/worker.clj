@@ -417,6 +417,37 @@
                         {:dir wt-dir :branch wt-branch}))))
     {:dir wt-dir :branch wt-branch :path wt-path}))
 
+(defn- detect-claimed-tasks
+  "Diff current/ task IDs before and after agent ran.
+   Returns set of task IDs this worker claimed during iteration."
+  [pre-current-ids]
+  (let [post-ids (tasks/current-task-ids)]
+    (clojure.set/difference post-ids pre-current-ids)))
+
+(defn- emit-iteration-log!
+  "Write iteration event log and update live summary.
+   Called at every iteration exit point."
+  [swarm-id worker-id iteration start-ms metrics
+   {:keys [outcome task-ids recycled-tasks error-snippet review-rounds]}]
+  (let [duration-ms (- (System/currentTimeMillis) start-ms)
+        task-id (first task-ids)]
+    (runs/write-iteration-log!
+      swarm-id worker-id iteration
+      {:outcome outcome
+       :duration-ms duration-ms
+       :task-id task-id
+       :recycled-tasks (or recycled-tasks [])
+       :error-snippet error-snippet
+       :review-rounds (or review-rounds 0)
+       :metrics metrics})
+    ;; Update live summary atom and flush to disk
+    (runs/update-live-metrics! worker-id
+      (assoc metrics
+             :iteration iteration
+             :status (name outcome)
+             :updated-at (str (java.time.Instant/now))))
+    (runs/write-live-summary! swarm-id)))
+
 (defn- recycle-orphaned-tasks!
   "Recycle tasks that a worker claimed but didn't complete.
    Compares current/ task IDs before and after the agent ran —
@@ -606,7 +637,7 @@
    Returns final worker state with metrics attached."
   [worker]
   (tasks/ensure-dirs!)
-  (let [{:keys [id iterations]} worker
+  (let [{:keys [id iterations swarm-id]} worker
         project-root (System/getProperty "user.dir")]
     (println (format "[%s] Starting worker (%s:%s%s, %d iterations)"
                      id
@@ -660,6 +691,7 @@
 
               ;; Worktree ready — run agent
               (let [resume? (some? session-id)
+                    iter-start-ms (System/currentTimeMillis)
                     ;; Snapshot current/ task IDs before agent runs so we can
                     ;; detect which tasks THIS worker claimed during iteration.
                     ;; On failure/rejection, tasks claimed but not completed
@@ -670,18 +702,23 @@
                     context (build-context)
                     {:keys [output exit done? merge?] :as agent-result}
                     (run-agent! worker (:path wt-state) context session-id resume?)
-                    new-session-id (:session-id agent-result)]
+                    new-session-id (:session-id agent-result)
+                    claimed-tasks (detect-claimed-tasks pre-current-ids)]
 
                 (cond
                   ;; Agent errored — recycle claimed tasks, cleanup, reset session
                   (not (zero? exit))
                   (let [errors (inc consec-errors)
-                        n-recycled (recycle-orphaned-tasks! id pre-current-ids)
+                        recycled (recycle-orphaned-tasks! id pre-current-ids)
                         metrics (-> metrics
                                     (update :errors inc)
-                                    (update :recycled + n-recycled))]
-                    (println (format "[%s] Agent error (exit %d): %s"
-                                     id exit (subs (or output "") 0 (min 200 (count (or output ""))))))
+                                    (update :recycled + recycled))
+                        error-msg (subs (or output "") 0 (min 200 (count (or output ""))))]
+                    (println (format "[%s] Agent error (exit %d): %s" id exit error-msg))
+                    (emit-iteration-log! swarm-id id iter iter-start-ms metrics
+                      {:outcome :error :task-ids claimed-tasks
+                       :recycled-tasks (when (pos? recycled) (vec claimed-tasks))
+                       :error-snippet error-msg})
                     (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                     (if (>= errors max-consecutive-errors)
                       (do
@@ -699,6 +736,8 @@
                         (let [merged? (merge-to-main! (:path wt-state) (:branch wt-state) id project-root 0)
                               metrics (if merged? (update metrics :merges inc) metrics)]
                           (println (format "[%s] Iteration %d/%d complete" id iter iterations))
+                          (emit-iteration-log! swarm-id id iter iter-start-ms metrics
+                            {:outcome :merged :task-ids claimed-tasks :review-rounds 0})
                           (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                           (if (and done? (:can-plan worker))
                             (do
@@ -719,6 +758,9 @@
                           (do
                             (merge-to-main! (:path wt-state) (:branch wt-state) id project-root (or attempts 0))
                             (println (format "[%s] Iteration %d/%d complete" id iter iterations))
+                            (emit-iteration-log! swarm-id id iter iter-start-ms metrics
+                              {:outcome :merged :task-ids claimed-tasks
+                               :review-rounds (or attempts 0)})
                             (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                             ;; If also __DONE__, stop after merge
                             (if (and done? (:can-plan worker))
@@ -731,14 +773,21 @@
                                               :recycled (:recycled metrics)
                                               :review-rounds-total (:review-rounds-total metrics)))
                               (recur (inc iter) (inc completed) 0 metrics nil nil)))
-                          (let [n-recycled (recycle-orphaned-tasks! id pre-current-ids)
-                                metrics (update metrics :recycled + n-recycled)]
+                          (let [recycled (recycle-orphaned-tasks! id pre-current-ids)
+                                metrics (update metrics :recycled + recycled)]
                             (println (format "[%s] Iteration %d/%d rejected" id iter iterations))
+                            (emit-iteration-log! swarm-id id iter iter-start-ms metrics
+                              {:outcome :rejected :task-ids claimed-tasks
+                               :recycled-tasks (when (pos? recycled) (vec claimed-tasks))
+                               :review-rounds (or attempts 0)})
                             (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                             (recur (inc iter) completed 0 metrics nil nil)))))
-                    (let [n-recycled (recycle-orphaned-tasks! id pre-current-ids)
-                          metrics (update metrics :recycled + n-recycled)]
+                    (let [recycled (recycle-orphaned-tasks! id pre-current-ids)
+                          metrics (update metrics :recycled + recycled)]
                       (println (format "[%s] Merge signaled but no changes, skipping" id))
+                      (emit-iteration-log! swarm-id id iter iter-start-ms metrics
+                        {:outcome :no-changes :task-ids claimed-tasks
+                         :recycled-tasks (when (pos? recycled) (vec claimed-tasks))})
                       (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                       (recur (inc iter) completed 0 metrics nil nil)))
 
@@ -746,6 +795,8 @@
                   (and done? (:can-plan worker))
                   (do
                     (println (format "[%s] Received __DONE__ signal" id))
+                    (emit-iteration-log! swarm-id id iter iter-start-ms metrics
+                      {:outcome :done :task-ids claimed-tasks})
                     (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                     (println (format "[%s] Worker done after %d/%d iterations" id iter iterations))
                     (finish :done))
@@ -754,9 +805,12 @@
                   ;; the agent process exited. Resuming a dead session causes exit 1
                   ;; which cascades into consecutive errors and premature stopping.
                   (and done? (not (:can-plan worker)))
-                  (let [n-recycled (recycle-orphaned-tasks! id pre-current-ids)
-                        metrics (update metrics :recycled + n-recycled)]
+                  (let [recycled (recycle-orphaned-tasks! id pre-current-ids)
+                        metrics (update metrics :recycled + recycled)]
                     (println (format "[%s] Ignoring __DONE__ (executor), resetting session" id))
+                    (emit-iteration-log! swarm-id id iter iter-start-ms metrics
+                      {:outcome :executor-done :task-ids claimed-tasks
+                       :recycled-tasks (when (pos? recycled) (vec claimed-tasks))})
                     (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                     (recur (inc iter) completed 0 metrics nil nil))
 
@@ -764,6 +818,8 @@
                   :else
                   (do
                     (println (format "[%s] Working... (will resume)" id))
+                    (emit-iteration-log! swarm-id id iter iter-start-ms metrics
+                      {:outcome :working :task-ids claimed-tasks})
                     (recur (inc iter) completed 0 metrics new-session-id wt-state)))))))))))
 
 ;; =============================================================================
@@ -794,13 +850,14 @@
       (let [results (mapv deref futures)]
         (println "\nAll workers complete.")
         (doseq [w results]
-          (println (format "  [%s] %s - %d completed, %d merges, %d rejections, %d errors, %d review rounds"
+          (println (format "  [%s] %s - %d completed, %d merges, %d rejections, %d errors, %d recycled, %d review rounds"
                            (:id w)
                            (name (:status w))
                            (:completed w)
                            (or (:merges w) 0)
                            (or (:rejections w) 0)
                            (or (:errors w) 0)
+                           (or (:recycled w) 0)
                            (or (:review-rounds-total w) 0))))
 
         ;; Write swarm summary to disk

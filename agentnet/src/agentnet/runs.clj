@@ -5,6 +5,8 @@
      runs/{swarm-id}/
        run.json          — start time, worker configs, planner output
        summary.json      — final metrics per worker, aggregate stats
+       iterations/
+         {worker-id}-i{N}.json  — per-iteration event log (started → outcome)
        reviews/
          {worker-id}-i{N}-r{round}.json  — per-iteration review log
 
@@ -26,8 +28,12 @@
 (defn- reviews-dir [swarm-id]
   (str (run-dir swarm-id) "/reviews"))
 
+(defn- iterations-dir [swarm-id]
+  (str (run-dir swarm-id) "/iterations"))
+
 (defn- ensure-run-dirs! [swarm-id]
-  (.mkdirs (io/file (reviews-dir swarm-id))))
+  (.mkdirs (io/file (reviews-dir swarm-id)))
+  (.mkdirs (io/file (iterations-dir swarm-id))))
 
 ;; =============================================================================
 ;; Atomic Write
@@ -93,6 +99,56 @@
                   :timestamp (str (java.time.Instant/now))
                   :output output
                   :diff-files (vec diff-files)})))
+
+;; =============================================================================
+;; Iteration Log — written per iteration for real-time dashboard visibility
+;; =============================================================================
+
+(defn write-iteration-log!
+  "Write an iteration event log for a worker.
+   Contains: outcome, timing, task info, metrics snapshot.
+   Written at iteration end so dashboards can track progress in real-time."
+  [swarm-id worker-id iteration
+   {:keys [outcome duration-ms task-id recycled-tasks
+           error-snippet review-rounds metrics]}]
+  (when swarm-id
+    (let [filename (format "%s-i%d.json" worker-id iteration)]
+      (write-json! (str (iterations-dir swarm-id) "/" filename)
+                   {:worker-id worker-id
+                    :iteration iteration
+                    :outcome (name outcome)
+                    :timestamp (str (java.time.Instant/now))
+                    :duration-ms duration-ms
+                    :task-id task-id
+                    :recycled-tasks (or recycled-tasks [])
+                    :error-snippet error-snippet
+                    :review-rounds (or review-rounds 0)
+                    :metrics metrics}))))
+
+;; =============================================================================
+;; Live Summary — written after each iteration for mid-run visibility
+;; =============================================================================
+
+(def ^:private live-metrics
+  "Atom holding per-worker metrics for live summary writes.
+   Updated by workers after each iteration."
+  (atom {}))
+
+(defn update-live-metrics!
+  "Update live metrics for a worker. Called after each iteration."
+  [worker-id metrics-map]
+  (swap! live-metrics assoc worker-id metrics-map))
+
+(defn write-live-summary!
+  "Write a live summary snapshot to runs/{swarm-id}/live-summary.json.
+   Called after each iteration so dashboards can show mid-run stats."
+  [swarm-id]
+  (when swarm-id
+    (let [workers @live-metrics]
+      (write-json! (str (run-dir swarm-id) "/live-summary.json")
+                   {:swarm-id swarm-id
+                    :updated-at (str (java.time.Instant/now))
+                    :workers workers}))))
 
 ;; =============================================================================
 ;; Swarm Summary — written at swarm end
@@ -164,3 +220,20 @@
            (filter #(str/ends-with? (.getName %) ".json"))
            (sort-by #(.getName %))
            (mapv (fn [f] (json/parse-string (slurp f) true)))))))
+
+(defn list-iterations
+  "List all iteration logs for a swarm, sorted by filename."
+  [swarm-id]
+  (let [d (io/file (iterations-dir swarm-id))]
+    (when (.exists d)
+      (->> (.listFiles d)
+           (filter #(str/ends-with? (.getName %) ".json"))
+           (sort-by #(.getName %))
+           (mapv (fn [f] (json/parse-string (slurp f) true)))))))
+
+(defn read-live-summary
+  "Read live-summary.json for a swarm (available during run)."
+  [swarm-id]
+  (let [f (io/file (str (run-dir swarm-id) "/live-summary.json"))]
+    (when (.exists f)
+      (json/parse-string (slurp f) true))))
