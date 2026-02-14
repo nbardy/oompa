@@ -222,10 +222,12 @@
                           true (conj tagged-prompt)))
 
         ;; Run agent — all run with cwd=worktree
+        ;; NOTE: :in "" closes stdin immediately. Without this, opencode hangs
+        ;; forever waiting on an open pipe. Claude needs :in for its prompt.
         result (try
                  (if (= harness :claude)
                    (process/sh cmd {:dir abs-worktree :in tagged-prompt :out :string :err :string})
-                   (process/sh cmd {:dir abs-worktree :out :string :err :string}))
+                   (process/sh cmd {:dir abs-worktree :in "" :out :string :err :string}))
                  (catch Exception e
                    (println (format "[%s] Agent exception: %s" id (.getMessage e)))
                    {:exit -1 :out "" :err (.getMessage e)}))
@@ -307,11 +309,11 @@
                           opencode-attach (into ["--attach" opencode-attach])
                           true (conj review-prompt)))
 
-        ;; Run reviewer — cwd=worktree
+        ;; Run reviewer — cwd=worktree (:in "" closes stdin for non-claude harnesses)
         result (try
                  (if (= review-harness :claude)
                    (process/sh cmd {:dir abs-wt :in review-prompt :out :string :err :string})
-                   (process/sh cmd {:dir abs-wt :out :string :err :string}))
+                   (process/sh cmd {:dir abs-wt :in "" :out :string :err :string}))
                  (catch Exception e
                    {:exit -1 :out "" :err (.getMessage e)}))
 
@@ -375,10 +377,11 @@
                           opencode-attach (into ["--attach" opencode-attach])
                           true (conj fix-prompt)))
 
+        ;; :in "" closes stdin for non-claude harnesses (opencode hangs on open pipe)
         result (try
                  (if (= harness :claude)
                    (process/sh cmd {:dir abs-wt :in fix-prompt :out :string :err :string})
-                   (process/sh cmd {:dir abs-wt :out :string :err :string}))
+                   (process/sh cmd {:dir abs-wt :in "" :out :string :err :string}))
                  (catch Exception e
                    {:exit -1 :out "" :err (.getMessage e)}))]
 
@@ -923,10 +926,11 @@
             _ (println (format "[planner] Running (%s:%s, max_pending: %d, current: %d)"
                                (name harness) (or model "default") max-pending pending-before))
 
+            ;; :in "" closes stdin for non-claude harnesses (opencode hangs on open pipe)
             result (try
                      (if (= harness :claude)
                        (process/sh cmd {:dir abs-root :in tagged-prompt :out :string :err :string})
-                       (process/sh cmd {:dir abs-root :out :string :err :string}))
+                       (process/sh cmd {:dir abs-root :in "" :out :string :err :string}))
                      (catch Exception e
                        (println (format "[planner] Agent exception: %s" (.getMessage e)))
                        {:exit -1 :out "" :err (.getMessage e)}))
