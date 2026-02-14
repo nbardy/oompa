@@ -59,6 +59,22 @@
   (or (agent/load-custom-prompt path)
       (agent/load-custom-prompt (str package-root "/" path))))
 
+(defn- task-root-for-cwd
+  "Return the relative tasks root for commands issued from cwd."
+  [cwd]
+  (let [cwd-file (io/file cwd)
+        local-tasks (io/file cwd-file "tasks")
+        parent-tasks (some-> cwd-file .getParentFile (io/file "tasks"))]
+    (cond
+      (.exists local-tasks) "tasks"
+      (and parent-tasks (.exists parent-tasks)) "../tasks"
+      :else "tasks")))
+
+(defn- render-task-header
+  "Inject runtime task path into auto-injected task header."
+  [raw-header cwd]
+  (str/replace (or raw-header "") "{{TASKS_ROOT}}" (task-root-for-cwd cwd)))
+
 (defn create-worker
   "Create a worker config.
    :prompts is a string or vector of strings — paths to prompt files.
@@ -159,7 +175,9 @@
                  (str "Task Status: " (:task_status context) "\n"
                       "Pending: " (:pending_tasks context) "\n\n"
                       "Continue working. Signal COMPLETE_AND_READY_FOR_MERGE when your current task is done and ready for review.")
-                 (let [task-header (or (load-prompt "config/prompts/_task_header.md") "")
+                 (let [task-header (render-task-header
+                                     (load-prompt "config/prompts/_task_header.md")
+                                     worktree-path)
                        user-prompts (if (seq prompts)
                                       (->> prompts
                                            (map load-prompt)
@@ -195,7 +213,8 @@
                                "--session-id" session-id]
                         resume? (conj "--resume")
                         model (into ["--model" model]))
-              :opencode (cond-> [(resolve-binary! "opencode") "run" "--format" "json"]
+              :opencode (cond-> [(resolve-binary! "opencode") "run" "--format" "json"
+                                 "--print-logs" "--log-level" "WARN"]
                           model (into ["-m" model])
                           opencode-attach (into ["--attach" opencode-attach])
                           (and resume? session-id) (into ["-s" session-id "--continue"])
@@ -281,7 +300,8 @@
                        true (conj "--" review-prompt))
               :claude (cond-> [(resolve-binary! "claude") "-p" "--dangerously-skip-permissions"]
                         review-model (into ["--model" review-model]))
-              :opencode (cond-> [(resolve-binary! "opencode") "run"]
+              :opencode (cond-> [(resolve-binary! "opencode") "run"
+                                 "--print-logs" "--log-level" "WARN"]
                           review-model (into ["-m" review-model])
                           opencode-attach (into ["--attach" opencode-attach])
                           true (conj review-prompt)))
@@ -348,7 +368,8 @@
                        true (conj "--" fix-prompt))
               :claude (cond-> [(resolve-binary! "claude") "-p" "--dangerously-skip-permissions"]
                         model (into ["--model" model]))
-              :opencode (cond-> [(resolve-binary! "opencode") "run"]
+              :opencode (cond-> [(resolve-binary! "opencode") "run"
+                                 "--print-logs" "--log-level" "WARN"]
                           model (into ["-m" model])
                           opencode-attach (into ["--attach" opencode-attach])
                           true (conj fix-prompt)))
@@ -805,7 +826,8 @@
                            true (conj "--" tagged-prompt))
                   :claude (cond-> [(resolve-binary! "claude") "-p" "--dangerously-skip-permissions"]
                             model (into ["--model" model]))
-                  :opencode (cond-> [(resolve-binary! "opencode") "run"]
+                  :opencode (cond-> [(resolve-binary! "opencode") "run"
+                                     "--print-logs" "--log-level" "WARN"]
                               model (into ["-m" model])
                               opencode-attach (into ["--attach" opencode-attach])
                               true (conj tagged-prompt)))
