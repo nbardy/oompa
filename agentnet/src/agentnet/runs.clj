@@ -134,6 +134,11 @@
    Updated by workers after each iteration."
   (atom {}))
 
+;; Serializes live-summary.json writes so concurrent workers don't
+;; corrupt the file. The atom is already thread-safe, but the
+;; read-atom → write-file sequence needs to be atomic too.
+(def ^:private live-summary-lock (Object.))
+
 (defn update-live-metrics!
   "Update live metrics for a worker. Called after each iteration."
   [worker-id metrics-map]
@@ -141,14 +146,16 @@
 
 (defn write-live-summary!
   "Write a live summary snapshot to runs/{swarm-id}/live-summary.json.
-   Called after each iteration so dashboards can show mid-run stats."
+   Called after each iteration so dashboards can show mid-run stats.
+   Serialized via live-summary-lock to prevent concurrent file corruption."
   [swarm-id]
   (when swarm-id
-    (let [workers @live-metrics]
-      (write-json! (str (run-dir swarm-id) "/live-summary.json")
-                   {:swarm-id swarm-id
-                    :updated-at (str (java.time.Instant/now))
-                    :workers workers}))))
+    (locking live-summary-lock
+      (let [workers @live-metrics]
+        (write-json! (str (run-dir swarm-id) "/live-summary.json")
+                     {:swarm-id swarm-id
+                      :updated-at (str (java.time.Instant/now))
+                      :workers workers})))))
 
 ;; =============================================================================
 ;; Swarm Summary — written at swarm end
