@@ -1,0 +1,42 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/nbardy/oompa_loompas/schemas/review.schema.json",
+  "title": "OompaReviewLog",
+  "description": "Review log written after each review round. File: runs/{swarm-id}/reviews/{worker-id}-i{N}-r{round}.json",
+  "type": "object",
+  "required": ["worker-id", "iteration", "round", "verdict", "timestamp", "output", "diff-files"],
+  "properties": {
+    "worker-id": {
+      "type": "string"
+    },
+    "iteration": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "round": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "Review round number (1-indexed, matches review-loop! attempt counter)"
+    },
+    "verdict": {
+      "type": "string",
+      "enum": ["approved", "needs-changes", "rejected"],
+      "description": "Review verdict from schema.clj review-verdicts"
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 instant when the review completed"
+    },
+    "output": {
+      "type": ["string", "null"],
+      "description": "Full reviewer agent output (null if process failed before producing output)"
+    },
+    "diff-files": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "List of files in the diff that was reviewed"
+    }
+  },
+  "additionalProperties": false
+}

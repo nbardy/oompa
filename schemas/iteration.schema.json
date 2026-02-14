@@ -1,0 +1,62 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/nbardy/oompa_loompas/schemas/iteration.schema.json",
+  "title": "OompaIterationLog",
+  "description": "Iteration event log written at the end of each worker iteration. File: runs/{swarm-id}/iterations/{worker-id}-i{N}.json",
+  "type": "object",
+  "required": ["worker-id", "iteration", "outcome", "timestamp", "duration-ms", "recycled-tasks", "review-rounds"],
+  "properties": {
+    "worker-id": {
+      "type": "string"
+    },
+    "iteration": {
+      "type": "integer",
+      "minimum": 1
+    },
+    "outcome": {
+      "type": "string",
+      "enum": ["merged", "rejected", "error", "done", "executor-done", "no-changes", "working"]
+    },
+    "timestamp": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 instant when the iteration completed"
+    },
+    "duration-ms": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Wall-clock duration of the iteration in milliseconds"
+    },
+    "task-id": {
+      "type": ["string", "null"],
+      "description": "ID of the first claimed task, or null if none claimed"
+    },
+    "recycled-tasks": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Task IDs recycled back to pending (empty array when none)"
+    },
+    "error-snippet": {
+      "type": ["string", "null"],
+      "description": "First ~200 chars of agent output on error, null otherwise"
+    },
+    "review-rounds": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Number of review rounds for this iteration (0 when no review)"
+    },
+    "metrics": {
+      "type": ["object", "null"],
+      "description": "Cumulative worker metrics snapshot at iteration end",
+      "properties": {
+        "merges": { "type": "integer", "minimum": 0 },
+        "rejections": { "type": "integer", "minimum": 0 },
+        "errors": { "type": "integer", "minimum": 0 },
+        "recycled": { "type": "integer", "minimum": 0 },
+        "review-rounds-total": { "type": "integer", "minimum": 0 }
+      },
+      "required": ["merges", "rejections", "errors", "recycled", "review-rounds-total"]
+    }
+  },
+  "additionalProperties": false
+}

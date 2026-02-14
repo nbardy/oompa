@@ -1,0 +1,63 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/nbardy/oompa_loompas/schemas/summary.schema.json",
+  "title": "OompaSwarmSummary",
+  "description": "Final swarm summary written when all workers complete. File: runs/{swarm-id}/summary.json",
+  "type": "object",
+  "required": ["swarm-id", "finished-at", "total-workers", "total-completed", "total-iterations", "status-counts", "workers"],
+  "properties": {
+    "swarm-id": {
+      "type": "string"
+    },
+    "finished-at": {
+      "type": "string",
+      "format": "date-time",
+      "description": "ISO-8601 instant when the swarm finished"
+    },
+    "total-workers": {
+      "type": "integer",
+      "minimum": 0
+    },
+    "total-completed": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Sum of completed iterations across all workers"
+    },
+    "total-iterations": {
+      "type": "integer",
+      "minimum": 0,
+      "description": "Sum of all iterations (configured max) across all workers"
+    },
+    "status-counts": {
+      "type": "object",
+      "description": "Frequency map of worker final statuses (e.g. {\"done\": 2, \"exhausted\": 1})",
+      "additionalProperties": { "type": "integer", "minimum": 0 }
+    },
+    "workers": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "harness", "model", "status", "completed", "iterations", "merges", "rejections", "errors", "recycled", "review-rounds-total"],
+        "properties": {
+          "id": { "type": "string" },
+          "harness": { "type": "string", "enum": ["codex", "claude", "opencode", "gemini"] },
+          "model": { "type": "string" },
+          "status": {
+            "type": "string",
+            "enum": ["done", "exhausted", "error", "idle"],
+            "description": "Worker final status"
+          },
+          "completed": { "type": "integer", "minimum": 0, "description": "Number of successfully completed iterations" },
+          "iterations": { "type": "integer", "minimum": 1, "description": "Configured max iterations for this worker" },
+          "merges": { "type": "integer", "minimum": 0 },
+          "rejections": { "type": "integer", "minimum": 0 },
+          "errors": { "type": "integer", "minimum": 0 },
+          "recycled": { "type": "integer", "minimum": 0 },
+          "review-rounds-total": { "type": "integer", "minimum": 0 }
+        },
+        "additionalProperties": false
+      }
+    }
+  },
+  "additionalProperties": false
+}
