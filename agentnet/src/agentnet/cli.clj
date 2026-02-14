@@ -496,6 +496,7 @@
                            :iterations (or (:iterations wc) 10)
                            :prompts (:prompt wc)
                            :can-plan (:can_plan wc)
+                           :wait-between (:wait_between wc)
                            :review-harness (:harness review-parsed)
                            :review-model (:model review-parsed)
                            :review-prompts (:prompts review-parsed)})))

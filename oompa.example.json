@@ -4,7 +4,8 @@
       "model": "claude:opus",
       "prompt": ["config/prompts/planner.md"],
       "iterations": 5,
-      "count": 1
+      "count": 1,
+      "wait_between": 60
     },
     {
       "model": "codex:gpt-5.3-codex:medium",

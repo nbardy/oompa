@@ -61,9 +61,10 @@
    :prompts is a string or vector of strings — paths to prompt files.
    :can-plan when false, worker waits for tasks before starting (backpressure).
    :reasoning reasoning effort level (e.g. \"low\", \"medium\", \"high\") — codex only.
-   :review-prompts paths to reviewer prompt files (loaded and concatenated for review)."
+   :review-prompts paths to reviewer prompt files (loaded and concatenated for review).
+   :wait-between seconds to sleep between iterations (nil or 0 = no wait)."
   [{:keys [id swarm-id harness model iterations prompts can-plan reasoning
-           review-harness review-model review-prompts]}]
+           review-harness review-model review-prompts wait-between]}]
   {:id id
    :swarm-id swarm-id
    :harness (or harness :codex)
@@ -75,6 +76,7 @@
               :else [])
    :can-plan (if (some? can-plan) can-plan true)
    :reasoning reasoning
+   :wait-between (when (and wait-between (pos? wait-between)) wait-between)
    :review-harness review-harness
    :review-model review-model
    :review-prompts (cond
@@ -509,6 +511,14 @@
           (Thread/sleep (* wait-poll-interval 1000))
           (recur (+ waited wait-poll-interval))))))
 
+(defn- maybe-sleep-between!
+  "Sleep between iterations when wait-between is configured.
+   Called at the start of each iteration (except the first)."
+  [worker-id wait-between iter]
+  (when (and wait-between (> iter 1))
+    (println (format "[%s] Sleeping %ds before next iteration" worker-id wait-between))
+    (Thread/sleep (* wait-between 1000))))
+
 (defn run-worker!
   "Run worker loop with persistent sessions.
 
@@ -520,14 +530,15 @@
    Returns final worker state with metrics attached."
   [worker]
   (tasks/ensure-dirs!)
-  (let [{:keys [id iterations swarm-id]} worker
+  (let [{:keys [id iterations swarm-id wait-between]} worker
         project-root (System/getProperty "user.dir")]
-    (println (format "[%s] Starting worker (%s:%s%s, %d iterations)"
+    (println (format "[%s] Starting worker (%s:%s%s, %d iterations%s)"
                      id
                      (name (:harness worker))
                      (or (:model worker) "default")
                      (if (:reasoning worker) (str ":" (:reasoning worker)) "")
-                     iterations))
+                     iterations
+                     (if wait-between (format ", %ds between" wait-between) "")))
 
     ;; Backpressure: workers that can't create tasks wait for tasks to exist
     (when-not (:can-plan worker)
@@ -555,6 +566,10 @@
             (println (format "[%s] Completed %d iterations (%d merges, %d rejections, %d errors, %d recycled)"
                              id completed (:merges metrics) (:rejections metrics) (:errors metrics) (:recycled metrics)))
             (finish :exhausted))
+
+          (do
+          ;; Sleep between iterations when wait_between is configured
+          (maybe-sleep-between! id wait-between iter)
 
           ;; Ensure worktree exists (create fresh if nil, reuse if persisted)
           (let [wt-state (try
@@ -703,7 +718,7 @@
                     (println (format "[%s] Working... (will resume)" id))
                     (emit-iteration-log! swarm-id id iter iter-start-ms metrics
                       {:outcome :working :task-ids claimed-tasks})
-                    (recur (inc iter) completed 0 metrics new-session-id wt-state)))))))))))
+                    (recur (inc iter) completed 0 metrics new-session-id wt-state))))))))))))
 
 ;; =============================================================================
 ;; Multi-Worker Execution
