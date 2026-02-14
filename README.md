@@ -85,7 +85,7 @@ This repo has a fleshed out version of the idea. The oompa loompas are organized
   "workers": [
     {"model": "claude:opus", "prompt": ["config/prompts/planner.md"], "iterations": 5, "count": 1},
     {"model": "codex:gpt-5.3-codex:medium", "prompt": ["config/prompts/executor.md"], "iterations": 10, "count": 2, "can_plan": false},
-    {"model": "opencode:openai/gpt-5", "prompt": ["config/prompts/executor.md"], "iterations": 10, "count": 1, "can_plan": false}
+    {"model": "opencode:opencode/kimi-k2.5-free", "prompt": ["config/prompts/executor.md"], "iterations": 10, "count": 1, "can_plan": false}
   ]
 }
 ```
@@ -93,13 +93,13 @@ This repo has a fleshed out version of the idea. The oompa loompas are organized
 This spawns:
 - **1 planner** (opus) — reads spec, explores codebase, creates/refines tasks
 - **2 codex executors** (gpt-5.3-codex, medium reasoning) — claims and executes tasks fast
-- **1 opencode executor** (openai/gpt-5) — same task loop via `opencode run`
+- **1 opencode executor** (opencode/kimi-k2.5-free) — same task loop via `opencode run`
 
 #### Worker fields
 
 | Field | Required | Description |
 |-------|----------|-------------|
-| `model` | yes | `harness:model` or `harness:model:reasoning` (e.g. `codex:gpt-5.3-codex:medium`, `claude:opus`, `opencode:openai/gpt-5`) |
+| `model` | yes | `harness:model` or `harness:model:reasoning` (e.g. `codex:gpt-5.3-codex:medium`, `claude:opus`, `opencode:opencode/kimi-k2.5-free`) |
 | `prompt` | no | String or array of paths — concatenated into one prompt |
 | `iterations` | no | Max iterations per worker (default: 10) |
 | `count` | no | Number of workers with this config (default: 1) |
@@ -113,7 +113,7 @@ This spawns:
 {
   "workers": [
     {"model": "claude:opus-4.5", "prompt": ["prompts/base.md", "prompts/architect.md"], "count": 1},
-    {"model": "opencode:openai/gpt-5-mini", "prompt": ["prompts/base.md", "prompts/frontend.md"], "count": 2},
+    {"model": "opencode:opencode/kimi-k2.5-free", "prompt": ["prompts/base.md", "prompts/frontend.md"], "count": 2},
     {"model": "codex:codex-5.2-mini", "prompt": ["prompts/base.md", "prompts/backend.md"], "count": 2}
   ]
 }

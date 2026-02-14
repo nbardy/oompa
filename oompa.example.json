@@ -14,7 +14,7 @@
       "can_plan": false
     },
     {
-      "model": "opencode:openai/gpt-5",
+      "model": "opencode:opencode/kimi-k2.5-free",
       "prompt": ["config/prompts/executor.md"],
       "iterations": 10,
       "count": 1,
