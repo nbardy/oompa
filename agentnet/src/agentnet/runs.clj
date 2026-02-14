@@ -115,6 +115,7 @@
                             :merges (or (:merges w) 0)
                             :rejections (or (:rejections w) 0)
                             :errors (or (:errors w) 0)
+                            :recycled (or (:recycled w) 0)
                             :review-rounds-total (or (:review-rounds-total w) 0)})
                          worker-results)]
     (write-json! (str (run-dir swarm-id) "/summary.json")

@@ -163,6 +163,24 @@
 (defn current-count [] (count (list-task-files CURRENT_DIR)))
 (defn complete-count [] (count (list-task-files COMPLETE_DIR)))
 
+(defn current-task-ids
+  "Return a set of task IDs currently in current/."
+  []
+  (->> (list-task-files CURRENT_DIR)
+       (keep read-task-file)
+       (map :id)
+       set))
+
+(defn recycle-tasks!
+  "Move specific tasks from current/ back to pending/ by ID.
+   Returns vector of recycled task IDs."
+  [task-ids]
+  (let [current (list-current)
+        to-recycle (filter #(task-ids (:id %)) current)]
+    (doseq [task to-recycle]
+      (unclaim-task! task))
+    (mapv :id to-recycle)))
+
 (defn all-complete?
   "True if no pending or current tasks"
   []

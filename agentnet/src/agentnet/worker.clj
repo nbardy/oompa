@@ -19,6 +19,7 @@
             [cheshire.core :as json]
             [babashka.process :as process]
             [clojure.java.io :as io]
+            [clojure.set]
             [clojure.string :as str]))
 
 ;; =============================================================================
@@ -416,6 +417,22 @@
                         {:dir wt-dir :branch wt-branch}))))
     {:dir wt-dir :branch wt-branch :path wt-path}))
 
+(defn- recycle-orphaned-tasks!
+  "Recycle tasks that a worker claimed but didn't complete.
+   Compares current/ task IDs before and after the agent ran —
+   new IDs that appeared are tasks this worker claimed. On failure
+   or rejection, move them back to pending/ so other workers can
+   pick them up. Returns count of recycled tasks."
+  [worker-id pre-current-ids]
+  (let [post-current-ids (tasks/current-task-ids)
+        orphaned-ids (clojure.set/difference post-current-ids pre-current-ids)
+        recycled (when (seq orphaned-ids)
+                   (tasks/recycle-tasks! orphaned-ids))]
+    (when (seq recycled)
+      (println (format "[%s] Recycled %d orphaned task(s): %s"
+                       worker-id (count recycled) (str/join ", " recycled))))
+    (count (or recycled []))))
+
 (defn- cleanup-worktree!
   "Remove worktree and branch."
   [project-root wt-dir wt-branch]
@@ -602,11 +619,11 @@
     (when-not (:can-plan worker)
       (wait-for-tasks! id))
 
-    ;; metrics tracks: {:merges N :rejections N :errors N :review-rounds-total N}
+    ;; metrics tracks: {:merges N :rejections N :errors N :recycled N :review-rounds-total N}
     (loop [iter 1
            completed 0
            consec-errors 0
-           metrics {:merges 0 :rejections 0 :errors 0 :review-rounds-total 0}
+           metrics {:merges 0 :rejections 0 :errors 0 :recycled 0 :review-rounds-total 0}
            session-id nil    ;; persistent session-id (nil = start fresh)
            wt-state nil]     ;; {:dir :branch :path} or nil
       (let [finish (fn [status]
@@ -614,14 +631,15 @@
                                    :merges (:merges metrics)
                                    :rejections (:rejections metrics)
                                    :errors (:errors metrics)
+                                   :recycled (:recycled metrics)
                                    :review-rounds-total (:review-rounds-total metrics)))]
         (if (> iter iterations)
           (do
             ;; Cleanup any lingering worktree
             (when wt-state
               (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state)))
-            (println (format "[%s] Completed %d iterations (%d merges, %d rejections, %d errors)"
-                             id completed (:merges metrics) (:rejections metrics) (:errors metrics)))
+            (println (format "[%s] Completed %d iterations (%d merges, %d rejections, %d errors, %d recycled)"
+                             id completed (:merges metrics) (:rejections metrics) (:errors metrics) (:recycled metrics)))
             (finish :exhausted))
 
           ;; Ensure worktree exists (create fresh if nil, reuse if persisted)
@@ -642,6 +660,11 @@
 
               ;; Worktree ready — run agent
               (let [resume? (some? session-id)
+                    ;; Snapshot current/ task IDs before agent runs so we can
+                    ;; detect which tasks THIS worker claimed during iteration.
+                    ;; On failure/rejection, tasks claimed but not completed
+                    ;; get recycled back to pending/.
+                    pre-current-ids (tasks/current-task-ids)
                     _ (println (format "[%s] %s iteration %d/%d"
                                        id (if resume? "Resuming" "Starting") iter iterations))
                     context (build-context)
@@ -650,10 +673,13 @@
                     new-session-id (:session-id agent-result)]
 
                 (cond
-                  ;; Agent errored — cleanup, reset session
+                  ;; Agent errored — recycle claimed tasks, cleanup, reset session
                   (not (zero? exit))
                   (let [errors (inc consec-errors)
-                        metrics (update metrics :errors inc)]
+                        n-recycled (recycle-orphaned-tasks! id pre-current-ids)
+                        metrics (-> metrics
+                                    (update :errors inc)
+                                    (update :recycled + n-recycled))]
                     (println (format "[%s] Agent error (exit %d): %s"
                                      id exit (subs (or output "") 0 (min 200 (count (or output ""))))))
                     (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
@@ -681,6 +707,7 @@
                                             :merges (:merges metrics)
                                             :rejections (:rejections metrics)
                                             :errors (:errors metrics)
+                                            :recycled (:recycled metrics)
                                             :review-rounds-total (:review-rounds-total metrics)))
                             (recur (inc iter) (inc completed) 0 metrics nil nil))))
                       ;; Code changes — full review loop
@@ -701,13 +728,16 @@
                                               :merges (:merges metrics)
                                               :rejections (:rejections metrics)
                                               :errors (:errors metrics)
+                                              :recycled (:recycled metrics)
                                               :review-rounds-total (:review-rounds-total metrics)))
                               (recur (inc iter) (inc completed) 0 metrics nil nil)))
-                          (do
+                          (let [n-recycled (recycle-orphaned-tasks! id pre-current-ids)
+                                metrics (update metrics :recycled + n-recycled)]
                             (println (format "[%s] Iteration %d/%d rejected" id iter iterations))
                             (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                             (recur (inc iter) completed 0 metrics nil nil)))))
-                    (do
+                    (let [n-recycled (recycle-orphaned-tasks! id pre-current-ids)
+                          metrics (update metrics :recycled + n-recycled)]
                       (println (format "[%s] Merge signaled but no changes, skipping" id))
                       (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                       (recur (inc iter) completed 0 metrics nil nil)))
@@ -724,7 +754,8 @@
                   ;; the agent process exited. Resuming a dead session causes exit 1
                   ;; which cascades into consecutive errors and premature stopping.
                   (and done? (not (:can-plan worker)))
-                  (do
+                  (let [n-recycled (recycle-orphaned-tasks! id pre-current-ids)
+                        metrics (update metrics :recycled + n-recycled)]
                     (println (format "[%s] Ignoring __DONE__ (executor), resetting session" id))
                     (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                     (recur (inc iter) completed 0 metrics nil nil))
