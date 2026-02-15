@@ -106,19 +106,60 @@
                           (count pending) (count current) (count complete))}))
 
 
+(defn- execute-claims!
+  "Execute CLAIM signal: attempt to claim each task ID from pending/.
+   Returns {:claimed [ids], :failed [ids], :resume-prompt string}."
+  [claim-ids]
+  (let [results (tasks/claim-by-ids! claim-ids)
+        claimed (filterv #(= :claimed (:status %)) results)
+        failed (filterv #(not= :claimed (:status %)) results)
+        claimed-ids (mapv :id claimed)
+        failed-ids (mapv :id failed)
+        context (build-context)
+        prompt (str "## Claim Results\n"
+                    (if (seq claimed-ids)
+                      (str "Claimed: " (str/join ", " claimed-ids) "\n")
+                      "No tasks were successfully claimed.\n")
+                    (when (seq failed-ids)
+                      (str "Already taken or not found: "
+                           (str/join ", " failed-ids) "\n"))
+                    "\nTask Status: " (:task_status context) "\n"
+                    "Remaining Pending:\n"
+                    (if (str/blank? (:pending_tasks context))
+                      "(none)"
+                      (:pending_tasks context))
+                    "\n\n"
+                    (if (seq claimed-ids)
+                      "Work on your claimed tasks. Signal COMPLETE_AND_READY_FOR_MERGE when done."
+                      "No claims succeeded. CLAIM different tasks, or signal __DONE__ if no suitable work remains."))]
+    {:claimed claimed-ids
+     :failed failed-ids
+     :resume-prompt prompt}))
+
 (defn- run-agent!
-  "Run agent with prompt, return {:output string, :done? bool, :merge? bool, :exit int, :session-id string}.
-   When resume? is true, continues the existing session with a lighter prompt
-   (just task status + continue instruction). All harness-specific CLI knowledge
+  "Run agent with prompt, return {:output :done? :merge? :claim-ids :exit :session-id}.
+   When resume? is true, continues the existing session with a lighter prompt.
+   resume-prompt-override: when non-nil, replaces the default resume prompt
+   (used to inject CLAIM results). All harness-specific CLI knowledge
    is delegated to harness/build-cmd."
-  [{:keys [id swarm-id harness model prompts reasoning]} worktree-path context session-id resume?]
+  [{:keys [id swarm-id harness model prompts reasoning]} worktree-path context session-id resume?
+   & {:keys [resume-prompt-override]}]
   (let [session-id (or session-id (harness/make-session-id harness))
 
-        ;; Build prompt — lighter for resume (agent already has full context)
-        prompt (if resume?
+        ;; Build prompt — 3-way: override → standard resume → fresh start
+        prompt (cond
+                 ;; CLAIM results or other injected resume prompt
+                 resume-prompt-override
+                 resume-prompt-override
+
+                 ;; Standard resume — lighter (agent already has full context)
+                 resume?
                  (str "Task Status: " (:task_status context) "\n"
                       "Pending: " (:pending_tasks context) "\n\n"
                       "Continue working. Signal COMPLETE_AND_READY_FOR_MERGE when your current task is done and ready for review.")
+
+                 ;; Fresh start — full task header + user prompts
+                 :else
                  (let [task-header (render-task-header
                                      (load-prompt "config/prompts/_task_header.md")
                                      worktree-path)
@@ -158,6 +199,7 @@
      :exit (:exit result)
      :done? (agent/done-signal? output)
      :merge? (agent/merge-signal? output)
+     :claim-ids (agent/parse-claim-signal output)
      :session-id session-id}))
 
 (defn- run-reviewer!
@@ -387,10 +429,10 @@
 
 (defn- merge-to-main!
   "Merge worktree changes to main branch. Serialized via merge-lock to prevent
-   concurrent workers from corrupting the git index. On success, annotates any
-   newly-completed tasks with worker metadata. Returns true on success.
-   review-rounds: number of review rounds (0 for auto-merged task-only changes)."
-  [wt-path wt-id worker-id project-root review-rounds]
+   concurrent workers from corrupting the git index. On success, moves claimed
+   tasks current→complete and annotates metadata. Returns true on success.
+   claimed-task-ids: set of task IDs this worker claimed (framework owns completion)."
+  [wt-path wt-id worker-id project-root review-rounds claimed-task-ids]
   (locking merge-lock
     (println (format "[%s] Merging changes to main" worker-id))
     (let [;; Commit in worktree if needed (no-op if already committed)
@@ -411,7 +453,13 @@
       (if success
         (do
           (println (format "[%s] Merge successful" worker-id))
-          ;; Annotate completed tasks while still holding merge-lock
+          ;; Framework-owned completion: move claimed tasks current→complete
+          (when (seq claimed-task-ids)
+            (let [completed (tasks/complete-by-ids! claimed-task-ids)]
+              (when (seq completed)
+                (println (format "[%s] Completed %d task(s): %s"
+                                 worker-id (count completed) (str/join ", " completed))))))
+          ;; Annotate completed tasks with metadata while still holding merge-lock
           (annotate-completed-tasks! project-root worker-id review-rounds))
         (when merge-result
           (println (format "[%s] MERGE FAILED: %s" worker-id (:err merge-result)))))
@@ -544,27 +592,30 @@
     (when-not (:can-plan worker)
       (wait-for-tasks! id))
 
-    ;; metrics tracks: {:merges N :rejections N :errors N :recycled N :review-rounds-total N}
+    ;; metrics tracks: {:merges N :rejections N :errors N :recycled N :review-rounds-total N :claims N}
     (loop [iter 1
            completed 0
            consec-errors 0
-           metrics {:merges 0 :rejections 0 :errors 0 :recycled 0 :review-rounds-total 0}
-           session-id nil    ;; persistent session-id (nil = start fresh)
-           wt-state nil]     ;; {:dir :branch :path} or nil
+           metrics {:merges 0 :rejections 0 :errors 0 :recycled 0 :review-rounds-total 0 :claims 0}
+           session-id nil            ;; persistent session-id (nil = start fresh)
+           wt-state nil              ;; {:dir :branch :path} or nil
+           claimed-ids #{}           ;; task IDs claimed this session (reset on worktree destroy)
+           claim-resume-prompt nil]  ;; override prompt for next iteration (from CLAIM results)
       (let [finish (fn [status]
                      (assoc worker :completed completed :status status
                                    :merges (:merges metrics)
                                    :rejections (:rejections metrics)
                                    :errors (:errors metrics)
                                    :recycled (:recycled metrics)
-                                   :review-rounds-total (:review-rounds-total metrics)))]
+                                   :review-rounds-total (:review-rounds-total metrics)
+                                   :claims (:claims metrics)))]
         (if (> iter iterations)
           (do
             ;; Cleanup any lingering worktree
             (when wt-state
               (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state)))
-            (println (format "[%s] Completed %d iterations (%d merges, %d rejections, %d errors, %d recycled)"
-                             id completed (:merges metrics) (:rejections metrics) (:errors metrics) (:recycled metrics)))
+            (println (format "[%s] Completed %d iterations (%d merges, %d claims, %d rejections, %d errors, %d recycled)"
+                             id completed (:merges metrics) (:claims metrics) (:rejections metrics) (:errors metrics) (:recycled metrics)))
             (finish :exhausted))
 
           (do
@@ -585,23 +636,23 @@
                   (do
                     (println (format "[%s] %d consecutive errors, stopping" id errors))
                     (finish :error))
-                  (recur (inc iter) completed errors metrics nil nil)))
+                  (recur (inc iter) completed errors metrics nil nil #{} nil)))
 
               ;; Worktree ready — run agent
-              (let [resume? (some? session-id)
+              (let [resume? (or (some? session-id) (some? claim-resume-prompt))
                     iter-start-ms (System/currentTimeMillis)
                     ;; Snapshot current/ task IDs before agent runs so we can
-                    ;; detect which tasks THIS worker claimed during iteration.
-                    ;; On failure/rejection, tasks claimed but not completed
-                    ;; get recycled back to pending/.
+                    ;; detect any direct mv claims (safety net for old behavior).
                     pre-current-ids (tasks/current-task-ids)
                     _ (println (format "[%s] %s iteration %d/%d"
                                        id (if resume? "Resuming" "Starting") iter iterations))
                     context (build-context)
-                    {:keys [output exit done? merge?] :as agent-result}
-                    (run-agent! worker (:path wt-state) context session-id resume?)
+                    {:keys [output exit done? merge? claim-ids] :as agent-result}
+                    (run-agent! worker (:path wt-state) context session-id resume?
+                                :resume-prompt-override claim-resume-prompt)
                     new-session-id (:session-id agent-result)
-                    claimed-tasks (detect-claimed-tasks pre-current-ids)]
+                    ;; Safety net: detect any direct mv claims (old behavior)
+                    mv-claimed-tasks (detect-claimed-tasks pre-current-ids)]
 
                 (cond
                   ;; Agent errored — recycle claimed tasks, cleanup, reset session
@@ -614,15 +665,28 @@
                         error-msg (subs (or output "") 0 (min 200 (count (or output ""))))]
                     (println (format "[%s] Agent error (exit %d): %s" id exit error-msg))
                     (emit-iteration-log! swarm-id id iter iter-start-ms metrics
-                      {:outcome :error :task-ids claimed-tasks
-                       :recycled-tasks (when (pos? recycled) (vec claimed-tasks))
+                      {:outcome :error :task-ids (into claimed-ids mv-claimed-tasks)
+                       :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))
                        :error-snippet error-msg})
                     (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                     (if (>= errors max-consecutive-errors)
                       (do
                         (println (format "[%s] %d consecutive errors, stopping" id errors))
                         (finish :error))
-                      (recur (inc iter) completed errors metrics nil nil)))
+                      (recur (inc iter) completed errors metrics nil nil #{} nil)))
+
+                  ;; CLAIM signal — framework claims tasks, resumes agent with results
+                  ;; Only honored when no MERGE or DONE signal (lowest priority)
+                  (and (seq claim-ids) (not merge?) (not done?))
+                  (let [_ (println (format "[%s] CLAIM signal: %s" id (str/join ", " claim-ids)))
+                        {:keys [claimed failed resume-prompt]} (execute-claims! claim-ids)
+                        new-claimed-ids (into claimed-ids claimed)
+                        metrics (update metrics :claims + (count claimed))]
+                    (println (format "[%s] Claimed %d/%d tasks" id (count claimed) (count claim-ids)))
+                    (emit-iteration-log! swarm-id id iter iter-start-ms metrics
+                      {:outcome :claimed :task-ids (set claimed)})
+                    (recur (inc iter) completed 0 metrics new-session-id wt-state
+                           new-claimed-ids resume-prompt))
 
                   ;; COMPLETE_AND_READY_FOR_MERGE — review, merge, reset session
                   merge?
@@ -631,11 +695,12 @@
                       ;; Task-only changes — skip review, auto-merge
                       (do
                         (println (format "[%s] Task-only diff, auto-merging" id))
-                        (let [merged? (merge-to-main! (:path wt-state) (:branch wt-state) id project-root 0)
+                        (let [all-claimed (into claimed-ids mv-claimed-tasks)
+                              merged? (merge-to-main! (:path wt-state) (:branch wt-state) id project-root 0 all-claimed)
                               metrics (if merged? (update metrics :merges inc) metrics)]
                           (println (format "[%s] Iteration %d/%d complete" id iter iterations))
                           (emit-iteration-log! swarm-id id iter iter-start-ms metrics
-                            {:outcome :merged :task-ids claimed-tasks :review-rounds 0})
+                            {:outcome :merged :task-ids all-claimed :review-rounds 0})
                           (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                           (if (and done? (:can-plan worker))
                             (do
@@ -645,19 +710,20 @@
                                             :rejections (:rejections metrics)
                                             :errors (:errors metrics)
                                             :recycled (:recycled metrics)
-                                            :review-rounds-total (:review-rounds-total metrics)))
-                            (recur (inc iter) (inc completed) 0 metrics nil nil))))
+                                            :review-rounds-total (:review-rounds-total metrics)
+                                            :claims (:claims metrics)))
+                            (recur (inc iter) (inc completed) 0 metrics nil nil #{} nil))))
                       ;; Code changes — full review loop
                       (let [{:keys [approved? attempts]} (review-loop! worker (:path wt-state) id iter)
                             metrics (-> metrics
                                         (update :review-rounds-total + (or attempts 0))
                                         (update (if approved? :merges :rejections) inc))]
                         (if approved?
-                          (do
-                            (merge-to-main! (:path wt-state) (:branch wt-state) id project-root (or attempts 0))
+                          (let [all-claimed (into claimed-ids mv-claimed-tasks)]
+                            (merge-to-main! (:path wt-state) (:branch wt-state) id project-root (or attempts 0) all-claimed)
                             (println (format "[%s] Iteration %d/%d complete" id iter iterations))
                             (emit-iteration-log! swarm-id id iter iter-start-ms metrics
-                              {:outcome :merged :task-ids claimed-tasks
+                              {:outcome :merged :task-ids all-claimed
                                :review-rounds (or attempts 0)})
                             (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                             ;; If also __DONE__, stop after merge
@@ -669,32 +735,33 @@
                                               :rejections (:rejections metrics)
                                               :errors (:errors metrics)
                                               :recycled (:recycled metrics)
-                                              :review-rounds-total (:review-rounds-total metrics)))
-                              (recur (inc iter) (inc completed) 0 metrics nil nil)))
+                                              :review-rounds-total (:review-rounds-total metrics)
+                                              :claims (:claims metrics)))
+                              (recur (inc iter) (inc completed) 0 metrics nil nil #{} nil)))
                           (let [recycled (recycle-orphaned-tasks! id pre-current-ids)
                                 metrics (update metrics :recycled + recycled)]
                             (println (format "[%s] Iteration %d/%d rejected" id iter iterations))
                             (emit-iteration-log! swarm-id id iter iter-start-ms metrics
-                              {:outcome :rejected :task-ids claimed-tasks
-                               :recycled-tasks (when (pos? recycled) (vec claimed-tasks))
+                              {:outcome :rejected :task-ids (into claimed-ids mv-claimed-tasks)
+                               :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))
                                :review-rounds (or attempts 0)})
                             (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                            (recur (inc iter) completed 0 metrics nil nil)))))
+                            (recur (inc iter) completed 0 metrics nil nil #{} nil)))))
                     (let [recycled (recycle-orphaned-tasks! id pre-current-ids)
                           metrics (update metrics :recycled + recycled)]
                       (println (format "[%s] Merge signaled but no changes, skipping" id))
                       (emit-iteration-log! swarm-id id iter iter-start-ms metrics
-                        {:outcome :no-changes :task-ids claimed-tasks
-                         :recycled-tasks (when (pos? recycled) (vec claimed-tasks))})
+                        {:outcome :no-changes :task-ids (into claimed-ids mv-claimed-tasks)
+                         :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))})
                       (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                      (recur (inc iter) completed 0 metrics nil nil)))
+                      (recur (inc iter) completed 0 metrics nil nil #{} nil)))
 
                   ;; __DONE__ without merge — only honor for planners
                   (and done? (:can-plan worker))
                   (do
                     (println (format "[%s] Received __DONE__ signal" id))
                     (emit-iteration-log! swarm-id id iter iter-start-ms metrics
-                      {:outcome :done :task-ids claimed-tasks})
+                      {:outcome :done :task-ids (into claimed-ids mv-claimed-tasks)})
                     (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                     (println (format "[%s] Worker done after %d/%d iterations" id iter iterations))
                     (finish :done))
@@ -707,18 +774,19 @@
                         metrics (update metrics :recycled + recycled)]
                     (println (format "[%s] Ignoring __DONE__ (executor), resetting session" id))
                     (emit-iteration-log! swarm-id id iter iter-start-ms metrics
-                      {:outcome :executor-done :task-ids claimed-tasks
-                       :recycled-tasks (when (pos? recycled) (vec claimed-tasks))})
+                      {:outcome :executor-done :task-ids (into claimed-ids mv-claimed-tasks)
+                       :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))})
                     (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                    (recur (inc iter) completed 0 metrics nil nil))
+                    (recur (inc iter) completed 0 metrics nil nil #{} nil))
 
                   ;; No signal — agent still working, resume next iteration
                   :else
                   (do
                     (println (format "[%s] Working... (will resume)" id))
                     (emit-iteration-log! swarm-id id iter iter-start-ms metrics
-                      {:outcome :working :task-ids claimed-tasks})
-                    (recur (inc iter) completed 0 metrics new-session-id wt-state))))))))))))
+                      {:outcome :working :task-ids (into claimed-ids mv-claimed-tasks)})
+                    (recur (inc iter) completed 0 metrics new-session-id wt-state
+                           claimed-ids nil))))))))))))
 
 ;; =============================================================================
 ;; Multi-Worker Execution
@@ -748,11 +816,12 @@
       (let [results (mapv deref futures)]
         (println "\nAll workers complete.")
         (doseq [w results]
-          (println (format "  [%s] %s - %d completed, %d merges, %d rejections, %d errors, %d recycled, %d review rounds"
+          (println (format "  [%s] %s - %d completed, %d merges, %d claims, %d rejections, %d errors, %d recycled, %d review rounds"
                            (:id w)
                            (name (:status w))
                            (:completed w)
                            (or (:merges w) 0)
+                           (or (:claims w) 0)
                            (or (:rejections w) 0)
                            (or (:errors w) 0)
                            (or (:recycled w) 0)

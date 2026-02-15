@@ -24,3 +24,4 @@ See `CLAUDE.md` for the full docs/ vs notes/ convention.
 ## Current Documentation
 
 - `opencode-harness.md` - exact OpenCode worker run/continue/session behavior
+- `run-artifacts.md` - `runs/{swarm-id}/` directory layout and JSON schema contract with claude-web-view

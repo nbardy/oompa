@@ -150,9 +150,11 @@
       (when session-id
         ["--session-id" session-id]))
     :resume-fn
+    ;; --resume takes session-id as its value; combining --session-id + --resume
+    ;; is rejected by Claude CLI unless --fork-session is also passed.
     (fn [{:keys [session-id]}]
       (when session-id
-        ["--session-id" session-id "--resume"]))
+        ["--resume" session-id]))
     :output       :plain
     :format-flags nil
     :extra-flags-fn nil}

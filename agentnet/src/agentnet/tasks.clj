@@ -123,6 +123,35 @@
   (when-let [task (first (list-pending))]
     (claim-task! task)))
 
+(defn claim-by-id!
+  "Claim a pending task by its :id string. Atomically moves pending → current.
+   Returns {:status :claimed|:already-taken|:not-found, :id id}."
+  [task-id]
+  (let [match (first (filter #(= (:id %) task-id) (list-pending)))]
+    (if match
+      (if (claim-task! match)
+        {:status :claimed :id task-id}
+        {:status :already-taken :id task-id})
+      ;; Not in pending — check if already in current (raced)
+      (if (some #(= (:id %) task-id) (list-current))
+        {:status :already-taken :id task-id}
+        {:status :not-found :id task-id}))))
+
+(defn claim-by-ids!
+  "Claim multiple tasks by ID. Returns vector of result maps."
+  [task-ids]
+  (mapv claim-by-id! task-ids))
+
+(defn complete-by-ids!
+  "Move tasks from current → complete by ID. Framework-owned completion.
+   Returns vector of completed task IDs."
+  [task-ids]
+  (let [id-set (set task-ids)
+        to-complete (filter #(id-set (:id %)) (list-current))]
+    (doseq [task to-complete]
+      (complete-task! task))
+    (mapv :id to-complete)))
+
 ;; =============================================================================
 ;; Task Creation
 ;; =============================================================================

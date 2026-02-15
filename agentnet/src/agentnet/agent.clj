@@ -158,6 +158,17 @@
   [output]
   (boolean (re-find #"COMPLETE_AND_READY_FOR_MERGE" (or output ""))))
 
+(defn parse-claim-signal
+  "Extract task IDs from CLAIM(...) signal in output.
+   Returns vector of task ID strings, or nil if no CLAIM signal found.
+   Format: CLAIM(task-001, task-003, task-005)"
+  [output]
+  (when-let [match (re-find #"CLAIM\(([^)]+)\)" (or output ""))]
+    (->> (str/split (second match) #",")
+         (map str/trim)
+         (remove str/blank?)
+         vec)))
+
 (defn- extract-comments
   "Extract bullet-point comments from output"
   [output]

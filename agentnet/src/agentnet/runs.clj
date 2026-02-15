@@ -176,6 +176,7 @@
                             :completed (:completed w)
                             :iterations (:iterations w)
                             :merges (or (:merges w) 0)
+                            :claims (or (:claims w) 0)
                             :rejections (or (:rejections w) 0)
                             :errors (or (:errors w) 0)
                             :recycled (or (:recycled w) 0)

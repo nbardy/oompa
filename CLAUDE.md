@@ -38,6 +38,10 @@ The `agent_notes/` folder is for agent-to-agent communication during swarm execu
 - `notes_FROM_CTO/` - Feedback from reviewer agents
 - `proposed_tasks/` - Self-created tasks from workers
 
+## Systems Design
+
+See [docs/SYSTEMS_DESIGN.md](docs/SYSTEMS_DESIGN.md) for the constitution governing agent vs. framework responsibilities. Key rule: **agents act, the framework reacts.** Agents get maximum flexibility (claim, create, work); deterministic software handles races, merges, completion, and stability. All design decisions should reference this document.
+
 ## Git Workflow
 
 - Workers operate in isolated git worktrees

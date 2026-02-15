@@ -1,63 +1,31 @@
 ## Task Management (auto-injected by oompa)
 
-You are working in a git worktree. Your code changes go in `.` (current directory).
-Tasks live in the project root at `{{TASKS_ROOT}}/`. You can reach them from your worktree.
+You are working in a git worktree. Tasks live at `{{TASKS_ROOT}}/`.
 
-### See available tasks
+### Orient first
 
-```bash
-ls {{TASKS_ROOT}}/pending/
-cat {{TASKS_ROOT}}/pending/*.edn
+Before claiming, understand the landscape:
+- Read the project spec
+- Run `git log --oneline -20` to see what's been merged
+- `ls {{TASKS_ROOT}}/pending/` and `cat` tasks that interest you
+- Check `{{TASKS_ROOT}}/current/` and `{{TASKS_ROOT}}/complete/` to see what's in flight and done
+
+### Claim tasks
+
+Output this signal (the framework handles the rest):
+
+```
+CLAIM(task-001, task-003)
 ```
 
-### Claim a task (mark as in-progress)
+The framework will claim them atomically and resume you with results: what succeeded, what was already taken, and what's still pending. You can CLAIM again if needed.
 
-```bash
-mv {{TASKS_ROOT}}/pending/<task-file>.edn {{TASKS_ROOT}}/current/<task-file>.edn
-```
-
-### Complete a task
-
-```bash
-mv {{TASKS_ROOT}}/current/<task-file>.edn {{TASKS_ROOT}}/complete/<task-file>.edn
-```
-
-### Create a new task
-
-```bash
-cat > {{TASKS_ROOT}}/pending/task-NNN.edn << 'EOF'
-{:id "task-NNN"
- :summary "Short imperative description"
- :description "What needs to happen and why"
- :difficulty :easy  ;; :easy :medium :hard
- :files ["src/relevant-file.py"]
- :acceptance ["Specific condition that means done"]}
-EOF
-```
-
-### Planning vs Executing
-
-**WHEN PLANNING** (task queue is empty or nearly empty):
-- Your FIRST priority is creating tasks for other workers. They are waiting.
-- Read the project spec, identify gaps, and create 5-10 focused, well-detailed tasks.
-- Do NOT execute tasks in the same iteration you create them.
-- Commit the task files and finish your iteration so others can claim them immediately.
-
-**WHEN EXECUTING** (tasks exist in pending):
-- Claim one task, execute it end-to-end, complete it.
-- If work emerges during execution, create new tasks in `{{TASKS_ROOT}}/pending/`.
+Do NOT `mv` task files yourself. The framework owns all task state transitions.
 
 ### Signals
 
-Your session persists across iterations. Keep working until your task is complete.
+- **`CLAIM(id, ...)`** — Claim one or more pending tasks. Batch related tasks together.
+- **`COMPLETE_AND_READY_FOR_MERGE`** — Your work is done and ready for review. Framework reviews, merges, and marks your claimed tasks complete.
+- **`__DONE__`** — No more useful work exists. Stops your worker.
 
-- **`COMPLETE_AND_READY_FOR_MERGE`**: Output this on its own line when your current work is done and ready for review. Your changes will be reviewed and merged, then you start a fresh session.
-- **`__DONE__`**: Output this only when ALL project work is truly complete and no more tasks can be derived from the spec. This stops your worker entirely.
-
-### Rules
-
-- Before starting work: read the project spec and all tasks to understand scope.
-- Claim your task by moving it to `{{TASKS_ROOT}}/current/`.
-- If the `mv` fails (another worker claimed it first), pick a different task.
-- One task per commit (or a small, tightly-related set with overlapping files).
-- Do NOT output `__DONE__` on your first action. Only use it when you've verified nothing remains.
+One signal per output. Claim before working.
