@@ -189,7 +189,13 @@
                   :total-completed total-completed
                   :total-iterations total-iterations
                   :status-counts statuses
-                  :workers per-worker})))
+                  :workers per-worker})
+    ;; Clean up live-summary.json — its lifecycle ends when summary.json is written.
+    ;; Leaving it around causes claude-web-view to show ghost "running" status.
+    (let [live-file (io/file (str (run-dir swarm-id) "/live-summary.json"))]
+      (when (.exists live-file)
+        (.delete live-file)))
+    (reset! live-metrics {})))
 
 ;; =============================================================================
 ;; Read helpers (for cmd-status, dashboards)

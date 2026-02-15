@@ -22,8 +22,8 @@ All writes are atomic (write to `.tmp`, then rename) to avoid partial reads by d
 | File | When Written | Contents |
 |------|-------------|----------|
 | `run.json` | Swarm start | Start time, worker configs (harness, model, prompts, iterations), planner/reviewer config |
-| `live-summary.json` | After each iteration | Per-worker metrics snapshot. Serialized with a lock to prevent concurrent corruption |
-| `summary.json` | Swarm end | Final per-worker stats (completed, merges, rejections, errors, recycled) and aggregates |
+| `live-summary.json` | After each iteration | Per-worker metrics snapshot. Serialized with a lock to prevent concurrent corruption. **Deleted when `summary.json` is written** — its lifecycle ends at swarm completion |
+| `summary.json` | Swarm end | Final per-worker stats (completed, merges, claims, rejections, errors, recycled) and aggregates |
 | `iterations/{wid}-i{N}.json` | Iteration end | Outcome, duration, task ID, recycled tasks, error snippet, review round count, metrics |
 | `reviews/{wid}-i{N}-r{round}.json` | After each review round | Verdict (approved/rejected/needs-changes), reviewer output, diff file list |
 

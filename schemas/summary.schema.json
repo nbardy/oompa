@@ -37,7 +37,7 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["id", "harness", "model", "status", "completed", "iterations", "merges", "rejections", "errors", "recycled", "review-rounds-total"],
+        "required": ["id", "harness", "model", "status", "completed", "iterations", "merges", "claims", "rejections", "errors", "recycled", "review-rounds-total"],
         "properties": {
           "id": { "type": "string" },
           "harness": { "type": "string", "enum": ["codex", "claude", "opencode", "gemini"] },
@@ -50,6 +50,7 @@
           "completed": { "type": "integer", "minimum": 0, "description": "Number of successfully completed iterations" },
           "iterations": { "type": "integer", "minimum": 1, "description": "Configured max iterations for this worker" },
           "merges": { "type": "integer", "minimum": 0 },
+          "claims": { "type": "integer", "minimum": 0, "description": "Number of tasks claimed via CLAIM signal" },
           "rejections": { "type": "integer", "minimum": 0 },
           "errors": { "type": "integer", "minimum": 0 },
           "recycled": { "type": "integer", "minimum": 0 },
