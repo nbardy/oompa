@@ -1,0 +1,30 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/nbardy/oompa_loompas/schemas/cycle.schema.json",
+  "title": "OompaCycle",
+  "description": "Worker cycle event. One complete work unit. File: runs/{swarm-id}/cycles/{worker-id}-c{N}.json",
+  "type": "object",
+  "required": ["worker-id", "cycle", "outcome", "timestamp", "duration-ms", "recycled-tasks", "review-rounds"],
+  "properties": {
+    "worker-id": { "type": "string" },
+    "cycle": { "type": "integer", "minimum": 1 },
+    "outcome": {
+      "type": "string",
+      "enum": ["merged", "rejected", "error", "done", "executor-done", "no-changes", "working"]
+    },
+    "timestamp": { "type": "string", "format": "date-time" },
+    "duration-ms": { "type": "integer", "minimum": 0 },
+    "claimed-task-ids": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Task IDs claimed via CLAIM signal during this cycle"
+    },
+    "recycled-tasks": {
+      "type": "array",
+      "items": { "type": "string" }
+    },
+    "error-snippet": { "type": ["string", "null"] },
+    "review-rounds": { "type": "integer", "minimum": 0 }
+  },
+  "additionalProperties": false
+}

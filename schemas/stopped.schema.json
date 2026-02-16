@@ -1,0 +1,15 @@
+{
+  "$schema": "http://json-schema.org/draft-07/schema#",
+  "$id": "https://github.com/nbardy/oompa_loompas/schemas/stopped.schema.json",
+  "title": "OompaStopped",
+  "description": "Swarm stopped event. Written once at clean exit. File: runs/{swarm-id}/stopped.json",
+  "type": "object",
+  "required": ["swarm-id", "stopped-at", "reason"],
+  "properties": {
+    "swarm-id": { "type": "string" },
+    "stopped-at": { "type": "string", "format": "date-time" },
+    "reason": { "type": "string", "enum": ["completed", "interrupted", "error"] },
+    "error": { "type": ["string", "null"] }
+  },
+  "additionalProperties": false
+}

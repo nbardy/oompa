@@ -282,46 +282,45 @@
       (orchestrator/run-once! opts))))
 
 (defn cmd-status
-  "Show status of last run — reads structured runs/{swarm-id}/ data."
+  "Show status of last run — reads event-sourced runs/{swarm-id}/ data."
   [opts args]
   (let [run-ids (runs/list-runs)]
     (if (seq run-ids)
       (let [swarm-id (or (first args) (first run-ids))
-            run-log (runs/read-run-log swarm-id)
-            summary (runs/read-summary swarm-id)
+            started (runs/read-started swarm-id)
+            stopped (runs/read-stopped swarm-id)
+            cycles (runs/list-cycles swarm-id)
             reviews (runs/list-reviews swarm-id)]
         (println (format "Swarm: %s" swarm-id))
-        (when run-log
-          (println (format "  Started: %s" (:started-at run-log)))
-          (println (format "  Config:  %s" (or (:config-file run-log) "N/A")))
-          (println (format "  Workers: %d" (count (:workers run-log)))))
+        (when started
+          (println (format "  Started: %s" (:started-at started)))
+          (println (format "  PID:     %s" (or (:pid started) "N/A")))
+          (println (format "  Config:  %s" (or (:config-file started) "N/A")))
+          (println (format "  Workers: %d" (count (:workers started)))))
         (println)
-        (if summary
-          (do
-            (println (format "Summary (finished %s):" (:finished-at summary)))
-            (println (format "  Total completed: %d/%d iterations"
-                             (:total-completed summary) (:total-iterations summary)))
-            (println (format "  Status counts: %s" (pr-str (:status-counts summary))))
-            (println)
-            (println "Per-worker:")
-            (doseq [w (:workers summary)]
-              (println (format "  [%s] %s:%s — %s, %d completed, %d merges, %d rejections, %d errors, %d review rounds"
-                               (:id w)
-                               (or (:harness w) "unknown")
-                               (or (:model w) "default")
-                               (or (:status w) "unknown")
-                               (or (:completed w) 0)
-                               (or (:merges w) 0)
-                               (or (:rejections w) 0)
-                               (or (:errors w) 0)
-                               (or (:review-rounds-total w) 0)))))
-          (println "  (still running — no summary yet)"))
+        (if stopped
+          (println (format "Stopped: %s (reason: %s%s)"
+                           (:stopped-at stopped)
+                           (:reason stopped)
+                           (if (:error stopped)
+                             (str ", error: " (:error stopped))
+                             "")))
+          (println "  (still running — no stopped event yet)"))
+        (when (seq cycles)
+          (println)
+          (println (format "Cycles: %d total" (count cycles)))
+          (doseq [c cycles]
+            (println (format "  %s-c%d: %s (%dms, claimed: %s)"
+                             (:worker-id c) (:cycle c)
+                             (:outcome c)
+                             (or (:duration-ms c) 0)
+                             (str/join ", " (or (:claimed-task-ids c) []))))))
         (when (seq reviews)
           (println)
           (println (format "Reviews: %d total" (count reviews)))
           (doseq [r reviews]
-            (println (format "  %s-i%d-r%d: %s"
-                             (:worker-id r) (:iteration r) (:round r)
+            (println (format "  %s-c%d-r%d: %s"
+                             (:worker-id r) (:cycle r) (:round r)
                              (:verdict r))))))
       ;; Fall back to legacy JSONL format
       (let [runs-dir (io/file "runs")
@@ -537,13 +536,13 @@
                           planner-config (conj planner-config))
                         review-parsed)
 
-      ;; Write run log to runs/{swarm-id}/run.edn
-      (runs/write-run-log! swarm-id
+      ;; Write started event to runs/{swarm-id}/started.json
+      (runs/write-started! swarm-id
                            {:workers workers
                             :planner-config planner-parsed
                             :reviewer-config review-parsed
                             :config-file config-file})
-      (println (format "\nRun log written to runs/%s/run.edn" swarm-id))
+      (println (format "\nStarted event written to runs/%s/started.json" swarm-id))
 
       ;; Run planner if configured — synchronously before workers
       (when planner-parsed

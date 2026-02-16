@@ -1,24 +1,15 @@
 {
   "$schema": "http://json-schema.org/draft-07/schema#",
-  "$id": "https://github.com/nbardy/oompa_loompas/schemas/run.schema.json",
-  "title": "OompaRunLog",
-  "description": "Run log written at swarm start. File: runs/{swarm-id}/run.json",
+  "$id": "https://github.com/nbardy/oompa_loompas/schemas/started.schema.json",
+  "title": "OompaStarted",
+  "description": "Swarm started event. Written once at swarm start. File: runs/{swarm-id}/started.json",
   "type": "object",
-  "required": ["swarm-id", "started-at", "config-file", "workers"],
+  "required": ["swarm-id", "started-at", "pid", "config-file", "workers"],
   "properties": {
-    "swarm-id": {
-      "type": "string",
-      "description": "Unique identifier for this swarm run"
-    },
-    "started-at": {
-      "type": "string",
-      "format": "date-time",
-      "description": "ISO-8601 instant when the swarm started"
-    },
-    "config-file": {
-      "type": "string",
-      "description": "Path to the oompa.json config file used"
-    },
+    "swarm-id": { "type": "string" },
+    "started-at": { "type": "string", "format": "date-time" },
+    "pid": { "type": "integer", "description": "Orchestrator process ID for liveness checks" },
+    "config-file": { "type": "string" },
     "workers": {
       "type": "array",
       "items": {
@@ -32,12 +23,12 @@
           "iterations": { "type": "integer", "minimum": 1 },
           "can-plan": { "type": "boolean" },
           "prompts": { "type": "array", "items": { "type": "string" } }
-        }
+        },
+        "additionalProperties": false
       }
     },
     "planner": {
       "type": ["object", "null"],
-      "description": "Planner config, null when no planner is configured",
       "properties": {
         "harness": { "type": "string", "enum": ["codex", "claude", "opencode", "gemini"] },
         "model": { "type": "string" },
@@ -48,7 +39,6 @@
     },
     "reviewer": {
       "type": ["object", "null"],
-      "description": "Reviewer config, null when no reviewer is configured",
       "properties": {
         "harness": { "type": "string", "enum": ["codex", "claude", "opencode", "gemini"] },
         "model": { "type": "string" },

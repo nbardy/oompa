@@ -351,29 +351,20 @@
   (let [post-ids (tasks/current-task-ids)]
     (clojure.set/difference post-ids pre-current-ids)))
 
-(defn- emit-iteration-log!
-  "Write iteration event log and update live summary.
-   Called at every iteration exit point."
-  [swarm-id worker-id iteration start-ms metrics
-   {:keys [outcome task-ids recycled-tasks error-snippet review-rounds]}]
-  (let [duration-ms (- (System/currentTimeMillis) start-ms)
-        task-id (first task-ids)]
-    (runs/write-iteration-log!
-      swarm-id worker-id iteration
+(defn- emit-cycle-log!
+  "Write cycle event log. Called at every cycle exit point.
+   No mutable summary state — all state is derived from immutable cycle logs."
+  [swarm-id worker-id cycle start-ms
+   {:keys [outcome claimed-task-ids recycled-tasks error-snippet review-rounds]}]
+  (let [duration-ms (- (System/currentTimeMillis) start-ms)]
+    (runs/write-cycle-log!
+      swarm-id worker-id cycle
       {:outcome outcome
        :duration-ms duration-ms
-       :task-id task-id
+       :claimed-task-ids (vec (or claimed-task-ids []))
        :recycled-tasks (or recycled-tasks [])
        :error-snippet error-snippet
-       :review-rounds (or review-rounds 0)
-       :metrics metrics})
-    ;; Update live summary atom and flush to disk
-    (runs/update-live-metrics! worker-id
-      (assoc metrics
-             :iteration iteration
-             :status (name outcome)
-             :updated-at (str (java.time.Instant/now))))
-    (runs/write-live-summary! swarm-id)))
+       :review-rounds (or review-rounds 0)})))
 
 (defn- recycle-orphaned-tasks!
   "Recycle tasks that a worker claimed but didn't complete.
@@ -664,8 +655,8 @@
                                     (update :recycled + recycled))
                         error-msg (subs (or output "") 0 (min 200 (count (or output ""))))]
                     (println (format "[%s] Agent error (exit %d): %s" id exit error-msg))
-                    (emit-iteration-log! swarm-id id iter iter-start-ms metrics
-                      {:outcome :error :task-ids (into claimed-ids mv-claimed-tasks)
+                    (emit-cycle-log! swarm-id id iter iter-start-ms
+                      {:outcome :error :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))
                        :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))
                        :error-snippet error-msg})
                     (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
@@ -683,8 +674,8 @@
                         new-claimed-ids (into claimed-ids claimed)
                         metrics (update metrics :claims + (count claimed))]
                     (println (format "[%s] Claimed %d/%d tasks" id (count claimed) (count claim-ids)))
-                    (emit-iteration-log! swarm-id id iter iter-start-ms metrics
-                      {:outcome :claimed :task-ids (set claimed)})
+                    (emit-cycle-log! swarm-id id iter iter-start-ms
+                      {:outcome :claimed :claimed-task-ids (vec claimed)})
                     (recur (inc iter) completed 0 metrics new-session-id wt-state
                            new-claimed-ids resume-prompt))
 
@@ -698,9 +689,9 @@
                         (let [all-claimed (into claimed-ids mv-claimed-tasks)
                               merged? (merge-to-main! (:path wt-state) (:branch wt-state) id project-root 0 all-claimed)
                               metrics (if merged? (update metrics :merges inc) metrics)]
-                          (println (format "[%s] Iteration %d/%d complete" id iter iterations))
-                          (emit-iteration-log! swarm-id id iter iter-start-ms metrics
-                            {:outcome :merged :task-ids all-claimed :review-rounds 0})
+                          (println (format "[%s] Cycle %d/%d complete" id iter iterations))
+                          (emit-cycle-log! swarm-id id iter iter-start-ms
+                            {:outcome :merged :claimed-task-ids (vec all-claimed) :review-rounds 0})
                           (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                           (if (and done? (:can-plan worker))
                             (do
@@ -721,9 +712,9 @@
                         (if approved?
                           (let [all-claimed (into claimed-ids mv-claimed-tasks)]
                             (merge-to-main! (:path wt-state) (:branch wt-state) id project-root (or attempts 0) all-claimed)
-                            (println (format "[%s] Iteration %d/%d complete" id iter iterations))
-                            (emit-iteration-log! swarm-id id iter iter-start-ms metrics
-                              {:outcome :merged :task-ids all-claimed
+                            (println (format "[%s] Cycle %d/%d complete" id iter iterations))
+                            (emit-cycle-log! swarm-id id iter iter-start-ms
+                              {:outcome :merged :claimed-task-ids (vec all-claimed)
                                :review-rounds (or attempts 0)})
                             (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                             ;; If also __DONE__, stop after merge
@@ -740,9 +731,9 @@
                               (recur (inc iter) (inc completed) 0 metrics nil nil #{} nil)))
                           (let [recycled (recycle-orphaned-tasks! id pre-current-ids)
                                 metrics (update metrics :recycled + recycled)]
-                            (println (format "[%s] Iteration %d/%d rejected" id iter iterations))
-                            (emit-iteration-log! swarm-id id iter iter-start-ms metrics
-                              {:outcome :rejected :task-ids (into claimed-ids mv-claimed-tasks)
+                            (println (format "[%s] Cycle %d/%d rejected" id iter iterations))
+                            (emit-cycle-log! swarm-id id iter iter-start-ms
+                              {:outcome :rejected :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))
                                :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))
                                :review-rounds (or attempts 0)})
                             (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
@@ -750,8 +741,8 @@
                     (let [recycled (recycle-orphaned-tasks! id pre-current-ids)
                           metrics (update metrics :recycled + recycled)]
                       (println (format "[%s] Merge signaled but no changes, skipping" id))
-                      (emit-iteration-log! swarm-id id iter iter-start-ms metrics
-                        {:outcome :no-changes :task-ids (into claimed-ids mv-claimed-tasks)
+                      (emit-cycle-log! swarm-id id iter iter-start-ms
+                        {:outcome :no-changes :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))
                          :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))})
                       (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                       (recur (inc iter) completed 0 metrics nil nil #{} nil)))
@@ -760,8 +751,8 @@
                   (and done? (:can-plan worker))
                   (do
                     (println (format "[%s] Received __DONE__ signal" id))
-                    (emit-iteration-log! swarm-id id iter iter-start-ms metrics
-                      {:outcome :done :task-ids (into claimed-ids mv-claimed-tasks)})
+                    (emit-cycle-log! swarm-id id iter iter-start-ms
+                      {:outcome :done :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))})
                     (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                     (println (format "[%s] Worker done after %d/%d iterations" id iter iterations))
                     (finish :done))
@@ -773,8 +764,8 @@
                   (let [recycled (recycle-orphaned-tasks! id pre-current-ids)
                         metrics (update metrics :recycled + recycled)]
                     (println (format "[%s] Ignoring __DONE__ (executor), resetting session" id))
-                    (emit-iteration-log! swarm-id id iter iter-start-ms metrics
-                      {:outcome :executor-done :task-ids (into claimed-ids mv-claimed-tasks)
+                    (emit-cycle-log! swarm-id id iter iter-start-ms
+                      {:outcome :executor-done :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))
                        :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))})
                     (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                     (recur (inc iter) completed 0 metrics nil nil #{} nil))
@@ -783,8 +774,8 @@
                   :else
                   (do
                     (println (format "[%s] Working... (will resume)" id))
-                    (emit-iteration-log! swarm-id id iter iter-start-ms metrics
-                      {:outcome :working :task-ids (into claimed-ids mv-claimed-tasks)})
+                    (emit-cycle-log! swarm-id id iter iter-start-ms
+                      {:outcome :working :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))})
                     (recur (inc iter) completed 0 metrics new-session-id wt-state
                            claimed-ids nil))))))))))))
 
@@ -794,7 +785,7 @@
 
 (defn run-workers!
   "Run multiple workers in parallel.
-   Writes swarm summary to runs/{swarm-id}/summary.edn on completion.
+   Writes stopped event to runs/{swarm-id}/stopped.json on completion.
 
    Arguments:
      workers - seq of worker configs
@@ -827,10 +818,10 @@
                            (or (:recycled w) 0)
                            (or (:review-rounds-total w) 0))))
 
-        ;; Write swarm summary to disk
+        ;; Write stopped event — all state derivable from cycle logs
         (when swarm-id
-          (runs/write-summary! swarm-id results)
-          (println (format "\nSwarm summary written to runs/%s/summary.edn" swarm-id)))
+          (runs/write-stopped! swarm-id :completed)
+          (println (format "\nStopped event written to runs/%s/stopped.json" swarm-id)))
 
         results))))
 

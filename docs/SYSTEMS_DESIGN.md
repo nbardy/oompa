@@ -63,3 +63,9 @@ Role-specific behavior (planning strategy, execution approach, task decompositio
 When agents interact with shared state, the mechanism should be visible and inspectable. Filesystem operations over in-memory state. Explicit signals over implicit detection. Scripts with output over silent side effects.
 
 If something goes wrong, an operator should be able to reconstruct what happened from the artifacts on disk — without reading framework source code or agent logs.
+
+### 10. Write events, never projections
+
+Every file on disk records something that happened — a swarm started, an iteration completed, a reviewer gave a verdict. No file records a computed view of what happened. Summaries, statuses, and aggregate metrics are computed at read time by whoever needs them.
+
+This eliminates ghost state (derived files outliving their validity), dual authority (two files claiming to represent the same thing), and stale reads (dashboards showing dead runs as alive). An event file is written once, is immutable, and is always true.
