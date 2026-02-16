@@ -2,20 +2,17 @@
   "Harness configuration registry.
 
    Each harness is a data map describing how to invoke a CLI agent.
-   All harness-specific knowledge lives here — binary names, flag syntax,
-   stdin behavior, session strategy, output parsing.
-
-   To add a new harness: add one entry to `registry`.
-   No case/switch/if-on-harness anywhere else in the codebase.
+   CLI flag syntax is owned by agent-cli (shared with claude-web-view).
+   This module owns: stdin behavior, session strategy, output parsing.
 
    Harness = Codex | Claude | Opencode | Gemini
-   δ(harness) → config map → builder functions → command vector"
+   δ(harness) → config map → agent-cli JSON → command vector"
   (:require [babashka.process :as process]
             [cheshire.core :as json]
             [clojure.string :as str]))
 
 ;; =============================================================================
-;; Binary Resolution (moved from worker.clj — shared across all harnesses)
+;; Binary Resolution (shared across all harnesses)
 ;; =============================================================================
 
 (def ^:private binary-paths* (atom {}))
@@ -29,16 +26,15 @@
   (or (get @binary-paths* name)
       (let [result (try
                      (process/sh ["which" name] {:out :string :err :string})
-                     (catch Exception _ {:exit -1 :out "" :err ""}))
-            path (when (zero? (:exit result))
-                   (str/trim (:out result)))]
-        (if path
-          (do (swap! binary-paths* assoc name path)
-              path)
+                     (catch Exception _ {:exit -1 :out "" :err ""}))]
+        (if (zero? (:exit result))
+          (let [path (str/trim (:out result))]
+            (swap! binary-paths* assoc name path)
+            path)
           (throw (ex-info (str "Binary not found on PATH: " name) {:binary name}))))))
 
 ;; =============================================================================
-;; Opencode Output Parsing (harness-specific, lives here not in worker.clj)
+;; Opencode Output Parsing (harness-specific, lives here not in agent-cli)
 ;; =============================================================================
 
 (defn- parse-opencode-run-output
@@ -72,7 +68,7 @@
      :text (when-not (str/blank? text) text)}))
 
 ;; =============================================================================
-;; Env Helpers (harness-specific config from environment)
+;; Env Helpers
 ;; =============================================================================
 
 (defn- opencode-attach-url
@@ -84,120 +80,21 @@
       url)))
 
 ;; =============================================================================
-;; Harness Registry — THE canonical source of all harness-specific knowledge
+;; Harness Registry — oompa-specific behavior fields only
 ;; =============================================================================
 ;;
-;; Each entry describes one CLI agent harness. Fields:
+;; CLI flag syntax (model flags, session flags, bypass, prompt delivery)
+;; is owned by agent-cli. This registry only tracks:
 ;;
-;;   :binary        - CLI binary name (resolved via `which`)
-;;   :base-cmd      - subcommand + fixed flags after binary name
-;;   :auto-approve  - flags to skip all confirmation prompts
-;;   :model-flag    - flag name for model selection
-;;   :prompt-via    - how prompt is delivered:
-;;                      :cli-arg  → appended as last CLI arg
-;;                      :cli-sep  → appended after separator (e.g. "--")
-;;                      :flag     → passed as value to :prompt-flag
-;;                      :stdin    → piped via process stdin
-;;   :prompt-flag   - flag name when :prompt-via is :flag (e.g. "-p")
-;;   :prompt-sep    - separator string when :prompt-via is :cli-sep (e.g. "--")
-;;   :stdin         - what to pass as process stdin:
-;;                      :close   → "" (close immediately, prevent hang)
-;;                      :prompt  → the prompt text
-;;   :cwd-flag      - CLI flag for working directory (nil = use :dir on process)
-;;   :session       - session ID strategy:
-;;                      :uuid      → generate UUID
-;;                      :extracted → parse from output (opencode NDJSON)
-;;                      :implicit  → harness manages sessions by cwd (gemini)
-;;   :session-flags-fn  - (fn [{:keys [session-id]}]) → flags for initial session
-;;   :resume-fn         - (fn [{:keys [session-id]}]) → flags for resuming
-;;   :output        - output format: :plain or :ndjson
-;;   :format-flags  - extra flags for structured output (only when :format? true)
-;;   :extra-flags-fn - (fn [opts]) → additional flags from env/config
+;;   :stdin   - what to pass as process stdin (:close or :prompt)
+;;   :session - session ID strategy (:uuid, :extracted, :implicit)
+;;   :output  - output format (:plain or :ndjson)
 
 (def registry
-  {:codex
-   {:binary       "codex"
-    :base-cmd     ["exec"]
-    :auto-approve ["--dangerously-bypass-approvals-and-sandbox"
-                   "--skip-git-repo-check"]
-    :model-flag   "--model"
-    :prompt-via   :cli-sep
-    :prompt-sep   "--"
-    :stdin        :close
-    :cwd-flag     "-C"
-    :session      :uuid
-    :session-flags-fn nil
-    :resume-fn    nil
-    :output       :plain
-    :format-flags nil
-    :extra-flags-fn
-    (fn [{:keys [reasoning]}]
-      (when reasoning
-        ["-c" (str "reasoning.effort=\"" reasoning "\"")]))}
-
-   :claude
-   {:binary       "claude"
-    :base-cmd     []
-    :auto-approve ["--dangerously-skip-permissions"]
-    :model-flag   "--model"
-    :prompt-via   :flag
-    :prompt-flag  "-p"
-    :stdin        :prompt
-    :cwd-flag     nil
-    :session      :uuid
-    :session-flags-fn
-    (fn [{:keys [session-id]}]
-      (when session-id
-        ["--session-id" session-id]))
-    :resume-fn
-    ;; --resume takes session-id as its value; combining --session-id + --resume
-    ;; is rejected by Claude CLI unless --fork-session is also passed.
-    (fn [{:keys [session-id]}]
-      (when session-id
-        ["--resume" session-id]))
-    :output       :plain
-    :format-flags nil
-    :extra-flags-fn nil}
-
-   :opencode
-   {:binary       "opencode"
-    :base-cmd     ["run"]
-    :auto-approve []
-    :model-flag   "-m"
-    :prompt-via   :cli-arg
-    :stdin        :close
-    :cwd-flag     nil
-    :session      :extracted
-    :session-flags-fn nil
-    :resume-fn
-    (fn [{:keys [session-id]}]
-      (when session-id
-        ["-s" session-id "--continue"]))
-    :output       :ndjson
-    :format-flags ["--format" "json" "--print-logs" "--log-level" "WARN"]
-    :extra-flags-fn
-    (fn [_]
-      (let [url (opencode-attach-url)]
-        (when url
-          ["--attach" url])))}
-
-   :gemini
-   {:binary       "gemini"
-    :base-cmd     []
-    :auto-approve ["--yolo"]
-    :model-flag   "-m"
-    :prompt-via   :flag
-    :prompt-flag  "-p"
-    :stdin        :close
-    :cwd-flag     nil
-    :session      :implicit
-    :session-flags-fn nil
-    :resume-fn
-    (fn [_]
-      ["--resume" "latest"])
-    :output       :plain
-    :format-flags nil
-    :extra-flags-fn nil}})
+  {:codex    {:stdin :close   :session :uuid      :output :plain}
+   :claude   {:stdin :prompt  :session :uuid      :output :plain}
+   :opencode {:stdin :close   :session :extracted  :output :ndjson}
+   :gemini   {:stdin :close   :session :implicit   :output :plain}})
 
 ;; =============================================================================
 ;; Registry Access
@@ -217,54 +114,46 @@
   (set (keys registry)))
 
 ;; =============================================================================
-;; Command Builder — composes registry data into command vectors
+;; Command Builder — delegates to agent-cli via JSON input
 ;; =============================================================================
 
-(defn build-cmd
-  "Build full CLI command vector from harness config + opts.
+(defn- add-extra-args
+  "Attach harness-specific extraArgs to the JSON input map.
+   Only opencode needs extra flags (--format json, --attach)."
+  [m harness-kw opts]
+  (if (= harness-kw :opencode)
+    (let [url (opencode-attach-url)
+          extra (cond-> []
+                  (:format? opts) (into ["--format" "json" "--print-logs" "--log-level" "WARN"])
+                  url             (into ["--attach" url]))]
+      (if (seq extra) (assoc m :extraArgs extra) m))
+    m))
 
-   opts keys:
-     :cwd         - working directory (absolute path)
-     :model       - model name (optional)
-     :reasoning   - reasoning effort level (codex only, optional)
-     :session-id  - session identifier (optional)
-     :resume?     - whether to resume existing session
-     :prompt      - prompt text
-     :format?     - include structured output flags (default false)"
-  [harness-kw {:keys [cwd model reasoning session-id resume? prompt format?]}]
-  (let [{:keys [binary base-cmd auto-approve model-flag cwd-flag
-                prompt-via prompt-flag prompt-sep
-                session-flags-fn resume-fn format-flags extra-flags-fn]}
-        (get-config harness-kw)]
-    (cond-> [(resolve-binary! binary)]
-      ;; Subcommand + fixed flags
-      (seq base-cmd)           (into base-cmd)
-      ;; Auto-approve flags
-      (seq auto-approve)       (into auto-approve)
-      ;; Structured output flags (opt-in, e.g. opencode --format json)
-      (and format? (seq format-flags)) (into format-flags)
-      ;; Working directory via CLI flag (codex uses -C; others use :dir on process)
-      (and cwd-flag cwd)       (into [cwd-flag cwd])
-      ;; Model
-      model                    (into [model-flag model])
-      ;; Extra env/config flags (reasoning, --attach, etc.)
-      (and extra-flags-fn
-           (seq (extra-flags-fn {:reasoning reasoning})))
-      (into (extra-flags-fn {:reasoning reasoning}))
-      ;; Session flags — resume takes priority over initial session
-      (and resume? resume-fn
-           (seq (resume-fn {:session-id session-id})))
-      (into (resume-fn {:session-id session-id}))
-      (and (not resume?) session-flags-fn session-id
-           (seq (session-flags-fn {:session-id session-id})))
-      (into (session-flags-fn {:session-id session-id}))
-      ;; Prompt delivery
-      (and (= prompt-via :flag) prompt-flag prompt)
-      (into [prompt-flag prompt])
-      (and (= prompt-via :cli-sep) prompt-sep prompt)
-      (into [prompt-sep prompt])
-      (and (= prompt-via :cli-arg) prompt)
-      (conj prompt))))
+(defn build-cmd
+  "Build CLI command vector via agent-cli JSON input.
+   Sends a JSON dict to `agent-cli build --input -`, parses the CommandSpec,
+   and resolves the binary to an absolute path.
+
+   agent-cli owns all CLI flag syntax (session create/resume, model decomposition,
+   bypass flags, prompt delivery). This function just maps oompa opts to JSON."
+  [harness-kw opts]
+  (let [input (-> {:harness (name harness-kw)
+                   :bypassPermissions true}
+                  (cond->
+                    (:model opts)      (assoc :model (:model opts))
+                    (:prompt opts)     (assoc :prompt (:prompt opts))
+                    (:session-id opts) (assoc :sessionId (:session-id opts))
+                    (:resume? opts)    (assoc :resume true)
+                    (:cwd opts)        (assoc :cwd (:cwd opts))
+                    (:reasoning opts)  (assoc :reasoning (:reasoning opts)))
+                  (add-extra-args harness-kw opts)
+                  json/generate-string)
+        {:keys [exit out err]} (process/sh ["agent-cli" "build" "--input" "-"]
+                                           {:in input :out :string :err :string})]
+    (when-not (zero? exit)
+      (throw (ex-info (str "agent-cli: " (str/trim err)) {:exit exit})))
+    (let [argv (:argv (json/parse-string out true))]
+      (vec (cons (resolve-binary! (first argv)) (rest argv))))))
 
 (defn process-stdin
   "Return the :in value for process/sh.
@@ -308,40 +197,21 @@
        :session-id session-id})))
 
 ;; =============================================================================
-;; Probe / Health Check
+;; Probe / Health Check — delegates to agent-cli check
 ;; =============================================================================
+
+(defn check-available
+  "Check if harness CLI binary is available on PATH via agent-cli."
+  [harness-kw]
+  (try
+    (let [{:keys [exit out]} (process/sh ["agent-cli" "check" (name harness-kw)]
+                                         {:out :string :err :string})]
+      (when (zero? exit)
+        (:available (json/parse-string out true))))
+    (catch Exception _ false)))
 
 (defn build-probe-cmd
   "Build minimal command to test if a harness+model is accessible.
-   Sends '[_HIDE_TEST_] say ok' and checks for exit 0."
+   Delegates to build-cmd with a '[_HIDE_TEST_] say ok' probe prompt."
   [harness-kw model]
-  (let [{:keys [binary base-cmd auto-approve model-flag
-                prompt-via prompt-flag prompt-sep]}
-        (get-config harness-kw)
-        test-prompt "[_HIDE_TEST_] say ok"]
-    (cond-> [binary]
-      (seq base-cmd)     (into base-cmd)
-      (seq auto-approve) (into auto-approve)
-      model              (into [model-flag model])
-      ;; Prompt delivery (same logic as build-cmd)
-      (and (= prompt-via :flag) prompt-flag)
-      (into [prompt-flag test-prompt])
-      (and (= prompt-via :cli-sep) prompt-sep)
-      (into [prompt-sep test-prompt])
-      (= prompt-via :cli-arg)
-      (conj test-prompt))))
-
-(defn check-available
-  "Check if harness CLI binary is available on PATH."
-  [harness-kw]
-  (let [{:keys [binary]} (get-config harness-kw)]
-    (try
-      (let [{:keys [exit]} (process/sh [binary "--version"] {:out :string :err :string})]
-        (zero? exit))
-      (catch Exception _
-        ;; Some CLIs (like gemini) may error on --version due to config issues
-        ;; but still exist on PATH. Fall back to `which`.
-        (try
-          (let [{:keys [exit]} (process/sh ["which" binary] {:out :string :err :string})]
-            (zero? exit))
-          (catch Exception _ false))))))
+  (build-cmd harness-kw {:model model :prompt "[_HIDE_TEST_] say ok"}))
