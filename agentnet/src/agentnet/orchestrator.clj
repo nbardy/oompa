@@ -286,6 +286,8 @@
 (defn- ensure-dir! [path]
   (.mkdirs (io/file path)))
 
+;; DEAD CODE: save-run-log!, run-once!, run-loop! are unreachable since
+;; cmd-run/cmd-loop simple-mode was retired 2026-02-17. Delete in a future pass.
 (defn save-run-log!
   "Save run results to JSONL file"
   [state]

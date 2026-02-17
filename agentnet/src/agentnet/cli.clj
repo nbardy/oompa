@@ -223,10 +223,10 @@
             (println (format "  %dx %s" (:count spec) (name (:harness spec)))))
           (println)
           (worker/run-workers! workers))
-        ;; Simple mode
+        ;; Simple mode retired — use oompa.json or --workers harness:count
         (do
-          (println (format "Swarm ID: %s" swarm-id))
-          (orchestrator/run-once! (assoc opts :swarm-id swarm-id)))))))
+          (println "Simple mode is no longer supported. Use oompa.json or --workers harness:count.")
+          (System/exit 1))))))
 
 (defn cmd-loop
   "Run orchestrator N times"
@@ -255,14 +255,10 @@
           (println (format "  %dx %s" (:count spec) (name (:harness spec)))))
         (println)
         (worker/run-workers! workers))
-      ;; Simple mode: --workers N --harness X
-      (let [model-str (if (:model opts)
-                        (format " (model: %s)" (:model opts))
-                        "")]
-        (println (format "Starting %d iterations with %s harness%s..."
-                         iterations (name (:harness opts)) model-str))
-        (println (format "Swarm ID: %s" swarm-id))
-        (orchestrator/run-loop! iterations (assoc opts :swarm-id swarm-id))))))
+      ;; Simple mode retired — use oompa.json or --workers harness:count
+      (do
+        (println "Simple mode is no longer supported. Use oompa.json or --workers harness:count.")
+        (System/exit 1)))))
 
 (defn cmd-prompt
   "Run ad-hoc prompt as single task"
