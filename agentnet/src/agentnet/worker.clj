@@ -380,8 +380,9 @@
 
 (defn- emit-cycle-log!
   "Write cycle event log. Called at every cycle exit point.
+   session-id links to the Claude CLI conversation transcript on disk.
    No mutable summary state — all state is derived from immutable cycle logs."
-  [swarm-id worker-id cycle start-ms
+  [swarm-id worker-id cycle start-ms session-id
    {:keys [outcome claimed-task-ids recycled-tasks error-snippet review-rounds]}]
   (let [duration-ms (- (System/currentTimeMillis) start-ms)]
     (runs/write-cycle-log!
@@ -391,7 +392,8 @@
        :claimed-task-ids (vec (or claimed-task-ids []))
        :recycled-tasks (or recycled-tasks [])
        :error-snippet error-snippet
-       :review-rounds (or review-rounds 0)})))
+       :review-rounds (or review-rounds 0)
+       :session-id session-id})))
 
 (defn- recycle-orphaned-tasks!
   "Recycle tasks that a worker claimed but didn't complete.
@@ -647,7 +649,7 @@
                   (when (seq recycled)
                     (println (format "[%s] Recycled %d claimed task(s) on shutdown" id (count recycled))))))
               (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state)))
-            (emit-cycle-log! swarm-id id iter (System/currentTimeMillis)
+            (emit-cycle-log! swarm-id id iter (System/currentTimeMillis) session-id
               {:outcome :interrupted})
             (finish :interrupted))
 
@@ -698,7 +700,7 @@
                                     (update :recycled + recycled))
                         error-msg (subs (or output "") 0 (min 200 (count (or output ""))))]
                     (println (format "[%s] Agent error (exit %d): %s" id exit error-msg))
-                    (emit-cycle-log! swarm-id id iter iter-start-ms
+                    (emit-cycle-log! swarm-id id iter iter-start-ms new-session-id
                       {:outcome :error :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))
                        :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))
                        :error-snippet error-msg})
@@ -717,7 +719,7 @@
                         new-claimed-ids (into claimed-ids claimed)
                         metrics (update metrics :claims + (count claimed))]
                     (println (format "[%s] Claimed %d/%d tasks" id (count claimed) (count claim-ids)))
-                    (emit-cycle-log! swarm-id id iter iter-start-ms
+                    (emit-cycle-log! swarm-id id iter iter-start-ms new-session-id
                       {:outcome :claimed :claimed-task-ids (vec claimed)})
                     (recur (inc iter) completed 0 metrics new-session-id wt-state
                            new-claimed-ids resume-prompt))
@@ -733,7 +735,7 @@
                               merged? (merge-to-main! (:path wt-state) (:branch wt-state) id project-root 0 all-claimed)
                               metrics (if merged? (update metrics :merges inc) metrics)]
                           (println (format "[%s] Cycle %d/%d complete" id iter iterations))
-                          (emit-cycle-log! swarm-id id iter iter-start-ms
+                          (emit-cycle-log! swarm-id id iter iter-start-ms new-session-id
                             {:outcome :merged :claimed-task-ids (vec all-claimed) :review-rounds 0})
                           (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                           (if (and done? (:can-plan worker))
@@ -756,7 +758,7 @@
                           (let [all-claimed (into claimed-ids mv-claimed-tasks)]
                             (merge-to-main! (:path wt-state) (:branch wt-state) id project-root (or attempts 0) all-claimed)
                             (println (format "[%s] Cycle %d/%d complete" id iter iterations))
-                            (emit-cycle-log! swarm-id id iter iter-start-ms
+                            (emit-cycle-log! swarm-id id iter iter-start-ms new-session-id
                               {:outcome :merged :claimed-task-ids (vec all-claimed)
                                :review-rounds (or attempts 0)})
                             (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
@@ -775,7 +777,7 @@
                           (let [recycled (recycle-orphaned-tasks! id pre-current-ids)
                                 metrics (update metrics :recycled + recycled)]
                             (println (format "[%s] Cycle %d/%d rejected" id iter iterations))
-                            (emit-cycle-log! swarm-id id iter iter-start-ms
+                            (emit-cycle-log! swarm-id id iter iter-start-ms new-session-id
                               {:outcome :rejected :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))
                                :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))
                                :review-rounds (or attempts 0)})
@@ -784,7 +786,7 @@
                     (let [recycled (recycle-orphaned-tasks! id pre-current-ids)
                           metrics (update metrics :recycled + recycled)]
                       (println (format "[%s] Merge signaled but no changes, skipping" id))
-                      (emit-cycle-log! swarm-id id iter iter-start-ms
+                      (emit-cycle-log! swarm-id id iter iter-start-ms new-session-id
                         {:outcome :no-changes :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))
                          :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))})
                       (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
@@ -794,7 +796,7 @@
                   (and done? (:can-plan worker))
                   (do
                     (println (format "[%s] Received __DONE__ signal" id))
-                    (emit-cycle-log! swarm-id id iter iter-start-ms
+                    (emit-cycle-log! swarm-id id iter iter-start-ms new-session-id
                       {:outcome :done :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))})
                     (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                     (println (format "[%s] Worker done after %d/%d iterations" id iter iterations))
@@ -807,7 +809,7 @@
                   (let [recycled (recycle-orphaned-tasks! id pre-current-ids)
                         metrics (update metrics :recycled + recycled)]
                     (println (format "[%s] Ignoring __DONE__ (executor), resetting session" id))
-                    (emit-cycle-log! swarm-id id iter iter-start-ms
+                    (emit-cycle-log! swarm-id id iter iter-start-ms new-session-id
                       {:outcome :executor-done :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))
                        :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))})
                     (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
@@ -817,7 +819,7 @@
                   :else
                   (do
                     (println (format "[%s] Working... (will resume)" id))
-                    (emit-cycle-log! swarm-id id iter iter-start-ms
+                    (emit-cycle-log! swarm-id id iter iter-start-ms new-session-id
                       {:outcome :working :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))})
                     (recur (inc iter) completed 0 metrics new-session-id wt-state
                            claimed-ids nil))))))))))))

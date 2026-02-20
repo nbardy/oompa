@@ -121,11 +121,12 @@
 
 (defn write-cycle-log!
   "Write a cycle event log for a worker.
-   Contains: outcome, timing, claimed task IDs, recycled tasks.
+   Contains: outcome, timing, claimed task IDs, recycled tasks, session-id.
+   session-id links to the Claude CLI conversation on disk for debugging.
    Written at cycle end so dashboards can track progress in real-time."
   [swarm-id worker-id cycle
    {:keys [outcome duration-ms claimed-task-ids recycled-tasks
-           error-snippet review-rounds]}]
+           error-snippet review-rounds session-id]}]
   (when swarm-id
     (let [filename (format "%s-c%d.json" worker-id cycle)]
       (write-json! (str (cycles-dir swarm-id) "/" filename)
@@ -137,7 +138,8 @@
                     :claimed-task-ids (or claimed-task-ids [])
                     :recycled-tasks (or recycled-tasks [])
                     :error-snippet error-snippet
-                    :review-rounds (or review-rounds 0)}))))
+                    :review-rounds (or review-rounds 0)
+                    :session-id session-id}))))
 
 ;; =============================================================================
 ;; Read helpers (for cmd-status, dashboards)
