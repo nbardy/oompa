@@ -42,3 +42,5 @@ Next work:
     - Ensure new names/types align with existing style.
   </checklist>
 </rules>
+
+#oompa_directive:include_file "config/prompts/_agent_scope_rules.md"

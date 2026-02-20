@@ -131,7 +131,102 @@
      :stdout (truncate (:out result) 10000)
      :stderr (truncate (:err result) 5000)
      :duration-ms (- (now-ms) start)
-     :timed-out? (boolean (:timed-out result))}))
+              :timed-out? (boolean (:timed-out result))}))
+
+;; =============================================================================
+;; Prompt Loading Helpers
+;; =============================================================================
+
+(defn- file-canonical-path
+  "Resolve a path for cache keys and cycle detection."
+  [path]
+  (try
+    (.getCanonicalPath (io/file path))
+    (catch Exception _
+      path)))
+
+(def ^:private prompt-file-cache
+  "Cache for prompt include expansion."
+  (atom {}))
+
+(def ^:private include-directive-pattern
+  #"(?m)^\s*#oompa_directive:include_file\s+\"([^\"]+)\"\s*$")
+
+(defn- read-file-cached
+  "Read a prompt file once and cache by canonical path."
+  [path]
+  (when path
+    (if-let [cached (get @prompt-file-cache path)]
+      cached
+      (let [f (io/file path)]
+        (when (.exists f)
+          (let [content (slurp f)]
+            (swap! prompt-file-cache assoc path content)
+            content))))))
+
+(defn- resolve-include-path
+  "Resolve an include path relative to the file that declares it."
+  [source-path include-path]
+  (let [source-file (io/file source-path)
+        base-dir (.getParentFile source-file)]
+    (if (or (str/starts-with? include-path "/")
+            (and (> (count include-path) 1)
+                 (= (nth include-path 1) \:)) ; Windows drive letter
+            (str/starts-with? include-path "~"))
+      include-path
+      (if base-dir
+        (str (io/file base-dir include-path))
+        include-path))))
+
+(defn- expand-includes
+  "Expand #oompa_directive:include_file directives recursively.
+
+   Directive syntax:
+   #oompa_directive:include_file \"relative/or/absolute/path.md\"
+
+   Includes are resolved relative to the prompt file containing the directive.
+   Cycles are guarded by a simple visited-set."
+  ([raw source-path]
+   (expand-includes raw source-path #{}))
+  ([raw source-path visited]
+   (let [source-canonical (file-canonical-path source-path)
+         lines (str/split-lines (or raw ""))
+         visited' (conj visited source-canonical)]
+     (str/join
+      "\n"
+      (mapcat
+       (fn [line]
+         (if-let [match (re-matches include-directive-pattern line)]
+           (let [include-target (second match)
+                 include-path (resolve-include-path source-canonical include-target)
+                 include-canonical (file-canonical-path include-path)
+                 included (and (not (str/blank? include-path))
+                               (read-file-cached include-canonical))]
+             (cond
+               (str/blank? include-target)
+               ["[oompa] Empty include target in prompt directive"]
+
+               (contains? visited' include-canonical)
+               [(format "[oompa] Skipping already-included file: \"%s\"" include-target)]
+
+               (not included)
+               [(format "[oompa] Could not include \"%s\"" include-target)]
+
+               :else
+               (cons (format "We have included the content of file: \"%s\" below"
+                             include-target)
+                     (str/split-lines
+                      (expand-includes included include-canonical visited')))))
+           [line]))
+       lines)))))
+
+(defn- load-prompt-file
+  "Load a prompt file and expand include directives."
+  [path]
+  (when path
+    (when-let [f (io/file path)]
+      (when (.exists f)
+        (expand-includes (slurp f) (file-canonical-path path))))))
 
 ;; =============================================================================
 ;; Output Parsing
@@ -245,7 +340,7 @@
   (let [filename (str "config/prompts/" (name role) ".md")
         f (io/file filename)]
     (when (.exists f)
-      (slurp f))))
+      (load-prompt-file filename))))
 
 (defn load-custom-prompt
   "Load a custom prompt file. Returns content or nil."
@@ -253,7 +348,7 @@
   (when path
     (let [f (io/file path)]
       (when (.exists f)
-        (slurp f)))))
+        (load-prompt-file path)))))
 
 (defn tokenize
   "Replace {tokens} in template with values from context map.

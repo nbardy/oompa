@@ -43,3 +43,5 @@ Next work:
     - Update docs/tests only if the change requires it.
   </checklist>
 </rules>
+
+#oompa_directive:include_file "config/prompts/_agent_scope_rules.md"

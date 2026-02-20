@@ -39,6 +39,8 @@
 ;; and exit gracefully — finishing the current cycle before stopping.
 (def ^:private shutdown-requested? (atom false))
 
+(declare task-root-for-cwd)
+
 (defn- load-prompt
   "Load a prompt file. Tries path as-is first, then from package root."
   [path]
@@ -51,15 +53,20 @@
    with worker-level context (task_status, pending_tasks) and defaults
    for tokens that core/build-context doesn't produce (mode_hint, targets,
    recent_sec). Without these defaults, those {vars} leak into prompts."
-  [worker-context]
-  (let [pending (tasks/list-pending)
-        core-ctx (core/build-context {:tasks pending
-                                      :repo (System/getProperty "user.dir")})]
-    (merge {:mode_hint "propose"
-            :targets "*"
-            :recent_sec "180"}
-           core-ctx
-           worker-context)))
+  ([worker-context]
+   (build-template-tokens worker-context nil))
+  ([worker-context cwd]
+   (let [pending (tasks/list-pending)
+         core-ctx (core/build-context {:tasks pending
+                                       :repo (System/getProperty "user.dir")})
+         task-root (task-root-for-cwd (or cwd (System/getProperty "user.dir")))]
+     (merge {:mode_hint "propose"
+             :targets "*"
+             :recent_sec "180"
+             :TASK_ROOT task-root
+             :TASKS_ROOT task-root}
+            core-ctx
+            worker-context))))
 
 (defn- task-root-for-cwd
   "Return the relative tasks root for commands issued from cwd."
@@ -75,7 +82,12 @@
 (defn- render-task-header
   "Inject runtime task path into auto-injected task header."
   [raw-header cwd]
-  (str/replace (or raw-header "") "{{TASKS_ROOT}}" (task-root-for-cwd cwd)))
+  (let [task-root (task-root-for-cwd cwd)]
+    (-> (or raw-header "")
+        (str/replace "{{TASK_ROOT}}" task-root)
+        (str/replace "{{TASKS_ROOT}}" task-root)
+        (str/replace "{TASK_ROOT}" task-root)
+        (str/replace "{TASKS_ROOT}" task-root))))
 
 (defn create-worker
   "Create a worker config.
@@ -166,6 +178,11 @@
   [{:keys [id swarm-id harness model prompts reasoning]} worktree-path context session-id resume?
    & {:keys [resume-prompt-override]}]
   (let [session-id (or session-id (harness/make-session-id harness))
+        template-tokens (build-template-tokens context worktree-path)
+        resume-prompt-override (when resume-prompt-override
+                                 (-> resume-prompt-override
+                                     (render-task-header worktree-path)
+                                     (agent/tokenize template-tokens)))
 
         ;; Build prompt — 3-way: override → standard resume → fresh start
         prompt (cond
@@ -187,7 +204,6 @@
                  (let [task-header (render-task-header
                                      (load-prompt "config/prompts/_task_header.md")
                                      worktree-path)
-                       template-tokens (build-template-tokens context)
                        user-prompts (if (seq prompts)
                                       (->> prompts
                                            (map load-prompt)
@@ -619,24 +635,27 @@
 ;; Worker Loop
 ;; =============================================================================
 
-(def ^:private max-wait-for-tasks 60)
-(def ^:private wait-poll-interval 5)
+;; Workers wait up to 10 minutes for tasks to appear before giving up.
+;; This keeps workers alive while planners/designers ramp up the queue.
+(def ^:private max-wait-for-tasks 600)
+(def ^:private wait-poll-interval 10)
 (def ^:private max-consecutive-errors 3)
 
 (defn- wait-for-tasks!
-  "Wait up to 60s for pending/current tasks to appear. Used for backpressure
-   on workers that can't create their own tasks (can_plan: false)."
+  "Wait up to 10 minutes for pending/current tasks to appear. Used for
+   backpressure on workers that can't create their own tasks (can_plan: false).
+   Polls every 10 seconds, logs every 60 seconds."
   [worker-id]
   (loop [waited 0]
     (cond
       (pos? (tasks/pending-count)) true
       (pos? (tasks/current-count)) true
       (>= waited max-wait-for-tasks)
-      (do (println (format "[%s] No tasks after %ds, proceeding anyway" worker-id waited))
+      (do (println (format "[%s] No tasks after %ds, giving up" worker-id waited))
           false)
       :else
-      (do (when (zero? (mod waited 15))
-            (println (format "[%s] Waiting for tasks... (%ds)" worker-id waited)))
+      (do (when (zero? (mod waited 60))
+            (println (format "[%s] Waiting for tasks... (%ds/%ds)" worker-id waited max-wait-for-tasks)))
           (Thread/sleep (* wait-poll-interval 1000))
           (recur (+ waited wait-poll-interval))))))
 
@@ -718,6 +737,13 @@
           (do
           ;; Sleep between iterations when wait_between is configured
           (maybe-sleep-between! id wait-between iter)
+
+          ;; Backpressure: non-planner workers wait for tasks between iterations too
+          (when (and (not (:can-plan worker))
+                     (not (pos? (tasks/pending-count)))
+                     (not (pos? (tasks/current-count))))
+            (println (format "[%s] Queue empty, waiting for tasks before iteration %d" id iter))
+            (wait-for-tasks! id))
 
           ;; Ensure worktree exists (create fresh if nil, reuse if persisted)
           (let [wt-state (try

@@ -47,3 +47,5 @@ REJECTED
 - List actionable items for NEEDS_CHANGES
 - Err on the side of APPROVED for minor style issues
 - REJECTED is for wrong direction, not small bugs
+
+#oompa_directive:include_file "config/prompts/_agent_scope_rules.md"

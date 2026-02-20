@@ -121,6 +121,23 @@ This spawns:
 
 Every worker automatically gets task management instructions injected above your prompts. Your prompts just say *what* the worker should do — the framework handles *how* tasks work.
 
+#### Prompt includes
+
+Prompts support `#oompa_directive:include_file "path/to/file.md"` lines.
+
+Use it to share common instructions across roles without copying content.  
+Paths are resolved relative to the prompt file containing the directive.
+
+Example:
+
+```md
+#oompa_directive:include_file "config/prompts/_agent_scope_rules.md"
+
+You are an executor. Focus on minimal changes and complete tasks.
+```
+
+The included file is inlined during prompt load, with a short header noting the injected source.
+
 ### Task System
 
 Workers self-organize via the filesystem. Tasks live at the project root and are shared across all worktrees:

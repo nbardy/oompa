@@ -255,6 +255,11 @@ Records one complete work unit by one worker. This is the core event that all me
 - `no-changes` — agent produced no diff
 - `done` — agent signaled `__DONE__` (no more useful work)
 - `working` — cycle ended mid-work (framework interrupted)
+- `executor-done` — executor received `__DONE__` and reset, ready for next cycle
+- `claimed` — worker claimed tasks and is now holding them for work
+- `sync-failed` — worker couldn't sync worktree before merge
+- `merge-failed` — merge to main failed during cycle
+- `interrupted` — worker interrupted by shutdown/signal while running
 
 ### Review Event
 
