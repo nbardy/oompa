@@ -14,6 +14,7 @@
    No separate orchestrator - workers self-organize."
   (:require [agentnet.tasks :as tasks]
             [agentnet.agent :as agent]
+            [agentnet.core :as core]
             [agentnet.harness :as harness]
             [agentnet.worktree :as worktree]
             [agentnet.runs :as runs]
@@ -34,11 +35,31 @@
 ;; git index corruption from parallel checkout+merge operations.
 (def ^:private merge-lock (Object.))
 
+;; Set by JVM shutdown hook (SIGTERM/SIGINT). Workers check this between cycles
+;; and exit gracefully — finishing the current cycle before stopping.
+(def ^:private shutdown-requested? (atom false))
+
 (defn- load-prompt
   "Load a prompt file. Tries path as-is first, then from package root."
   [path]
   (or (agent/load-custom-prompt path)
       (agent/load-custom-prompt (str package-root "/" path))))
+
+(defn- build-template-tokens
+  "Build token map for prompt template {var} substitution.
+   Merges core/build-context (rich YAML header, queue, hotspots, etc.)
+   with worker-level context (task_status, pending_tasks) and defaults
+   for tokens that core/build-context doesn't produce (mode_hint, targets,
+   recent_sec). Without these defaults, those {vars} leak into prompts."
+  [worker-context]
+  (let [pending (tasks/list-pending)
+        core-ctx (core/build-context {:tasks pending
+                                      :repo (System/getProperty "user.dir")})]
+    (merge {:mode_hint "propose"
+            :targets "*"
+            :recent_sec "180"}
+           core-ctx
+           worker-context)))
 
 (defn- task-root-for-cwd
   "Return the relative tasks root for commands issued from cwd."
@@ -158,17 +179,23 @@
                       "Pending: " (:pending_tasks context) "\n\n"
                       "Continue working. Signal COMPLETE_AND_READY_FOR_MERGE when your current task is done and ready for review.")
 
-                 ;; Fresh start — full task header + user prompts
+                 ;; Fresh start — full task header + tokenized user prompts
+                 ;; Template tokens ({context_header}, {queue_md}, etc.) are
+                 ;; replaced here. Without this, raw {var} placeholders leak
+                 ;; into the agent prompt verbatim.
                  :else
                  (let [task-header (render-task-header
                                      (load-prompt "config/prompts/_task_header.md")
                                      worktree-path)
+                       template-tokens (build-template-tokens context)
                        user-prompts (if (seq prompts)
                                       (->> prompts
                                            (map load-prompt)
                                            (remove nil?)
+                                           (map #(agent/tokenize % template-tokens))
                                            (str/join "\n\n"))
-                                      (or (load-prompt "config/prompts/worker.md")
+                                      (or (some-> (load-prompt "config/prompts/worker.md")
+                                                  (agent/tokenize template-tokens))
                                           "You are a worker. Claim tasks, execute them, complete them."))]
                    (str task-header "\n"
                         "Task Status: " (:task_status context) "\n"
@@ -600,7 +627,8 @@
                                    :recycled (:recycled metrics)
                                    :review-rounds-total (:review-rounds-total metrics)
                                    :claims (:claims metrics)))]
-        (if (> iter iterations)
+        (cond
+          (> iter iterations)
           (do
             ;; Cleanup any lingering worktree
             (when wt-state
@@ -609,6 +637,21 @@
                              id completed (:merges metrics) (:claims metrics) (:rejections metrics) (:errors metrics) (:recycled metrics)))
             (finish :exhausted))
 
+          @shutdown-requested?
+          (do
+            (println (format "[%s] Shutdown requested, stopping after %d iterations" id (dec iter)))
+            (when wt-state
+              ;; Recycle any claimed tasks back to pending so other workers can pick them up
+              (when (seq claimed-ids)
+                (let [recycled (tasks/recycle-tasks! claimed-ids)]
+                  (when (seq recycled)
+                    (println (format "[%s] Recycled %d claimed task(s) on shutdown" id (count recycled))))))
+              (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state)))
+            (emit-cycle-log! swarm-id id iter (System/currentTimeMillis)
+              {:outcome :interrupted})
+            (finish :interrupted))
+
+          :else
           (do
           ;; Sleep between iterations when wait_between is configured
           (maybe-sleep-between! id wait-between iter)
@@ -796,34 +839,53 @@
   (let [swarm-id (-> workers first :swarm-id)]
     (println (format "Launching %d workers..." (count workers)))
 
-    (let [futures (doall
-                    (map-indexed
-                      (fn [idx worker]
-                        (let [worker (assoc worker :id (or (:id worker) (str "w" idx)))]
-                          (future (run-worker! worker))))
-                      workers))]
+    ;; Register JVM shutdown hook so SIGTERM/SIGINT triggers graceful stop.
+    ;; Sets the shutdown atom — workers check it between cycles and exit cleanly.
+    ;; The hook waits for workers to finish, then writes stopped.json only if
+    ;; the clean exit path hasn't already done so (guarded by the atom).
+    (let [hook (Thread. (fn []
+                          (println "\nShutdown signal received, stopping workers after current cycle...")
+                          (reset! shutdown-requested? true)
+                          ;; Give workers time to finish current cycle and cleanup.
+                          ;; After sleep, write stopped.json only if still in shutdown
+                          ;; (clean exit resets the atom to false before writing :completed).
+                          (Thread/sleep 10000)
+                          (when (and swarm-id @shutdown-requested?)
+                            (runs/write-stopped! swarm-id :interrupted))))]
+      (.addShutdownHook (Runtime/getRuntime) hook)
 
-      (println "All workers launched. Waiting for completion...")
-      (let [results (mapv deref futures)]
-        (println "\nAll workers complete.")
-        (doseq [w results]
-          (println (format "  [%s] %s - %d completed, %d merges, %d claims, %d rejections, %d errors, %d recycled, %d review rounds"
-                           (:id w)
-                           (name (:status w))
-                           (:completed w)
-                           (or (:merges w) 0)
-                           (or (:claims w) 0)
-                           (or (:rejections w) 0)
-                           (or (:errors w) 0)
-                           (or (:recycled w) 0)
-                           (or (:review-rounds-total w) 0))))
+      (let [futures (doall
+                      (map-indexed
+                        (fn [idx worker]
+                          (let [worker (assoc worker :id (or (:id worker) (str "w" idx)))]
+                            (future (run-worker! worker))))
+                        workers))]
 
-        ;; Write stopped event — all state derivable from cycle logs
-        (when swarm-id
-          (runs/write-stopped! swarm-id :completed)
-          (println (format "\nStopped event written to runs/%s/stopped.json" swarm-id)))
+        (println "All workers launched. Waiting for completion...")
+        (let [results (mapv deref futures)]
+          ;; Clean exit — tell shutdown hook not to write stopped.json
+          (reset! shutdown-requested? false)
+          ;; Remove the hook so it doesn't accumulate across calls
+          (try (.removeShutdownHook (Runtime/getRuntime) hook) (catch Exception _))
+          (println "\nAll workers complete.")
+          (doseq [w results]
+            (println (format "  [%s] %s - %d completed, %d merges, %d claims, %d rejections, %d errors, %d recycled, %d review rounds"
+                             (:id w)
+                             (name (:status w))
+                             (:completed w)
+                             (or (:merges w) 0)
+                             (or (:claims w) 0)
+                             (or (:rejections w) 0)
+                             (or (:errors w) 0)
+                             (or (:recycled w) 0)
+                             (or (:review-rounds-total w) 0))))
 
-        results))))
+          ;; Write stopped event — all state derivable from cycle logs
+          (when swarm-id
+            (runs/write-stopped! swarm-id :completed)
+            (println (format "\nStopped event written to runs/%s/stopped.json" swarm-id)))
+
+          results)))))
 
 ;; =============================================================================
 ;; Planner — first-class config concept, NOT a worker
@@ -848,10 +910,12 @@
         {:tasks-created 0})
       ;; Run agent
       (let [context (build-context)
+            template-tokens (build-template-tokens context)
             prompt-text (str (when (seq prompts)
                                (->> prompts
                                     (map load-prompt)
                                     (remove nil?)
+                                    (map #(agent/tokenize % template-tokens))
                                     (str/join "\n\n")))
                              "\n\nTask Status: " (:task_status context) "\n"
                              "Pending: " (:pending_tasks context) "\n\n"

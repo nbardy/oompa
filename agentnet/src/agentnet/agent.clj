@@ -255,8 +255,9 @@
       (when (.exists f)
         (slurp f)))))
 
-(defn- tokenize
-  "Replace {tokens} in template with values from context map"
+(defn tokenize
+  "Replace {tokens} in template with values from context map.
+   Keys can be keywords or strings; values are stringified."
   [template tokens]
   (reduce (fn [acc [k v]]
             (str/replace acc
