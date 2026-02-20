@@ -339,6 +339,57 @@
     {:output (:out result)
      :exit (:exit result)}))
 
+(defn- sync-worktree-to-main!
+  "Merge latest main into worktree branch before merge-to-main!.
+   If conflicts arise, launches a one-shot agent to resolve them.
+   Runs OUTSIDE the merge-lock so the agent doesn't block other workers.
+   Returns :synced | :resolved | :failed."
+  [worker wt-path worker-id]
+  (let [merge-result (process/sh ["git" "merge" "main" "--no-edit"]
+                                 {:dir wt-path :out :string :err :string})]
+    (if (zero? (:exit merge-result))
+      (do (println (format "[%s] Worktree synced to main" worker-id))
+          :synced)
+      ;; Conflict — launch agent to resolve in the worktree
+      (let [_ (println (format "[%s] Sync conflict, launching resolver" worker-id))
+            conflict-files (:out (process/sh ["git" "diff" "--name-only" "--diff-filter=U"]
+                                             {:dir wt-path :out :string :err :string}))
+            resolve-prompt (str "[oompa:" (or (:swarm-id worker) "unknown") ":" worker-id "] "
+                                "Merge conflicts when syncing to main.\n"
+                                "Conflicted files:\n" conflict-files "\n\n"
+                                "Resolve ALL conflicts. Keep intent of both sides. "
+                                "Stage resolved files with git add.")
+            abs-wt (.getAbsolutePath (io/file wt-path))
+            cmd (harness/build-cmd (:harness worker)
+                  {:cwd abs-wt :model (:model worker) :prompt resolve-prompt})
+            result (try
+                     (process/sh cmd {:dir abs-wt
+                                      :in (harness/process-stdin (:harness worker) resolve-prompt)
+                                      :out :string :err :string})
+                     (catch Exception e
+                       {:exit -1 :out "" :err (.getMessage e)}))]
+        (if (zero? (:exit result))
+          ;; Agent ran — check if conflicts are actually resolved
+          (let [_ (process/sh ["git" "add" "-A"] {:dir wt-path})
+                remaining (:out (process/sh ["git" "diff" "--name-only" "--diff-filter=U"]
+                                            {:dir wt-path :out :string :err :string}))
+                clean? (str/blank? remaining)]
+            (if clean?
+              (let [commit (process/sh ["git" "commit" "--no-edit"]
+                                       {:dir wt-path :out :string :err :string})]
+                (if (zero? (:exit commit))
+                  (do (println (format "[%s] Conflicts resolved by agent" worker-id))
+                      :resolved)
+                  (do (println (format "[%s] Commit after resolution failed" worker-id))
+                      (process/sh ["git" "merge" "--abort"] {:dir wt-path})
+                      :failed)))
+              (do (println (format "[%s] Agent left unresolved conflicts" worker-id))
+                  (process/sh ["git" "merge" "--abort"] {:dir wt-path})
+                  :failed)))
+          (do (println (format "[%s] Resolver agent failed (exit %d)" worker-id (:exit result)))
+              (process/sh ["git" "merge" "--abort"] {:dir wt-path})
+              :failed))))))
+
 (defn- worktree-has-changes?
   "Check if worktree has committed OR uncommitted changes vs main.
    Workers commit before signaling merge, so we must check both:
@@ -481,8 +532,18 @@
                                  worker-id (count completed) (str/join ", " completed))))))
           ;; Annotate completed tasks with metadata while still holding merge-lock
           (annotate-completed-tasks! project-root worker-id review-rounds))
-        (when merge-result
-          (println (format "[%s] MERGE FAILED: %s" worker-id (:err merge-result)))))
+        ;; FAILED: Clean up git state before releasing merge-lock.
+        ;; Without this, a conflict leaves .git/MERGE_HEAD and poisons the
+        ;; shared index — every subsequent worker fails on `git checkout main`.
+        (do
+          (println (format "[%s] MERGE FAILED: %s" worker-id
+                           (or (:err merge-result) (:err checkout-result))))
+          (let [abort-result (process/sh ["git" "merge" "--abort"]
+                                         {:dir project-root :out :string :err :string})]
+            (when-not (zero? (:exit abort-result))
+              ;; Abort failed (no merge in progress, or other issue) — hard reset.
+              (process/sh ["git" "reset" "--hard" "HEAD"]
+                          {:dir project-root :out :string :err :string})))))
       success)))
 
 (defn- task-only-diff?
@@ -728,52 +789,76 @@
                   merge?
                   (if (worktree-has-changes? (:path wt-state))
                     (if (task-only-diff? (:path wt-state))
-                      ;; Task-only changes — skip review, auto-merge
+                      ;; Task-only changes — skip review, sync to main, auto-merge
                       (do
                         (println (format "[%s] Task-only diff, auto-merging" id))
-                        (let [all-claimed (into claimed-ids mv-claimed-tasks)
-                              merged? (merge-to-main! (:path wt-state) (:branch wt-state) id project-root 0 all-claimed)
-                              metrics (if merged? (update metrics :merges inc) metrics)]
-                          (println (format "[%s] Cycle %d/%d complete" id iter iterations))
-                          (emit-cycle-log! swarm-id id iter iter-start-ms new-session-id
-                            {:outcome :merged :claimed-task-ids (vec all-claimed) :review-rounds 0})
-                          (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                          (if (and done? (:can-plan worker))
+                        (let [sync-status (sync-worktree-to-main! worker (:path wt-state) id)
+                              all-claimed (into claimed-ids mv-claimed-tasks)]
+                          (if (= :failed sync-status)
+                            ;; Sync failed — cannot merge safely, skip
                             (do
-                              (println (format "[%s] Worker done after merge" id))
-                              (assoc worker :completed (inc completed) :status :done
-                                            :merges (:merges metrics)
-                                            :rejections (:rejections metrics)
-                                            :errors (:errors metrics)
-                                            :recycled (:recycled metrics)
-                                            :review-rounds-total (:review-rounds-total metrics)
-                                            :claims (:claims metrics)))
-                            (recur (inc iter) (inc completed) 0 metrics nil nil #{} nil))))
+                              (println (format "[%s] Sync to main failed, skipping merge" id))
+                              (emit-cycle-log! swarm-id id iter iter-start-ms new-session-id
+                                {:outcome :sync-failed :claimed-task-ids (vec all-claimed)})
+                              (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                              (recur (inc iter) completed 0 metrics nil nil #{} nil))
+                            ;; Synced — proceed with merge
+                            (let [merged? (merge-to-main! (:path wt-state) (:branch wt-state) id project-root 0 all-claimed)
+                                  metrics (if merged? (update metrics :merges inc) metrics)]
+                              (println (format "[%s] Cycle %d/%d complete" id iter iterations))
+                              (emit-cycle-log! swarm-id id iter iter-start-ms new-session-id
+                                {:outcome :merged :claimed-task-ids (vec all-claimed) :review-rounds 0})
+                              (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                              (if (and done? (:can-plan worker))
+                                (do
+                                  (println (format "[%s] Worker done after merge" id))
+                                  (assoc worker :completed (inc completed) :status :done
+                                                :merges (:merges metrics)
+                                                :rejections (:rejections metrics)
+                                                :errors (:errors metrics)
+                                                :recycled (:recycled metrics)
+                                                :review-rounds-total (:review-rounds-total metrics)
+                                                :claims (:claims metrics)))
+                                (recur (inc iter) (inc completed) 0 metrics nil nil #{} nil))))))
                       ;; Code changes — full review loop
                       (let [{:keys [approved? attempts]} (review-loop! worker (:path wt-state) id iter)
+                            ;; Don't pre-increment :merges — defer to after actual merge succeeds
                             metrics (-> metrics
                                         (update :review-rounds-total + (or attempts 0))
-                                        (update (if approved? :merges :rejections) inc))]
+                                        (cond-> (not approved?) (update :rejections inc)))]
                         (if approved?
-                          (let [all-claimed (into claimed-ids mv-claimed-tasks)]
-                            (merge-to-main! (:path wt-state) (:branch wt-state) id project-root (or attempts 0) all-claimed)
-                            (println (format "[%s] Cycle %d/%d complete" id iter iterations))
-                            (emit-cycle-log! swarm-id id iter iter-start-ms new-session-id
-                              {:outcome :merged :claimed-task-ids (vec all-claimed)
-                               :review-rounds (or attempts 0)})
-                            (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                            ;; If also __DONE__, stop after merge
-                            (if (and done? (:can-plan worker))
+                          (let [sync-status (sync-worktree-to-main! worker (:path wt-state) id)
+                                all-claimed (into claimed-ids mv-claimed-tasks)]
+                            (if (= :failed sync-status)
+                              ;; Sync failed after approval — treat as sync failure, skip merge
                               (do
-                                (println (format "[%s] Worker done after merge" id))
-                                (assoc worker :completed (inc completed) :status :done
-                                              :merges (:merges metrics)
-                                              :rejections (:rejections metrics)
-                                              :errors (:errors metrics)
-                                              :recycled (:recycled metrics)
-                                              :review-rounds-total (:review-rounds-total metrics)
-                                              :claims (:claims metrics)))
-                              (recur (inc iter) (inc completed) 0 metrics nil nil #{} nil)))
+                                (println (format "[%s] Sync to main failed after approval, skipping merge" id))
+                                (emit-cycle-log! swarm-id id iter iter-start-ms new-session-id
+                                  {:outcome :sync-failed :claimed-task-ids (vec all-claimed)
+                                   :review-rounds (or attempts 0)})
+                                (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                                (recur (inc iter) completed 0 metrics nil nil #{} nil))
+                              ;; Synced — proceed with merge, capture return value
+                              (let [merged? (merge-to-main! (:path wt-state) (:branch wt-state) id project-root (or attempts 0) all-claimed)
+                                    metrics (if merged? (update metrics :merges inc) metrics)]
+                                (println (format "[%s] Cycle %d/%d complete" id iter iterations))
+                                (emit-cycle-log! swarm-id id iter iter-start-ms new-session-id
+                                  {:outcome (if merged? :merged :merge-failed)
+                                   :claimed-task-ids (vec all-claimed)
+                                   :review-rounds (or attempts 0)})
+                                (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                                ;; If also __DONE__, stop after merge
+                                (if (and done? (:can-plan worker))
+                                  (do
+                                    (println (format "[%s] Worker done after merge" id))
+                                    (assoc worker :completed (inc completed) :status :done
+                                                  :merges (:merges metrics)
+                                                  :rejections (:rejections metrics)
+                                                  :errors (:errors metrics)
+                                                  :recycled (:recycled metrics)
+                                                  :review-rounds-total (:review-rounds-total metrics)
+                                                  :claims (:claims metrics)))
+                                  (recur (inc iter) (inc completed) 0 metrics nil nil #{} nil)))))
                           (let [recycled (recycle-orphaned-tasks! id pre-current-ids)
                                 metrics (update metrics :recycled + recycled)]
                             (println (format "[%s] Cycle %d/%d rejected" id iter iterations))
