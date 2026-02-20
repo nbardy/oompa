@@ -382,7 +382,7 @@
                        (if available? "✓ available" "✗ not found"))))))
 
 (def ^:private reasoning-variants
-  #{"minimal" "low" "medium" "high" "max"})
+  #{"minimal" "low" "medium" "high" "max" "xhigh"})
 
 (defn- parse-model-string
   "Parse model string into {:harness :model :reasoning}.
@@ -571,6 +571,69 @@
       (doseq [t (tasks/list-current)]
         (println (format "  - %s: %s" (:id t) (:summary t)))))))
 
+(defn- find-latest-swarm-id
+  "Find the most recent swarm ID from runs/ directory."
+  []
+  (first (runs/list-runs)))
+
+(defn- read-swarm-pid
+  "Read PID from started.json for a swarm. Returns nil if not found."
+  [swarm-id]
+  (when-let [started (runs/read-started swarm-id)]
+    (:pid started)))
+
+(defn- pid-alive?
+  "Check if a process is alive via kill -0."
+  [pid]
+  (try
+    (zero? (:exit (process/sh ["kill" "-0" (str pid)]
+                              {:out :string :err :string})))
+    (catch Exception _ false)))
+
+(defn cmd-stop
+  "Send SIGTERM to running swarm — workers finish current cycle then exit"
+  [opts args]
+  (let [swarm-id (or (first args) (find-latest-swarm-id))]
+    (if-not swarm-id
+      (println "No swarm runs found.")
+      (let [stopped (runs/read-stopped swarm-id)]
+        (if stopped
+          (println (format "Swarm %s already stopped (reason: %s)" swarm-id (:reason stopped)))
+          (let [pid (read-swarm-pid swarm-id)]
+            (if-not pid
+              (println (format "No PID found for swarm %s" swarm-id))
+              (if-not (pid-alive? pid)
+                (do
+                  (println (format "Swarm %s PID %s is not running (stale). Writing stopped event." swarm-id pid))
+                  (runs/write-stopped! swarm-id :interrupted))
+                (do
+                  (println (format "Sending SIGTERM to swarm %s (PID %s)..." swarm-id pid))
+                  (println "Workers will finish their current cycle and exit.")
+                  (process/sh ["kill" (str pid)]))))))))))
+
+(defn cmd-kill
+  "Send SIGKILL to running swarm — immediate termination"
+  [opts args]
+  (let [swarm-id (or (first args) (find-latest-swarm-id))]
+    (if-not swarm-id
+      (println "No swarm runs found.")
+      (let [stopped (runs/read-stopped swarm-id)]
+        (if stopped
+          (println (format "Swarm %s already stopped (reason: %s)" swarm-id (:reason stopped)))
+          (let [pid (read-swarm-pid swarm-id)]
+            (if-not pid
+              (println (format "No PID found for swarm %s" swarm-id))
+              (if-not (pid-alive? pid)
+                (do
+                  (println (format "Swarm %s PID %s is not running (stale). Writing stopped event." swarm-id pid))
+                  (runs/write-stopped! swarm-id :interrupted))
+                (do
+                  (println (format "Sending SIGKILL to swarm %s (PID %s)..." swarm-id pid))
+                  ;; SIGKILL bypasses JVM shutdown hooks, so write stopped.json here
+                  (process/sh ["kill" "-9" (str pid)])
+                  (runs/write-stopped! swarm-id :interrupted)
+                  (println "Swarm killed."))))))))))
+
 (defn cmd-help
   "Print usage information"
   [opts args]
@@ -586,6 +649,8 @@
   (println "  prompt \"...\"     Run ad-hoc prompt")
   (println "  status           Show last run summary")
   (println "  worktrees        List worktree status")
+  (println "  stop [swarm-id]  Stop swarm gracefully (finish current cycle)")
+  (println "  kill [swarm-id]  Kill swarm immediately (SIGKILL)")
   (println "  cleanup          Remove all worktrees")
   (println "  context          Print context block")
   (println "  check            Check agent backends")
@@ -616,6 +681,8 @@
    "tasks" cmd-tasks
    "prompt" cmd-prompt
    "status" cmd-status
+   "stop" cmd-stop
+   "kill" cmd-kill
    "worktrees" cmd-worktrees
    "cleanup" cmd-cleanup
    "context" cmd-context
