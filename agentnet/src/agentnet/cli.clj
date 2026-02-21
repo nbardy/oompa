@@ -154,6 +154,46 @@
       (println "Run 'git stash' or 'git commit' first.")
       (System/exit 1))))
 
+(defn- check-stale-worktrees!
+  "Abort if stale oompa worktrees or branches exist from a prior run.
+   Corrupted .git/worktrees/ entries poison git worktree add for ALL workers,
+   not just the worker whose entry is stale. (See swarm af32b180 — kimi-k2.5
+   w9 went 20/20 doing nothing because w10's corrupt commondir blocked it.)"
+  []
+  ;; Prune orphaned metadata first — cleans entries whose directories are gone
+  (let [prune-result (process/sh ["git" "worktree" "prune"] {:out :string :err :string})]
+    (when-not (zero? (:exit prune-result))
+      (println "WARNING: git worktree prune failed:")
+      (println (:err prune-result))))
+  (let [;; Find .ww* directories (oompa per-iteration worktree naming convention)
+        ls-result (process/sh ["find" "." "-maxdepth" "1" "-type" "d" "-name" ".ww*"]
+                              {:out :string})
+        stale-dirs (when (zero? (:exit ls-result))
+                     (->> (str/split-lines (:out ls-result))
+                          (remove str/blank?)))
+        ;; Find oompa/* branches
+        br-result (process/sh ["git" "branch" "--list" "oompa/*"]
+                              {:out :string})
+        stale-branches (when (zero? (:exit br-result))
+                         (->> (str/split-lines (:out br-result))
+                              (map str/trim)
+                              (remove str/blank?)))]
+    (when (or (seq stale-dirs) (seq stale-branches))
+      (println "ERROR: Stale oompa worktrees detected from a prior run.")
+      (println "       Corrupt worktree metadata will cause worker failures.")
+      (println)
+      (when (seq stale-dirs)
+        (println (format "  Stale directories (%d):" (count stale-dirs)))
+        (doseq [d stale-dirs] (println (str "    " d))))
+      (when (seq stale-branches)
+        (println (format "  Stale branches (%d):" (count stale-branches)))
+        (doseq [b stale-branches] (println (str "    " b))))
+      (println)
+      (println "Clean up with:")
+      (println "  git worktree prune; for d in .ww*/; do git worktree remove --force \"$d\" 2>/dev/null; done; git branch --list 'oompa/*' | xargs git branch -D 2>/dev/null; rm -rf .ww*")
+      (println)
+      (System/exit 1))))
+
 (defn- probe-model
   "Send 'say ok' to a model via its harness CLI. Returns true if model responds.
    Uses harness/build-probe-cmd for the command, /dev/null stdin to prevent hang."
@@ -437,6 +477,8 @@
       (System/exit 1))
     ;; Preflight: abort if git is dirty to prevent merge conflicts
     (check-git-clean!)
+    ;; Preflight: abort if stale worktrees from prior runs would poison git
+    (check-stale-worktrees!)
 
     (let [config (json/parse-string (slurp f) true)
           ;; Parse reviewer config — supports both formats:
@@ -492,6 +534,7 @@
                            :prompts (:prompt wc)
                            :can-plan (:can_plan wc)
                            :wait-between (:wait_between wc)
+                           :max-working-resumes (:max_working_resumes wc)
                            :review-harness (:harness review-parsed)
                            :review-model (:model review-parsed)
                            :review-prompts (:prompts review-parsed)})))
