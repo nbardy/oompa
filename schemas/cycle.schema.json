@@ -10,7 +10,7 @@
     "cycle": { "type": "integer", "minimum": 1 },
     "outcome": {
       "type": "string",
-      "enum": ["merged", "rejected", "error", "done", "executor-done", "no-changes", "working", "claimed", "sync-failed", "merge-failed", "interrupted"]
+      "enum": ["merged", "rejected", "error", "done", "executor-done", "no-changes", "working", "claimed", "sync-failed", "merge-failed", "interrupted", "stuck"]
     },
     "timestamp": { "type": "string", "format": "date-time" },
     "duration-ms": { "type": "integer", "minimum": 0 },

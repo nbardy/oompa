@@ -89,15 +89,19 @@
         (str/replace "{TASK_ROOT}" task-root)
         (str/replace "{TASKS_ROOT}" task-root))))
 
+(def ^:private default-max-working-resumes 5)
+
 (defn create-worker
   "Create a worker config.
    :prompts is a string or vector of strings — paths to prompt files.
    :can-plan when false, worker waits for tasks before starting (backpressure).
    :reasoning reasoning effort level (e.g. \"low\", \"medium\", \"high\") — codex only.
    :review-prompts paths to reviewer prompt files (loaded and concatenated for review).
-   :wait-between seconds to sleep between iterations (nil or 0 = no wait)."
+   :wait-between seconds to sleep between iterations (nil or 0 = no wait).
+   :max-working-resumes max consecutive working resumes before nudge+kill (default 5)."
   [{:keys [id swarm-id harness model iterations prompts can-plan reasoning
-           review-harness review-model review-prompts wait-between]}]
+           review-harness review-model review-prompts wait-between
+           max-working-resumes]}]
   {:id id
    :swarm-id swarm-id
    :harness (or harness :codex)
@@ -116,6 +120,7 @@
                      (vector? review-prompts) review-prompts
                      (string? review-prompts) [review-prompts]
                      :else [])
+   :max-working-resumes (or max-working-resumes default-max-working-resumes)
    :completed 0
    :status :idle})
 
@@ -124,6 +129,18 @@
 ;; =============================================================================
 
 (def ^:private max-review-retries 3)
+
+;; Nudge prompt injected when a worker hits max-working-resumes consecutive
+;; "working" outcomes without signaling. Gives the agent one final chance to
+;; produce something mergeable before the session is killed.
+(def ^:private nudge-prompt
+  (str "You have been working for a long time without signaling completion.\n"
+       "You MUST take one of these actions NOW:\n\n"
+       "1. If you have meaningful changes: commit them and signal COMPLETE_AND_READY_FOR_MERGE\n"
+       "2. If scope is too large: create follow-up tasks in tasks/pending/ for remaining work,\n"
+       "   commit what you have (even partial notes/design docs), and signal COMPLETE_AND_READY_FOR_MERGE\n"
+       "3. If you are stuck and cannot make progress: signal __DONE__\n\n"
+       "Do NOT continue working without producing a signal."))
 
 (defn- build-context
   "Build context for agent prompts"
@@ -283,8 +300,12 @@
                          (when history-block history-block)
                          "\nYour verdict MUST be on its own line, exactly one of:\n"
                          "VERDICT: APPROVED\n"
-                         "VERDICT: NEEDS_CHANGES\n"
-                         "VERDICT: REJECTED\n")
+                         "VERDICT: NEEDS_CHANGES\n\n"
+                         "Do NOT use REJECTED. Always use NEEDS_CHANGES with specific, "
+                         "actionable feedback explaining what must change and why. "
+                         "The worker will attempt fixes based on your feedback.\n"
+                         "After your verdict line, list every issue as a numbered item with "
+                         "the file path and what needs to change.\n")
         review-prompt (str "[oompa:" swarm-id* ":" id "] " review-body)
 
         abs-wt (.getAbsolutePath (io/file worktree-path))
@@ -302,13 +323,15 @@
 
         output (:out result)
 
-        ;; Parse verdict — require explicit VERDICT: prefix to avoid false matches
+        ;; Parse verdict — require explicit VERDICT: prefix to avoid false matches.
+        ;; REJECTED is treated as NEEDS_CHANGES: the reviewer must always give
+        ;; actionable feedback so the worker can attempt fixes. Hard rejection
+        ;; only happens when max review rounds are exhausted.
         verdict (cond
                   (re-find #"VERDICT:\s*APPROVED" output) :approved
-                  (re-find #"VERDICT:\s*REJECTED" output) :rejected
                   (re-find #"VERDICT:\s*NEEDS_CHANGES" output) :needs-changes
+                  (re-find #"VERDICT:\s*REJECTED" output) :needs-changes
                   (re-find #"(?i)\bAPPROVED\b" output) :approved
-                  (re-find #"(?i)\bREJECTED\b" output) :rejected
                   :else :needs-changes)]
 
     (println (format "[%s] Reviewer verdict: %s" id (name verdict)))
@@ -355,9 +378,38 @@
     {:output (:out result)
      :exit (:exit result)}))
 
+(defn- collect-divergence-context
+  "Collect context about how a worktree branch has diverged from main.
+   Returns a map with :branch-log, :main-log, :diff-stat strings."
+  [wt-path]
+  (let [git-out (fn [& args] (:out (process/sh (vec args) {:dir wt-path :out :string :err :string})))
+        branch-log (git-out "git" "log" "--oneline" "main..HEAD")
+        main-log   (git-out "git" "log" "--oneline" "HEAD..main")
+        diff-stat  (git-out "git" "diff" "--stat" "main")]
+    {:branch-log (or branch-log "(none)")
+     :main-log   (or main-log "(none)")
+     :diff-stat  (or diff-stat "(none)")}))
+
+(defn- verify-mergeable?
+  "Dry-run merge to verify a worktree branch merges cleanly into main.
+   Does NOT leave merge state behind — always cleans up the dry-run.
+   Uses --no-commit so no actual commit is created; resets afterward."
+  [wt-path]
+  (let [result (process/sh ["git" "merge" "--no-commit" "--no-ff" "main"]
+                           {:dir wt-path :out :string :err :string})
+        clean? (zero? (:exit result))]
+    ;; Clean up: abort if conflicted, reset if staged but uncommitted
+    (if clean?
+      (process/sh ["git" "reset" "--hard" "HEAD"] {:dir wt-path})
+      (process/sh ["git" "merge" "--abort"] {:dir wt-path}))
+    clean?))
+
 (defn- sync-worktree-to-main!
-  "Merge latest main into worktree branch before merge-to-main!.
-   If conflicts arise, launches a one-shot agent to resolve them.
+  "Sync worktree branch with main before merge-to-main!.
+   Fast path: git merge main succeeds cleanly → :synced.
+   Conflict path: abort merge, give agent a clean worktree + divergence
+   context, let agent make the branch mergeable (rebase, cherry-pick,
+   manual resolution — agent's choice), verify with dry-run merge.
    Runs OUTSIDE the merge-lock so the agent doesn't block other workers.
    Returns :synced | :resolved | :failed."
   [worker wt-path worker-id]
@@ -366,15 +418,21 @@
     (if (zero? (:exit merge-result))
       (do (println (format "[%s] Worktree synced to main" worker-id))
           :synced)
-      ;; Conflict — launch agent to resolve in the worktree
-      (let [_ (println (format "[%s] Sync conflict, launching resolver" worker-id))
-            conflict-files (:out (process/sh ["git" "diff" "--name-only" "--diff-filter=U"]
-                                             {:dir wt-path :out :string :err :string}))
+      ;; Conflict — abort merge to restore clean worktree state, then
+      ;; hand the problem to the agent with full divergence context.
+      (let [_ (process/sh ["git" "merge" "--abort"] {:dir wt-path})
+            _ (println (format "[%s] Branch diverged from main, launching resolver agent" worker-id))
+            {:keys [branch-log main-log diff-stat]} (collect-divergence-context wt-path)
             resolve-prompt (str "[oompa:" (or (:swarm-id worker) "unknown") ":" worker-id "] "
-                                "Merge conflicts when syncing to main.\n"
-                                "Conflicted files:\n" conflict-files "\n\n"
-                                "Resolve ALL conflicts. Keep intent of both sides. "
-                                "Stage resolved files with git add.")
+                                "Your branch has diverged from main and cannot merge cleanly.\n\n"
+                                "Your branch's commits (not on main):\n" branch-log "\n\n"
+                                "Commits on main since you branched:\n" main-log "\n\n"
+                                "Divergence scope:\n" diff-stat "\n\n"
+                                "Make this branch cleanly mergeable into main. "
+                                "Preserve the intent of your branch's changes.\n"
+                                "You have full git access — rebase, cherry-pick, resolve conflicts, "
+                                "whatever works.\n"
+                                "When done, verify with: git diff main --stat")
             abs-wt (.getAbsolutePath (io/file wt-path))
             cmd (harness/build-cmd (:harness worker)
                   {:cwd abs-wt :model (:model worker) :prompt resolve-prompt})
@@ -385,25 +443,13 @@
                      (catch Exception e
                        {:exit -1 :out "" :err (.getMessage e)}))]
         (if (zero? (:exit result))
-          ;; Agent ran — check if conflicts are actually resolved
-          (let [_ (process/sh ["git" "add" "-A"] {:dir wt-path})
-                remaining (:out (process/sh ["git" "diff" "--name-only" "--diff-filter=U"]
-                                            {:dir wt-path :out :string :err :string}))
-                clean? (str/blank? remaining)]
-            (if clean?
-              (let [commit (process/sh ["git" "commit" "--no-edit"]
-                                       {:dir wt-path :out :string :err :string})]
-                (if (zero? (:exit commit))
-                  (do (println (format "[%s] Conflicts resolved by agent" worker-id))
-                      :resolved)
-                  (do (println (format "[%s] Commit after resolution failed" worker-id))
-                      (process/sh ["git" "merge" "--abort"] {:dir wt-path})
-                      :failed)))
-              (do (println (format "[%s] Agent left unresolved conflicts" worker-id))
-                  (process/sh ["git" "merge" "--abort"] {:dir wt-path})
-                  :failed)))
+          ;; Agent ran — verify the branch actually merges cleanly now
+          (if (verify-mergeable? wt-path)
+            (do (println (format "[%s] Agent resolved divergence, branch is mergeable" worker-id))
+                :resolved)
+            (do (println (format "[%s] Agent ran but branch still can't merge cleanly" worker-id))
+                :failed))
           (do (println (format "[%s] Resolver agent failed (exit %d)" worker-id (:exit result)))
-              (process/sh ["git" "merge" "--abort"] {:dir wt-path})
               :failed))))))
 
 (defn- worktree-has-changes?
@@ -615,12 +661,8 @@
             (println (format "[%s] Reviewer APPROVED (attempt %d)" worker-id attempt))
             {:approved? true :attempts attempt})
 
-          :rejected
-          (do
-            (println (format "[%s] Reviewer REJECTED (attempt %d)" worker-id attempt))
-            {:approved? false :attempts attempt})
-
-          ;; :needs-changes
+          ;; :needs-changes — always give the worker a chance to fix.
+          ;; Hard rejection only happens when max review rounds are exhausted.
           (let [all-feedback (conj prev-feedback output)]
             (if (>= attempt max-review-retries)
               (do
@@ -700,7 +742,8 @@
            session-id nil            ;; persistent session-id (nil = start fresh)
            wt-state nil              ;; {:dir :branch :path} or nil
            claimed-ids #{}           ;; task IDs claimed this session (reset on worktree destroy)
-           claim-resume-prompt nil]  ;; override prompt for next iteration (from CLAIM results)
+           claim-resume-prompt nil   ;; override prompt for next iteration (from CLAIM results)
+           working-resumes 0]        ;; consecutive "working" outcomes in current session
       (let [finish (fn [status]
                      (assoc worker :completed completed :status status
                                    :merges (:merges metrics)
@@ -759,7 +802,7 @@
                   (do
                     (println (format "[%s] %d consecutive errors, stopping" id errors))
                     (finish :error))
-                  (recur (inc iter) completed errors metrics nil nil #{} nil)))
+                  (recur (inc iter) completed errors metrics nil nil #{} nil 0)))
 
               ;; Worktree ready — run agent
               (let [resume? (or (some? session-id) (some? claim-resume-prompt))
@@ -796,7 +839,7 @@
                       (do
                         (println (format "[%s] %d consecutive errors, stopping" id errors))
                         (finish :error))
-                      (recur (inc iter) completed errors metrics nil nil #{} nil)))
+                      (recur (inc iter) completed errors metrics nil nil #{} nil 0)))
 
                   ;; CLAIM signal — framework claims tasks, resumes agent with results
                   ;; Only honored when no MERGE or DONE signal (lowest priority)
@@ -809,7 +852,7 @@
                     (emit-cycle-log! swarm-id id iter iter-start-ms new-session-id
                       {:outcome :claimed :claimed-task-ids (vec claimed)})
                     (recur (inc iter) completed 0 metrics new-session-id wt-state
-                           new-claimed-ids resume-prompt))
+                           new-claimed-ids resume-prompt 0))
 
                   ;; COMPLETE_AND_READY_FOR_MERGE — review, merge, reset session
                   merge?
@@ -827,7 +870,7 @@
                               (emit-cycle-log! swarm-id id iter iter-start-ms new-session-id
                                 {:outcome :sync-failed :claimed-task-ids (vec all-claimed)})
                               (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                              (recur (inc iter) completed 0 metrics nil nil #{} nil))
+                              (recur (inc iter) completed 0 metrics nil nil #{} nil 0))
                             ;; Synced — proceed with merge
                             (let [merged? (merge-to-main! (:path wt-state) (:branch wt-state) id project-root 0 all-claimed)
                                   metrics (if merged? (update metrics :merges inc) metrics)]
@@ -845,7 +888,7 @@
                                                 :recycled (:recycled metrics)
                                                 :review-rounds-total (:review-rounds-total metrics)
                                                 :claims (:claims metrics)))
-                                (recur (inc iter) (inc completed) 0 metrics nil nil #{} nil))))))
+                                (recur (inc iter) (inc completed) 0 metrics nil nil #{} nil 0))))))
                       ;; Code changes — full review loop
                       (let [{:keys [approved? attempts]} (review-loop! worker (:path wt-state) id iter)
                             ;; Don't pre-increment :merges — defer to after actual merge succeeds
@@ -863,7 +906,7 @@
                                   {:outcome :sync-failed :claimed-task-ids (vec all-claimed)
                                    :review-rounds (or attempts 0)})
                                 (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                                (recur (inc iter) completed 0 metrics nil nil #{} nil))
+                                (recur (inc iter) completed 0 metrics nil nil #{} nil 0))
                               ;; Synced — proceed with merge, capture return value
                               (let [merged? (merge-to-main! (:path wt-state) (:branch wt-state) id project-root (or attempts 0) all-claimed)
                                     metrics (if merged? (update metrics :merges inc) metrics)]
@@ -884,7 +927,7 @@
                                                   :recycled (:recycled metrics)
                                                   :review-rounds-total (:review-rounds-total metrics)
                                                   :claims (:claims metrics)))
-                                  (recur (inc iter) (inc completed) 0 metrics nil nil #{} nil)))))
+                                  (recur (inc iter) (inc completed) 0 metrics nil nil #{} nil 0)))))
                           (let [recycled (recycle-orphaned-tasks! id pre-current-ids)
                                 metrics (update metrics :recycled + recycled)]
                             (println (format "[%s] Cycle %d/%d rejected" id iter iterations))
@@ -893,7 +936,7 @@
                                :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))
                                :review-rounds (or attempts 0)})
                             (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                            (recur (inc iter) completed 0 metrics nil nil #{} nil)))))
+                            (recur (inc iter) completed 0 metrics nil nil #{} nil 0)))))
                     (let [recycled (recycle-orphaned-tasks! id pre-current-ids)
                           metrics (update metrics :recycled + recycled)]
                       (println (format "[%s] Merge signaled but no changes, skipping" id))
@@ -901,7 +944,7 @@
                         {:outcome :no-changes :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))
                          :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))})
                       (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                      (recur (inc iter) completed 0 metrics nil nil #{} nil)))
+                      (recur (inc iter) completed 0 metrics nil nil #{} nil 0)))
 
                   ;; __DONE__ without merge — only honor for planners
                   (and done? (:can-plan worker))
@@ -924,16 +967,43 @@
                       {:outcome :executor-done :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))
                        :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))})
                     (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                    (recur (inc iter) completed 0 metrics nil nil #{} nil))
+                    (recur (inc iter) completed 0 metrics nil nil #{} nil 0))
 
-                  ;; No signal — agent still working, resume next iteration
+                  ;; No signal — agent still working, resume next iteration.
+                  ;; Track consecutive working resumes. After max-working-resumes,
+                  ;; inject a nudge prompt. If still no signal after nudge, kill session.
                   :else
-                  (do
-                    (println (format "[%s] Working... (will resume)" id))
-                    (emit-cycle-log! swarm-id id iter iter-start-ms new-session-id
-                      {:outcome :working :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))})
-                    (recur (inc iter) completed 0 metrics new-session-id wt-state
-                           claimed-ids nil))))))))))))
+                  (let [wr (inc working-resumes)
+                        max-wr (:max-working-resumes worker)]
+                    (cond
+                      ;; Already nudged last iteration, still no signal — stuck
+                      (> wr max-wr)
+                      (let [recycled (recycle-orphaned-tasks! id pre-current-ids)
+                            metrics (update metrics :recycled + recycled)]
+                        (println (format "[%s] Stuck after %d working resumes + nudge, resetting session" id wr))
+                        (emit-cycle-log! swarm-id id iter iter-start-ms new-session-id
+                          {:outcome :stuck :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))
+                           :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))})
+                        (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                        (recur (inc iter) completed 0 metrics nil nil #{} nil 0))
+
+                      ;; Hit the limit — nudge on next resume
+                      (= wr max-wr)
+                      (do
+                        (println (format "[%s] Working... %d/%d resumes, nudging agent to wrap up" id wr max-wr))
+                        (emit-cycle-log! swarm-id id iter iter-start-ms new-session-id
+                          {:outcome :working :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))})
+                        (recur (inc iter) completed 0 metrics new-session-id wt-state
+                               claimed-ids nudge-prompt wr))
+
+                      ;; Under limit — normal resume
+                      :else
+                      (do
+                        (println (format "[%s] Working... (will resume, %d/%d)" id wr max-wr))
+                        (emit-cycle-log! swarm-id id iter iter-start-ms new-session-id
+                          {:outcome :working :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))})
+                        (recur (inc iter) completed 0 metrics new-session-id wt-state
+                               claimed-ids nil wr))))))))))))))
 
 ;; =============================================================================
 ;; Multi-Worker Execution

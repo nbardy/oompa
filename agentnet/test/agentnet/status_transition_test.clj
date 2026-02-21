@@ -7,7 +7,7 @@
             [clojure.java.io :as io]
             [clojure.test :as t]))
 
-(defn- stubbed-worker-shell [run-agent-fn emit-log-fn & {:keys [can-plan iterations recycle-fn]}]
+(defn- stubbed-worker-shell [run-agent-fn emit-log-fn & {:keys [can-plan iterations recycle-fn max-working-resumes]}]
   (with-redefs [tasks/ensure-dirs! (fn [] nil)
                 tasks/pending-count (fn [] 1)
                 tasks/current-count (fn [] 0)
@@ -23,11 +23,13 @@
                                           :resume-prompt "## Claim Results"})
                 worker/recycle-orphaned-tasks! (or recycle-fn (fn [& _] 0))
                 worker/emit-cycle-log! emit-log-fn]
-    (worker/run-worker! {:id "w0"
-                         :harness :codex
-                         :model "gpt-5"
-                         :iterations (or iterations 1)
-                         :can-plan (if (nil? can-plan) true can-plan)})))
+    (worker/run-worker! (cond-> {:id "w0"
+                                  :harness :codex
+                                  :model "gpt-5"
+                                  :iterations (or iterations 1)
+                                  :can-plan (if (nil? can-plan) true can-plan)
+                                  :max-working-resumes (or max-working-resumes 5)}
+                          true identity))))
 
 (t/deftest claim-signal-transitions-to-claimed-cycle
   (let [logs (atom [])
@@ -95,6 +97,68 @@
     (t/is (contains? outcomes "sync-failed"))
     (t/is (contains? outcomes "merge-failed"))
     (t/is (contains? outcomes "interrupted"))))
+
+(t/deftest cycle-schema-includes-stuck-outcome
+  (let [schema (json/parse-string (slurp (io/file "schemas/cycle.schema.json")) true)
+        outcomes (set (get-in schema [:properties :outcome :enum]))]
+    (t/is (contains? outcomes "stuck"))))
+
+(t/deftest working-resumes-emits-stuck-after-max
+  ;; With max-working-resumes=2, the worker should:
+  ;; iter 1: working (wr=1, under limit)
+  ;; iter 2: working (wr=2, at limit → nudge injected for next resume)
+  ;; iter 3: working (wr=3, > limit → stuck, session reset)
+  ;; iter 4: exhausted (iterations=4, fresh start, working again wr=1)
+  (let [logs (atom [])
+        result (stubbed-worker-shell
+                 (fn [& _]
+                   {:output "still thinking..."
+                    :exit 0
+                    :done? false
+                    :merge? false
+                    :claim-ids nil
+                    :session-id "sid-stuck"})
+                 (fn [_ _ _ _ _ data]
+                   (swap! logs conj data))
+                 :iterations 4
+                 :max-working-resumes 2)]
+    (t/is (= :exhausted (:status result)))
+    (let [outcomes (mapv :outcome @logs)]
+      ;; 3 working + 1 stuck = 4 logs (iter 4 is working again after reset)
+      (t/is (= 4 (count outcomes)))
+      (t/is (= :working (nth outcomes 0)))  ;; wr=1
+      (t/is (= :working (nth outcomes 1)))  ;; wr=2, nudge queued
+      (t/is (= :stuck   (nth outcomes 2)))  ;; wr=3 > max, killed
+      (t/is (= :working (nth outcomes 3))))))  ;; fresh session, wr=1
+
+(t/deftest nudge-prompt-injected-at-max-working-resumes
+  ;; Verify the nudge prompt is passed as resume-prompt-override when wr hits max.
+  ;; At wr=max, the nudge is queued for the NEXT run-agent! call.
+  (let [prompts-seen (atom [])
+        call-count (atom 0)]
+    (stubbed-worker-shell
+      (fn [worker wt-path context session-id resume? & {:keys [resume-prompt-override]}]
+        (swap! call-count inc)
+        (swap! prompts-seen conj resume-prompt-override)
+        {:output "still working"
+         :exit 0
+         :done? false
+         :merge? false
+         :claim-ids nil
+         :session-id "sid-nudge"})
+      (fn [& _] nil)
+      :iterations 4
+      :max-working-resumes 2)
+    ;; Call 1 (iter 1): fresh start, no override
+    ;; Call 2 (iter 2): resume, wr=1, no nudge yet
+    ;; Call 3 (iter 3): resume, wr=2 (at limit), nudge injected
+    ;; iter 3 returns working → wr=3 > max → stuck → session reset
+    ;; Call 4 (iter 4): fresh start again, no override
+    (t/is (= 4 @call-count))
+    (t/is (nil? (nth @prompts-seen 0)))      ;; fresh start
+    (t/is (nil? (nth @prompts-seen 1)))      ;; wr=1, under limit
+    (t/is (string? (nth @prompts-seen 2)))   ;; wr=2, nudge injected
+    (t/is (nil? (nth @prompts-seen 3)))))
 
 (defn run-tests! []
   (let [{:keys [fail error]} (t/run-tests 'agentnet.status-transition-test)]
