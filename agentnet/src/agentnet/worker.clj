@@ -283,15 +283,19 @@
                              (remove nil?)
                              (str/join "\n\n")))
 
+        ;; Only include the most recent round's feedback — the worker has already
+        ;; attempted fixes based on it, so the reviewer just needs to verify.
+        ;; Including all prior rounds bloats the prompt and causes empty output.
         history-block (when (seq prev-feedback)
-                        (str "\n## Previous Review Rounds\n\n"
-                             "The worker has already attempted fixes based on earlier feedback. "
-                             "Do NOT raise new issues — only verify the original issues are resolved.\n\n"
-                             (->> prev-feedback
-                                  (map-indexed (fn [i fb]
-                                    (str "### Round " (inc i) " feedback:\n" fb)))
-                                  (str/join "\n\n"))
-                             "\n\n"))
+                        (let [latest (last prev-feedback)
+                              truncated (if (> (count latest) 2000)
+                                          (str (subs latest 0 2000) "\n... [feedback truncated]")
+                                          latest)]
+                          (str "\n## Previous Review (Round " (count prev-feedback) ")\n\n"
+                               "The worker has attempted fixes based on this feedback. "
+                               "Verify the issues below are resolved. Do NOT raise new issues.\n\n"
+                               truncated
+                               "\n\n")))
 
         review-body (str (or custom-prompt
                               (str "Review the changes in this worktree.\n"
@@ -878,17 +882,7 @@
                               (emit-cycle-log! swarm-id id iter iter-start-ms new-session-id
                                 {:outcome :merged :claimed-task-ids (vec all-claimed) :review-rounds 0})
                               (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                              (if (and done? (:can-plan worker))
-                                (do
-                                  (println (format "[%s] Worker done after merge" id))
-                                  (assoc worker :completed (inc completed) :status :done
-                                                :merges (:merges metrics)
-                                                :rejections (:rejections metrics)
-                                                :errors (:errors metrics)
-                                                :recycled (:recycled metrics)
-                                                :review-rounds-total (:review-rounds-total metrics)
-                                                :claims (:claims metrics)))
-                                (recur (inc iter) (inc completed) 0 metrics nil nil #{} nil 0))))))
+                              (recur (inc iter) (inc completed) 0 metrics nil nil #{} nil 0)))))
                       ;; Code changes — full review loop
                       (let [{:keys [approved? attempts]} (review-loop! worker (:path wt-state) id iter)
                             ;; Don't pre-increment :merges — defer to after actual merge succeeds
@@ -916,18 +910,7 @@
                                    :claimed-task-ids (vec all-claimed)
                                    :review-rounds (or attempts 0)})
                                 (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                                ;; If also __DONE__, stop after merge
-                                (if (and done? (:can-plan worker))
-                                  (do
-                                    (println (format "[%s] Worker done after merge" id))
-                                    (assoc worker :completed (inc completed) :status :done
-                                                  :merges (:merges metrics)
-                                                  :rejections (:rejections metrics)
-                                                  :errors (:errors metrics)
-                                                  :recycled (:recycled metrics)
-                                                  :review-rounds-total (:review-rounds-total metrics)
-                                                  :claims (:claims metrics)))
-                                  (recur (inc iter) (inc completed) 0 metrics nil nil #{} nil 0)))))
+                                (recur (inc iter) (inc completed) 0 metrics nil nil #{} nil 0))))
                           (let [recycled (recycle-orphaned-tasks! id pre-current-ids)
                                 metrics (update metrics :recycled + recycled)]
                             (println (format "[%s] Cycle %d/%d rejected" id iter iterations))
@@ -946,23 +929,13 @@
                       (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                       (recur (inc iter) completed 0 metrics nil nil #{} nil 0)))
 
-                  ;; __DONE__ without merge — only honor for planners
-                  (and done? (:can-plan worker))
-                  (do
-                    (println (format "[%s] Received __DONE__ signal" id))
-                    (emit-cycle-log! swarm-id id iter iter-start-ms new-session-id
-                      {:outcome :done :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))})
-                    (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                    (println (format "[%s] Worker done after %d/%d iterations" id iter iterations))
-                    (finish :done))
-
-                  ;; __DONE__ from executor — ignore signal, but reset session since
-                  ;; the agent process exited. Resuming a dead session causes exit 1
-                  ;; which cascades into consecutive errors and premature stopping.
-                  (and done? (not (:can-plan worker)))
+                  ;; __DONE__ — agent signaled it finished this cycle's work.
+                  ;; Always reset session and continue to next iteration.
+                  ;; Planners re-plan as tasks complete; executors pick up new tasks.
+                  done?
                   (let [recycled (recycle-orphaned-tasks! id pre-current-ids)
                         metrics (update metrics :recycled + recycled)]
-                    (println (format "[%s] Ignoring __DONE__ (executor), resetting session" id))
+                    (println (format "[%s] __DONE__ signal, resetting session (iter %d/%d)" id iter iterations))
                     (emit-cycle-log! swarm-id id iter iter-start-ms new-session-id
                       {:outcome :executor-done :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))
                        :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))})

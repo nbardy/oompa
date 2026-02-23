@@ -49,7 +49,9 @@
     (t/is (= :claimed (:outcome (first @logs))))
     (t/is (= ["task-001"] (:claimed-task-ids (first @logs))))))
 
-(t/deftest planner-done-signal-transitions-to-done
+(t/deftest planner-done-signal-resets-like-executor
+  ;; After __DONE__ unification, planners and executors behave identically:
+  ;; each __DONE__ resets the session and continues to the next iteration.
   (let [logs (atom [])
         result (stubbed-worker-shell
                  (fn [& _]
@@ -63,9 +65,9 @@
                    (swap! logs conj data))
                  :can-plan true
                  :iterations 3)]
-    (t/is (= :done (:status result)))
-    (t/is (= 1 (count @logs)))
-    (t/is (= :done (:outcome (first @logs))))))
+    (t/is (= :exhausted (:status result)))
+    (t/is (= 3 (count @logs)))
+    (t/is (every? #(= :executor-done (:outcome %)) @logs))))
 
 (t/deftest executor-done-signal-transitions-to-executor-done-cycle
   (let [logs (atom [])
