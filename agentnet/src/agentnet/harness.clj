@@ -34,11 +34,11 @@
           (throw (ex-info (str "Binary not found on PATH: " name) {:binary name}))))))
 
 ;; =============================================================================
-;; Opencode Output Parsing (harness-specific, lives here not in agent-cli)
+;; NDJSON Output Parsing (harness-specific, lives here not in agent-cli)
 ;; =============================================================================
 
-(defn- parse-opencode-run-output
-  "Parse `opencode run --format json` NDJSON output.
+(defn- parse-ndjson-output
+  "Parse NDJSON output from CLIs (opencode, gemini).
    Returns {:session-id string|nil, :text string|nil}."
   [s]
   (let [raw (or s "")
@@ -51,6 +51,7 @@
                     doall)
         session-id (or (some #(or (:sessionID %)
                                    (:sessionId %)
+                                   (:session_id %)
                                    (get-in % [:part :sessionID])
                                    (get-in % [:part :sessionId]))
                              events)
@@ -58,8 +59,11 @@
         text (->> events
                   (keep (fn [event]
                           (let [event-type (or (:type event) (get-in event [:part :type]))
-                                chunk (or (:text event) (get-in event [:part :text]))]
-                            (when (and (= event-type "text")
+                                role (or (:role event) (get-in event [:part :role]))
+                                chunk (or (:text event) (get-in event [:part :text]) (:content event))]
+                            (when (and (or (= event-type "text")
+                                           (and (= event-type "message")
+                                                (= role "assistant")))
                                        (string? chunk)
                                        (not (str/blank? chunk)))
                               chunk))))
@@ -94,7 +98,7 @@
   {:codex    {:stdin :close   :session :uuid      :output :plain}
    :claude   {:stdin :prompt  :session :uuid      :output :plain}
    :opencode {:stdin :close   :session :extracted  :output :ndjson}
-   :gemini   {:stdin :close   :session :implicit   :output :plain}})
+   :gemini   {:stdin :close   :session :implicit   :output :ndjson}})
 
 ;; =============================================================================
 ;; Registry Access
@@ -190,7 +194,7 @@
   [harness-kw raw-output session-id]
   (let [{:keys [output]} (get-config harness-kw)]
     (if (= output :ndjson)
-      (let [parsed (parse-opencode-run-output raw-output)]
+      (let [parsed (parse-ndjson-output raw-output)]
         {:output     (or (:text parsed) raw-output)
          :session-id (or (:session-id parsed) session-id)})
       {:output     raw-output
