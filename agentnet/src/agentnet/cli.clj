@@ -158,7 +158,7 @@
 ;; Commands
 ;; =============================================================================
 
-(declare cmd-swarm parse-model-string)
+(declare cmd-swarm parse-model-string pid-alive?)
 
 (defn- check-git-clean!
   "Abort if git working tree is dirty. Dirty index causes merge conflicts
@@ -602,6 +602,128 @@
                 (println (format "Total: %d tasks" (count entries))))))
           (println "No runs found."))))))
 
+(def ^:private error-outcomes
+  #{"error" "merge-failed" "rejected" "stuck"})
+
+(defn- run-state
+  "Derive run lifecycle state from started/stopped events + PID liveness."
+  [started stopped]
+  (cond
+    (nil? started) "missing-started"
+    stopped (str "stopped/" (:reason stopped))
+    (pid-alive? (:pid started)) "running"
+    :else "stale"))
+
+(defn- latest-cycles-by-worker
+  "Return map of worker-id -> latest cycle entry."
+  [cycles]
+  (reduce (fn [acc c]
+            (let [wid (:worker-id c)
+                  prev (get acc wid)]
+              (if (or (nil? prev)
+                      (> (or (:cycle c) 0) (or (:cycle prev) 0)))
+                (assoc acc wid c)
+                acc)))
+          {}
+          cycles))
+
+(defn- worker-runtime
+  "Best-effort worker runtime classification for view output."
+  [worker latest-cycle run-state*]
+  (let [iter-max (or (:iterations worker) 0)
+        iter-done (or (:cycle latest-cycle) 0)
+        outcome (or (:outcome latest-cycle) "-")]
+    (cond
+      (>= iter-done iter-max) "exhausted"
+      (str/starts-with? run-state* "stopped/") "stopped"
+      (= run-state* "stale") "stale"
+      (nil? latest-cycle) "starting"
+      (= outcome "working") "working"
+      (= outcome "executor-done") "idle"
+      :else outcome)))
+
+(defn- model-label
+  [{:keys [harness model reasoning]}]
+  (str harness ":" model (when reasoning (str ":" reasoning))))
+
+(defn- cmd-view-one
+  [swarm-id]
+  (if-let [started (runs/read-started swarm-id)]
+    (let [stopped (runs/read-stopped swarm-id)
+          cycles (or (runs/list-cycles swarm-id) [])
+          reviews (or (runs/list-reviews swarm-id) [])
+          workers (or (:workers started) [])
+          run-state* (run-state started stopped)
+          latest-by-worker (latest-cycles-by-worker cycles)]
+      (println (format "Swarm:   %s" swarm-id))
+      (println (format "State:   %s" run-state*))
+      (println (format "Started: %s" (:started-at started)))
+      (println (format "PID:     %s" (or (:pid started) "N/A")))
+      (println (format "Config:  %s" (or (:config-file started) "N/A")))
+      (when stopped
+        (println (format "Stopped: %s" (:stopped-at stopped))))
+      (println (format "Cycles:  %d  (merged=%d, errors=%d)"
+                       (count cycles)
+                       (count (filter #(= "merged" (:outcome %)) cycles))
+                       (count (filter #(error-outcomes (:outcome %)) cycles))))
+      (println (format "Reviews: %d" (count reviews)))
+      (println)
+      (println "Workers:")
+      (println "ID  | Runtime   | Progress | Last Outcome   | Claimed | Model")
+      (println "----+-----------+----------+----------------+---------+------------------------------")
+      (doseq [w (sort-by :id workers)]
+        (let [wid (:id w)
+              latest (get latest-by-worker wid)
+              progress (format "%d/%d" (or (:cycle latest) 0) (or (:iterations w) 0))
+              runtime (worker-runtime w latest run-state*)
+              outcome (or (:outcome latest) "-")
+              claimed (count (or (:claimed-task-ids latest) []))]
+          (println (format "%-3s | %-9s | %-8s | %-14s | %-7d | %s"
+                           wid runtime progress outcome claimed (model-label w))))))
+    (do
+      (println (format "Swarm not found: %s" swarm-id))
+      (System/exit 1))))
+
+(defn cmd-view
+  "List all swarms with liveness + worker activity summary.
+   Pass a swarm-id to inspect per-worker runtime details."
+  [opts args]
+  (let [run-ids (or (runs/list-runs) [])]
+    (if-not (seq run-ids)
+      (println "No swarm runs found.")
+      (if-let [swarm-id (first args)]
+        (cmd-view-one swarm-id)
+        (do
+          (println "Swarm Runs:")
+          (println "ID       | State            | PID    | Workers | Active | Cycles | Merged | Errors | Started")
+          (println "---------+------------------+--------+---------+--------+--------+--------+--------+-------------------------")
+          (doseq [rid run-ids]
+            (let [started (runs/read-started rid)
+                  stopped (runs/read-stopped rid)
+                  cycles (or (runs/list-cycles rid) [])
+                  workers (or (:workers started) [])
+                  latest-by-worker (latest-cycles-by-worker cycles)
+                  state* (run-state started stopped)
+                  active-count (if (= state* "running")
+                                 (count (filter (fn [w]
+                                                  (let [latest (get latest-by-worker (:id w))]
+                                                    (< (or (:cycle latest) 0)
+                                                       (or (:iterations w) 0))))
+                                                workers))
+                                 0)]
+              (println (format "%-8s | %-16s | %-6s | %7d | %6d | %6d | %6d | %6d | %s"
+                               rid
+                               state*
+                               (or (:pid started) "-")
+                               (count workers)
+                               active-count
+                               (count cycles)
+                               (count (filter #(= "merged" (:outcome %)) cycles))
+                               (count (filter #(error-outcomes (:outcome %)) cycles))
+                               (or (:started-at started) "-")))))
+          (println)
+          (println "Tip: use `oompa view <swarm-id>` for per-worker status."))))))
+
 (defn cmd-worktrees
   "List worktree status"
   [opts args]
@@ -916,6 +1038,8 @@
   (println "  tasks            Show task status (pending/current/complete)")
   (println "  prompt \"...\"     Run ad-hoc prompt")
   (println "  status           Show last run summary")
+  (println "  view [swarm-id]  List swarms or show per-worker runtime status")
+  (println "  list [swarm-id]  Alias for view")
   (println "  worktrees        List worktree status")
   (println "  stop [swarm-id]  Stop swarm gracefully (finish current cycle)")
   (println "  kill [swarm-id]  Kill swarm immediately (SIGKILL)")
@@ -953,6 +1077,8 @@
    "tasks" cmd-tasks
    "prompt" cmd-prompt
    "status" cmd-status
+   "view" cmd-view
+   "list" cmd-view
    "stop" cmd-stop
    "kill" cmd-kill
    "worktrees" cmd-worktrees

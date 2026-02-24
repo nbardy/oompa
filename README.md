@@ -218,6 +218,8 @@ oompa swarm
 oompa run [file]            # Run from config (defaults: oompa.json, oompa/oompa.json)
 oompa run --detach --config oompa.json
 oompa swarm [file]          # Direct swarm command (foreground)
+oompa view                  # List swarms with liveness + worker activity
+oompa view <swarm-id>       # Per-worker runtime status for one swarm
 oompa tasks                 # Show task status
 oompa check                 # Check available backends
 oompa cleanup               # Remove worktrees
