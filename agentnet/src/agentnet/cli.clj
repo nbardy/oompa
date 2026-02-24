@@ -2,8 +2,8 @@
   "Command-line interface for AgentNet orchestrator.
 
    Usage:
-     ./swarm.bb run                                    # Run all tasks once
-     ./swarm.bb run --workers 4                        # With 4 parallel workers
+     ./swarm.bb run                                    # Run swarm from config (oompa.json)
+     ./swarm.bb run --detach --config oompa.json       # Run in background with startup validation
      ./swarm.bb loop 20 --harness claude               # 20 iterations with Claude
      ./swarm.bb loop --workers claude:5 opencode:2 --iterations 20  # Mixed harnesses
      ./swarm.bb swarm oompa.json                       # Multi-model from config
@@ -75,6 +75,9 @@
                :harness :codex
                :model nil
                :dry-run false
+               :detach false
+               :config-file nil
+               :startup-timeout nil
                :iterations 1
                :worker-specs nil}
          remaining args]
@@ -105,6 +108,24 @@
         (= arg "--model")
         (recur (assoc opts :model (second remaining))
                (nnext remaining))
+
+        (= arg "--config")
+        (let [config-file (second remaining)]
+          (when (str/blank? config-file)
+            (throw (ex-info "--config requires a path" {:arg arg})))
+          (recur (assoc opts :config-file config-file)
+                 (nnext remaining)))
+
+        (or (= arg "--detach") (= arg "--dettach"))
+        (recur (assoc opts :detach true)
+               (next remaining))
+
+        (= arg "--startup-timeout")
+        (let [seconds (parse-int (second remaining) nil)]
+          (when-not (and (number? seconds) (pos? seconds))
+            (throw (ex-info "--startup-timeout requires a positive integer (seconds)" {:arg arg})))
+          (recur (assoc opts :startup-timeout seconds)
+                 (nnext remaining)))
 
         ;; Legacy flags (still supported)
         (= arg "--claude")
@@ -237,36 +258,240 @@
       (System/exit 1))
     (println)))
 
-(defn cmd-run
-  "Run orchestrator — uses oompa.json if present, otherwise simple mode"
+(def ^:private default-detach-startup-timeout 20)
+
+(defn- run-id []
+  (subs (str (java.util.UUID/randomUUID)) 0 8))
+
+(defn- run-ts []
+  (.format (java.time.format.DateTimeFormatter/ofPattern "yyyyMMdd-HHmmss")
+           (java.time.LocalDateTime/now)))
+
+(defn- default-config-file
+  []
+  (cond
+    (.exists (io/file "oompa.json")) "oompa.json"
+    (.exists (io/file "oompa/oompa.json")) "oompa/oompa.json"
+    :else nil))
+
+(defn- resolve-config-file
   [opts args]
-  (if (.exists (io/file "oompa.json"))
-    (cmd-swarm opts (or (seq args) ["oompa.json"]))
-    (let [swarm-id (make-swarm-id)]
-      (if-let [specs (:worker-specs opts)]
-        ;; Mixed worker specs: --workers claude:5 opencode:2
-        (let [workers (mapcat
-                        (fn [spec]
-                          (let [{:keys [harness count]} spec]
-                            (map-indexed
-                              (fn [idx _]
-                                (worker/create-worker
-                                  {:id (format "%s-%d" (name harness) idx)
-                                   :swarm-id swarm-id
-                                   :harness harness
-                                   :model (:model opts)
-                                   :iterations 1}))
-                              (range count))))
-                        specs)]
-          (println (format "Running once with mixed workers (swarm %s):" swarm-id))
-          (doseq [spec specs]
-            (println (format "  %dx %s" (:count spec) (name (:harness spec)))))
-          (println)
-          (worker/run-workers! workers))
-        ;; Simple mode retired — use oompa.json or --workers harness:count
+  (let [candidate (or (:config-file opts)
+                      (first args)
+                      (default-config-file))]
+    (when candidate
+      (.getCanonicalPath (io/file candidate)))))
+
+(defn- prepare-log-file!
+  "Create oompa/logs and return absolute log path."
+  [rid]
+  (let [dir (if (.exists (io/file "oompa"))
+              (io/file "oompa" "logs")
+              (io/file "runs" "logs"))]
+    (.mkdirs dir)
+    (.getCanonicalPath (io/file dir (str (run-ts) "_" rid ".log")))))
+
+(defn- read-file-safe
+  [path]
+  (try
+    (if (.exists (io/file path))
+      (slurp path)
+      "")
+    (catch Exception _
+      "")))
+
+(defn- tail-lines
+  [text n]
+  (->> (str/split-lines (or text ""))
+       (take-last n)
+       (str/join "\n")))
+
+(defn- extract-swarm-id
+  [text]
+  (some->> text
+           (re-find #"Swarm ID:\s*([0-9a-f]{8})")
+           second))
+
+(defn- startup-diagnostic-lines
+  [text]
+  (->> (str/split-lines (or text ""))
+       (filter #(re-find #"ERROR:|FAIL|WARNING:" %))
+       (take-last 20)))
+
+(defn- print-preflight-warnings!
+  []
+  (let [agent-cli? (zero? (:exit (process/sh ["which" "agent-cli"]
+                                              {:out :string :err :string})))]
+    (when-not agent-cli?
+      (println "WARNING: 'agent-cli' is not on PATH.")
+      (println "         Model validation may report false model-access failures.")))
+  (let [dirty (process/sh ["git" "status" "--porcelain"]
+                          {:out :string :err :string})
+        lines (->> (:out dirty)
+                   str/split-lines
+                   (remove str/blank?))]
+    (when (seq lines)
+      (println (format "WARNING: Git working tree is dirty (%d changed paths)." (count lines)))
+      (println "         Swarm startup may fail until changes are committed/stashed.")
+      (doseq [line (take 20 lines)]
+        (println line))
+      (when (> (count lines) 20)
+        (println (format "... (%d total changed paths)" (count lines)))))))
+
+(defn- runtime-classpath-entry
+  "Best-effort classpath root for agentnet sources."
+  []
+  (or
+    (some-> (System/getenv "OOMPA_PACKAGE_ROOT")
+            (io/file "agentnet" "src")
+            .getCanonicalPath)
+    (->> (str/split (or (System/getProperty "java.class.path") "")
+                    (re-pattern (java.io.File/pathSeparator)))
+         (map str/trim)
+         (remove str/blank?)
+         (map io/file)
+         (filter #(.exists %))
+         (map #(.getCanonicalPath %))
+         (some #(when (str/ends-with? % (str "agentnet" java.io.File/separator "src"))
+                  %)))
+    (.getCanonicalPath (io/file "agentnet" "src"))))
+
+(defn- run-classpath
+  []
+  (runtime-classpath-entry))
+
+(defn- run-script-path
+  []
+  (if-let [pkg-root (System/getenv "OOMPA_PACKAGE_ROOT")]
+    (.getCanonicalPath (io/file pkg-root "swarm.bb"))
+    (let [cp (io/file (runtime-classpath-entry))
+          ;; cp = <repo>/agentnet/src -> <repo>/swarm.bb
+          repo-root (some-> cp .getParentFile .getParentFile)
+          candidate (when repo-root (io/file repo-root "swarm.bb"))]
+      (if (and candidate (.exists candidate))
+        (.getCanonicalPath candidate)
+        (.getCanonicalPath (io/file "swarm.bb"))))))
+
+(defn- detached-cmd
+  [opts config-file]
+  (cond-> ["bb" "--classpath" (run-classpath) (run-script-path) "swarm"]
+    (:dry-run opts) (conj "--dry-run")
+    true (conj config-file)))
+
+(defn- wait-for-startup!
+  [proc log-file timeout-sec]
+  (loop [waited 0]
+    (let [content (read-file-safe log-file)
+          started? (str/includes? content "Started event written to runs/")
+          alive? (.isAlive proc)]
+      (cond
+        started?
+        {:status :started
+         :content content
+         :swarm-id (extract-swarm-id content)}
+
+        (not alive?)
+        {:status :failed
+         :content content}
+
+        (>= waited timeout-sec)
+        {:status :timeout
+         :content content}
+
+        :else
         (do
-          (println "Simple mode is no longer supported. Use oompa.json or --workers harness:count.")
-          (System/exit 1))))))
+          (Thread/sleep 1000)
+          (recur (inc waited)))))))
+
+(defn- cmd-run-detached
+  [opts config-file]
+  (print-preflight-warnings!)
+  (when-not (.exists (io/file config-file))
+    (println (format "Config not found: %s" config-file))
+    (System/exit 1))
+  (let [timeout-sec (or (:startup-timeout opts)
+                        (parse-int (System/getenv "OOMPA_DETACH_STARTUP_TIMEOUT")
+                                   default-detach-startup-timeout))
+        rid (run-id)
+        log-file (prepare-log-file! rid)
+        cmd (detached-cmd opts config-file)
+        handle (process/process cmd {:out log-file :err log-file :in ""})
+        proc (:proc handle)
+        pid (.pid proc)]
+    (println (format "Config:      %s" config-file))
+    (when (:dry-run opts)
+      (println "Merge mode:  dry-run"))
+    (let [{:keys [status content swarm-id]} (wait-for-startup! proc log-file timeout-sec)]
+      (case status
+        :failed
+        (do
+          (println)
+          (println "ERROR: Detached swarm exited during startup validation.")
+          (println "Startup log excerpt:")
+          (println (tail-lines content 120))
+          (System/exit 1))
+
+        :timeout
+        (do
+          (println)
+          (println (format "WARNING: Detached swarm still initializing after %ss." timeout-sec))
+          (println "Recent startup log lines:")
+          (println (tail-lines content 40)))
+
+        nil)
+      (let [diag (startup-diagnostic-lines content)]
+        (when (seq diag)
+          (println)
+          (println "Startup diagnostics:")
+          (doseq [line diag]
+            (println line))))
+      (println)
+      (println "  ┌──────────────────────────────────────────────────────────────┐")
+      (println "  │  OOMPA SWARM RUN (DETACHED)                               │")
+      (println (format "  │  Run id:   %-46s│" rid))
+      (println (format "  │  PID:      %-46s│" pid))
+      (println (format "  │  Log file: %-46s│" log-file))
+      (println (format "  │  Swarm ID: %-46s│" (or swarm-id "(pending)")))
+      (println "  └──────────────────────────────────────────────────────────────┘")
+      (println))))
+
+(defn- cmd-run-legacy
+  "Run orchestrator once from worker specs (legacy mode)."
+  [opts args]
+  (let [swarm-id (make-swarm-id)]
+    (if-let [specs (:worker-specs opts)]
+      ;; Mixed worker specs: --workers claude:5 opencode:2
+      (let [workers (mapcat
+                      (fn [spec]
+                        (let [{:keys [harness count]} spec]
+                          (map-indexed
+                            (fn [idx _]
+                              (worker/create-worker
+                                {:id (format "%s-%d" (name harness) idx)
+                                 :swarm-id swarm-id
+                                 :harness harness
+                                 :model (:model opts)
+                                 :iterations 1}))
+                            (range count))))
+                      specs)]
+        (println (format "Running once with mixed workers (swarm %s):" swarm-id))
+        (doseq [spec specs]
+          (println (format "  %dx %s" (:count spec) (name (:harness spec)))))
+        (println)
+        (worker/run-workers! workers))
+      ;; Simple mode retired — use oompa.json or --workers harness:count
+      (do
+        (println "Simple mode is no longer supported. Use oompa.json or --workers harness:count.")
+        (System/exit 1)))))
+
+(defn cmd-run
+  "Run swarm from config. Use --detach for background mode."
+  [opts args]
+  (if-let [config-file (resolve-config-file opts args)]
+    (if (:detach opts)
+      (cmd-run-detached opts config-file)
+      (cmd-swarm opts [config-file]))
+    (cmd-run-legacy opts args)))
 
 (defn cmd-loop
   "Run orchestrator N times"
@@ -685,7 +910,7 @@
   (println "Usage: ./swarm.bb <command> [options]")
   (println)
   (println "Commands:")
-  (println "  run              Run all tasks once")
+  (println "  run [file]       Run swarm from config (default: oompa.json, oompa/oompa.json)")
   (println "  loop N           Run N iterations")
   (println "  swarm [file]     Run multiple worker configs from oompa.json (parallel)")
   (println "  tasks            Show task status (pending/current/complete)")
@@ -702,6 +927,9 @@
   (println "Options:")
   (println "  --workers N              Number of parallel workers (default: 2)")
   (println "  --workers H:N [H:N ...]  Mixed workers by harness (e.g., claude:5 opencode:2)")
+  (println "  --config PATH            Config file for run/swarm")
+  (println "  --detach                 Run in background (run command)")
+  (println "  --startup-timeout N      Detached startup validation window in seconds")
   (println "  --iterations N           Number of iterations per worker (default: 1)")
   (println (str "  --harness {" (str/join "," (map name (sort harnesses))) "} Agent harness to use (default: codex)"))
   (println "  --model MODEL            Model to use (e.g., codex:gpt-5.3-codex:medium, claude:opus, gemini:gemini-3-pro-preview)")
@@ -709,6 +937,7 @@
   (println "  --keep-worktrees         Don't cleanup worktrees after run")
   (println)
   (println "Examples:")
+  (println "  ./swarm.bb run --detach --config oompa/oompa_overnight_self_healing.json")
   (println "  ./swarm.bb loop 10 --harness codex --model gpt-5.3-codex --workers 3")
   (println "  ./swarm.bb loop --workers claude:5 opencode:2 --iterations 20")
   (println "  ./swarm.bb swarm oompa.json  # Run multi-model config"))
@@ -735,13 +964,13 @@
 (defn -main [& args]
   (let [[cmd & rest-args] args]
     (if-let [handler (get commands cmd)]
-      (let [{:keys [opts args]} (parse-args rest-args)]
-        (try
-          (handler opts args)
-          (catch Exception e
-            (binding [*out* *err*]
-              (println (format "Error: %s" (.getMessage e))))
-            (System/exit 1))))
+      (try
+        (let [{:keys [opts args]} (parse-args rest-args)]
+          (handler opts args))
+        (catch Exception e
+          (binding [*out* *err*]
+            (println (format "Error: %s" (.getMessage e))))
+          (System/exit 1)))
       (do
         (cmd-help {} [])
         (when cmd

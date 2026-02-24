@@ -191,7 +191,10 @@ cd oompa
 echo "Build a simple todo API with CRUD endpoints" > spec.md
 
 # Run the swarm
-./swarm.bb swarm
+./swarm.bb run
+
+# Run detached with startup validation (fails fast if startup fails)
+./swarm.bb run --detach --config oompa.json
 ```
 
 ## Install (npm)
@@ -212,7 +215,9 @@ oompa swarm
 ## Commands
 
 ```bash
-oompa swarm [file]          # Run from oompa.json (default)
+oompa run [file]            # Run from config (defaults: oompa.json, oompa/oompa.json)
+oompa run --detach --config oompa.json
+oompa swarm [file]          # Direct swarm command (foreground)
 oompa tasks                 # Show task status
 oompa check                 # Check available backends
 oompa cleanup               # Remove worktrees
