@@ -21,6 +21,13 @@ CLAIM(task-001, task-003)
 The framework will claim them atomically and resume you with results: what succeeded, what was already taken, and what's still pending. You can CLAIM again if needed.
 
 Do NOT `mv` task files yourself. The framework owns all task state transitions.
+Always read/write queue files via `{{TASKS_ROOT}}/...` (not hard-coded local `tasks/...` paths).
+
+### Before merge signal
+
+- Before `COMPLETE_AND_READY_FOR_MERGE`, run `git status --short` and ensure your intended deliverable is in tracked files.
+- The framework performs final `git add -A` + `git commit`; you do not need to create the commit manually.
+- If your deliverable is task creation, ensure those `.edn` files are present in `{{TASKS_ROOT}}/pending/` so other workers can claim them.
 
 ### Signals
 

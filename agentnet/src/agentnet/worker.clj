@@ -75,8 +75,8 @@
         local-tasks (io/file cwd-file "tasks")
         parent-tasks (some-> cwd-file .getParentFile (io/file "tasks"))]
     (cond
-      (.exists local-tasks) "tasks"
       (and parent-tasks (.exists parent-tasks)) "../tasks"
+      (.exists local-tasks) "tasks"
       :else "tasks")))
 
 (defn- render-task-header
