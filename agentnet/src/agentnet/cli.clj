@@ -383,12 +383,37 @@
     (:dry-run opts) (conj "--dry-run")
     true (conj config-file)))
 
+(defn- shell-quote
+  [s]
+  (str "'" (str/replace (str s) "'" "'\"'\"'") "'"))
+
+(defn- spawn-detached!
+  [cmd log-file]
+  (let [script (str "nohup "
+                    (str/join " " (map shell-quote cmd))
+                    " >> " (shell-quote log-file)
+                    " 2>&1 < /dev/null & echo $!")
+        result (process/sh ["bash" "-lc" script] {:out :string :err :string})
+        pid-str (some-> (:out result) str/trim)]
+    (when-not (zero? (:exit result))
+      (throw (ex-info "Failed to spawn detached swarm process"
+                      {:exit (:exit result) :err (:err result)})))
+    (when-not (re-matches #"\d+" (or pid-str ""))
+      (throw (ex-info "Detached spawn did not return a PID"
+                      {:out (:out result) :err (:err result)})))
+    (Long/parseLong pid-str)))
+
+(defn- pid-alive?
+  [pid]
+  (zero? (:exit (process/sh ["kill" "-0" (str pid)]
+                            {:out :string :err :string}))))
+
 (defn- wait-for-startup!
-  [proc log-file timeout-sec]
+  [pid log-file timeout-sec]
   (loop [waited 0]
     (let [content (read-file-safe log-file)
           started? (str/includes? content "Started event written to runs/")
-          alive? (.isAlive proc)]
+          alive? (pid-alive? pid)]
       (cond
         started?
         {:status :started
@@ -420,13 +445,11 @@
         rid (run-id)
         log-file (prepare-log-file! rid)
         cmd (detached-cmd opts config-file)
-        handle (process/process cmd {:out log-file :err log-file :in ""})
-        proc (:proc handle)
-        pid (.pid proc)]
+        pid (spawn-detached! cmd log-file)]
     (println (format "Config:      %s" config-file))
     (when (:dry-run opts)
       (println "Merge mode:  dry-run"))
-    (let [{:keys [status content swarm-id]} (wait-for-startup! proc log-file timeout-sec)]
+    (let [{:keys [status content swarm-id]} (wait-for-startup! pid log-file timeout-sec)]
       (case status
         :failed
         (do
