@@ -76,6 +76,7 @@
                :model nil
                :dry-run false
                :detach false
+               :all false
                :config-file nil
                :startup-timeout nil
                :iterations 1
@@ -118,6 +119,10 @@
 
         (or (= arg "--detach") (= arg "--dettach"))
         (recur (assoc opts :detach true)
+               (next remaining))
+
+        (= arg "--all")
+        (recur (assoc opts :all true)
                (next remaining))
 
         (= arg "--startup-timeout")
@@ -646,6 +651,24 @@
   [{:keys [harness model reasoning]}]
   (str harness ":" model (when reasoning (str ":" reasoning))))
 
+(defn- run-metrics
+  "Summarize cycle metrics for a run."
+  [cycles]
+  (let [merged (count (filter #(= "merged" (:outcome %)) cycles))
+        failed (count (filter #(error-outcomes (:outcome %)) cycles))
+        claimed-all (->> cycles
+                         (mapcat #(or (:claimed-task-ids %) []))
+                         (remove str/blank?))
+        completed-ids (->> cycles
+                           (filter #(= "merged" (:outcome %)))
+                           (mapcat #(or (:claimed-task-ids %) []))
+                           (remove str/blank?)
+                           set)]
+    {:merged merged
+     :failed failed
+     :claimed (count (set claimed-all))
+     :completed (count completed-ids)}))
+
 (defn- cmd-view-one
   [swarm-id]
   (if-let [started (runs/read-started swarm-id)]
@@ -654,6 +677,7 @@
           reviews (or (runs/list-reviews swarm-id) [])
           workers (or (:workers started) [])
           run-state* (run-state started stopped)
+          metrics (run-metrics cycles)
           latest-by-worker (latest-cycles-by-worker cycles)]
       (println (format "Swarm:   %s" swarm-id))
       (println (format "State:   %s" run-state*))
@@ -662,10 +686,10 @@
       (println (format "Config:  %s" (or (:config-file started) "N/A")))
       (when stopped
         (println (format "Stopped: %s" (:stopped-at stopped))))
-      (println (format "Cycles:  %d  (merged=%d, errors=%d)"
-                       (count cycles)
-                       (count (filter #(= "merged" (:outcome %)) cycles))
-                       (count (filter #(error-outcomes (:outcome %)) cycles))))
+      (println (format "Cycles:  %d" (count cycles)))
+      (println (format "PRs:     merged=%d failed=%d" (:merged metrics) (:failed metrics)))
+      (println (format "Tasks:   claimed=%d completed=%d created=n/a"
+                       (:claimed metrics) (:completed metrics)))
       (println (format "Reviews: %d" (count reviews)))
       (println)
       (println "Workers:")
@@ -684,45 +708,54 @@
       (println (format "Swarm not found: %s" swarm-id))
       (System/exit 1))))
 
-(defn cmd-view
-  "List all swarms with liveness + worker activity summary.
-   Pass a swarm-id to inspect per-worker runtime details."
+(defn cmd-list
+  "List recent swarms with liveness + activity metrics.
+   Default: 20 most recent. Use --all for full history."
   [opts args]
   (let [run-ids (or (runs/list-runs) [])]
     (if-not (seq run-ids)
       (println "No swarm runs found.")
-      (if-let [swarm-id (first args)]
-        (cmd-view-one swarm-id)
-        (do
-          (println "Swarm Runs:")
-          (println "ID       | State            | PID    | Workers | Active | Cycles | Merged | Errors | Started")
-          (println "---------+------------------+--------+---------+--------+--------+--------+--------+-------------------------")
-          (doseq [rid run-ids]
-            (let [started (runs/read-started rid)
-                  stopped (runs/read-stopped rid)
-                  cycles (or (runs/list-cycles rid) [])
-                  workers (or (:workers started) [])
-                  latest-by-worker (latest-cycles-by-worker cycles)
-                  state* (run-state started stopped)
-                  active-count (if (= state* "running")
-                                 (count (filter (fn [w]
-                                                  (let [latest (get latest-by-worker (:id w))]
-                                                    (< (or (:cycle latest) 0)
-                                                       (or (:iterations w) 0))))
-                                                workers))
-                                 0)]
-              (println (format "%-8s | %-16s | %-6s | %7d | %6d | %6d | %6d | %6d | %s"
-                               rid
-                               state*
-                               (or (:pid started) "-")
-                               (count workers)
-                               active-count
-                               (count cycles)
-                               (count (filter #(= "merged" (:outcome %)) cycles))
-                               (count (filter #(error-outcomes (:outcome %)) cycles))
-                               (or (:started-at started) "-")))))
-          (println)
-          (println "Tip: use `oompa view <swarm-id>` for per-worker status."))))))
+      (let [shown (if (:all opts) run-ids (take 20 run-ids))]
+        (println "Swarm Runs:")
+        (println "ID       | State            | PID    | Workers | Active | Cycles | Merged | Failed | Done | Started")
+        (println "---------+------------------+--------+---------+--------+--------+--------+--------+------+-------------------------")
+        (doseq [rid shown]
+          (let [started (runs/read-started rid)
+                stopped (runs/read-stopped rid)
+                cycles (or (runs/list-cycles rid) [])
+                workers (or (:workers started) [])
+                metrics (run-metrics cycles)
+                latest-by-worker (latest-cycles-by-worker cycles)
+                state* (run-state started stopped)
+                active-count (if (= state* "running")
+                               (count (filter (fn [w]
+                                                (let [latest (get latest-by-worker (:id w))]
+                                                  (< (or (:cycle latest) 0)
+                                                     (or (:iterations w) 0))))
+                                              workers))
+                               0)]
+            (println (format "%-8s | %-16s | %-6s | %7d | %6d | %6d | %6d | %6d | %4d | %s"
+                             rid
+                             state*
+                             (or (:pid started) "-")
+                             (count workers)
+                             active-count
+                             (count cycles)
+                             (:merged metrics)
+                             (:failed metrics)
+                             (:completed metrics)
+                             (or (:started-at started) "-")))))
+        (when (and (not (:all opts)) (> (count run-ids) 20))
+          (println (format "\nShowing 20 of %d runs. Use --all for full history." (count run-ids))))
+        (println)
+        (println "Use `oompa view <swarm-id>` for detailed single-swarm info.")))))
+
+(defn cmd-view
+  "Show detailed runtime for one swarm (default: latest run)."
+  [opts args]
+  (if-let [swarm-id (or (first args) (first (runs/list-runs)))]
+    (cmd-view-one swarm-id)
+    (println "No swarm runs found.")))
 
 (defn cmd-worktrees
   "List worktree status"
@@ -1038,8 +1071,8 @@
   (println "  tasks            Show task status (pending/current/complete)")
   (println "  prompt \"...\"     Run ad-hoc prompt")
   (println "  status           Show last run summary")
-  (println "  view [swarm-id]  List swarms or show per-worker runtime status")
-  (println "  list [swarm-id]  Alias for view")
+  (println "  list             List recent swarms (default: 20, --all for full history)")
+  (println "  view [swarm-id]  Show detailed single-swarm runtime (default: latest)")
   (println "  worktrees        List worktree status")
   (println "  stop [swarm-id]  Stop swarm gracefully (finish current cycle)")
   (println "  kill [swarm-id]  Kill swarm immediately (SIGKILL)")
@@ -1051,6 +1084,7 @@
   (println "Options:")
   (println "  --workers N              Number of parallel workers (default: 2)")
   (println "  --workers H:N [H:N ...]  Mixed workers by harness (e.g., claude:5 opencode:2)")
+  (println "  --all                    Show full history for list command")
   (println "  --config PATH            Config file for run/swarm")
   (println "  --detach                 Run in background (run command)")
   (println "  --startup-timeout N      Detached startup validation window in seconds")
@@ -1061,6 +1095,9 @@
   (println "  --keep-worktrees         Don't cleanup worktrees after run")
   (println)
   (println "Examples:")
+  (println "  ./swarm.bb list")
+  (println "  ./swarm.bb list --all")
+  (println "  ./swarm.bb view 6cd50f5a")
   (println "  ./swarm.bb run --detach --config oompa/oompa_overnight_self_healing.json")
   (println "  ./swarm.bb loop 10 --harness codex --model gpt-5.3-codex --workers 3")
   (println "  ./swarm.bb loop --workers claude:5 opencode:2 --iterations 20")
@@ -1077,8 +1114,8 @@
    "tasks" cmd-tasks
    "prompt" cmd-prompt
    "status" cmd-status
+   "list" cmd-list
    "view" cmd-view
-   "list" cmd-view
    "stop" cmd-stop
    "kill" cmd-kill
    "worktrees" cmd-worktrees
