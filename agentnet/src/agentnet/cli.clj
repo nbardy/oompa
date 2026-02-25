@@ -914,6 +914,7 @@
                            :prompts (:prompt wc)
                            :can-plan (:can_plan wc)
                            :wait-between (:wait_between wc)
+                           :max-wait-for-tasks (:max_wait_for_tasks wc)
                            :max-working-resumes (:max_working_resumes wc)
                            :review-harness (:harness review-parsed)
                            :review-model (:model review-parsed)

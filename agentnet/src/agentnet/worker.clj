@@ -90,6 +90,7 @@
         (str/replace "{TASKS_ROOT}" task-root))))
 
 (def ^:private default-max-working-resumes 5)
+(def ^:private default-max-wait-for-tasks 600)
 
 (defn create-worker
   "Create a worker config.
@@ -98,10 +99,11 @@
    :reasoning reasoning effort level (e.g. \"low\", \"medium\", \"high\") — codex only.
    :review-prompts paths to reviewer prompt files (loaded and concatenated for review).
    :wait-between seconds to sleep between iterations (nil or 0 = no wait).
+   :max-wait-for-tasks max seconds a non-planner waits for tasks before giving up (default 600).
    :max-working-resumes max consecutive working resumes before nudge+kill (default 5)."
   [{:keys [id swarm-id harness model iterations prompts can-plan reasoning
            review-harness review-model review-prompts wait-between
-           max-working-resumes]}]
+           max-working-resumes max-wait-for-tasks]}]
   {:id id
    :swarm-id swarm-id
    :harness (or harness :codex)
@@ -114,6 +116,10 @@
    :can-plan (if (some? can-plan) can-plan true)
    :reasoning reasoning
    :wait-between (when (and wait-between (pos? wait-between)) wait-between)
+   :max-wait-for-tasks (let [v (or max-wait-for-tasks default-max-wait-for-tasks)]
+                         (if (and (number? v) (pos? v))
+                           v
+                           default-max-wait-for-tasks))
    :review-harness review-harness
    :review-model review-model
    :review-prompts (cond
@@ -681,27 +687,26 @@
 ;; Worker Loop
 ;; =============================================================================
 
-;; Workers wait up to 10 minutes for tasks to appear before giving up.
+;; Workers can wait for tasks before giving up; default is 10 minutes.
 ;; This keeps workers alive while planners/designers ramp up the queue.
-(def ^:private max-wait-for-tasks 600)
 (def ^:private wait-poll-interval 10)
 (def ^:private max-consecutive-errors 3)
 
 (defn- wait-for-tasks!
-  "Wait up to 10 minutes for pending/current tasks to appear. Used for
-   backpressure on workers that can't create their own tasks (can_plan: false).
+  "Wait up to max-wait-seconds for pending/current tasks to appear.
+   Used for backpressure on workers that can't create their own tasks (can_plan: false).
    Polls every 10 seconds, logs every 60 seconds."
-  [worker-id]
+  [worker-id max-wait-seconds]
   (loop [waited 0]
     (cond
       (pos? (tasks/pending-count)) true
       (pos? (tasks/current-count)) true
-      (>= waited max-wait-for-tasks)
+      (>= waited max-wait-seconds)
       (do (println (format "[%s] No tasks after %ds, giving up" worker-id waited))
           false)
       :else
       (do (when (zero? (mod waited 60))
-            (println (format "[%s] Waiting for tasks... (%ds/%ds)" worker-id waited max-wait-for-tasks)))
+            (println (format "[%s] Waiting for tasks... (%ds/%ds)" worker-id waited max-wait-seconds)))
           (Thread/sleep (* wait-poll-interval 1000))
           (recur (+ waited wait-poll-interval))))))
 
@@ -724,7 +729,7 @@
    Returns final worker state with metrics attached."
   [worker]
   (tasks/ensure-dirs!)
-  (let [{:keys [id iterations swarm-id wait-between]} worker
+  (let [{:keys [id iterations swarm-id wait-between max-wait-for-tasks]} worker
         project-root (System/getProperty "user.dir")]
     (println (format "[%s] Starting worker (%s:%s%s, %d iterations%s)"
                      id
@@ -736,7 +741,7 @@
 
     ;; Backpressure: workers that can't create tasks wait for tasks to exist
     (when-not (:can-plan worker)
-      (wait-for-tasks! id))
+      (wait-for-tasks! id max-wait-for-tasks))
 
     ;; metrics tracks: {:merges N :rejections N :errors N :recycled N :review-rounds-total N :claims N}
     (loop [iter 1
@@ -790,7 +795,7 @@
                      (not (pos? (tasks/pending-count)))
                      (not (pos? (tasks/current-count))))
             (println (format "[%s] Queue empty, waiting for tasks before iteration %d" id iter))
-            (wait-for-tasks! id))
+            (wait-for-tasks! id max-wait-for-tasks))
 
           ;; Ensure worktree exists (create fresh if nil, reuse if persisted)
           (let [wt-state (try
