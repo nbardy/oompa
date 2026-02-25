@@ -379,29 +379,27 @@
 
 (defn- detached-cmd
   [opts config-file]
-  (cond-> ["bb" "--classpath" (run-classpath) (run-script-path) "swarm"]
+  (cond-> ["nohup" "bb" "--classpath" (run-classpath) (run-script-path) "swarm"]
     (:dry-run opts) (conj "--dry-run")
     true (conj config-file)))
 
-(defn- shell-quote
-  [s]
-  (str "'" (str/replace (str s) "'" "'\"'\"'") "'"))
-
 (defn- spawn-detached!
   [cmd log-file]
-  (let [script (str "nohup "
-                    (str/join " " (map shell-quote cmd))
-                    " >> " (shell-quote log-file)
-                    " 2>&1 < /dev/null & echo $!")
-        result (process/sh ["bash" "-lc" script] {:out :string :err :string})
-        pid-str (some-> (:out result) str/trim)]
-    (when-not (zero? (:exit result))
-      (throw (ex-info "Failed to spawn detached swarm process"
-                      {:exit (:exit result) :err (:err result)})))
-    (when-not (re-matches #"\d+" (or pid-str ""))
-      (throw (ex-info "Detached spawn did not return a PID"
-                      {:out (:out result) :err (:err result)})))
-    (Long/parseLong pid-str)))
+  (let [log (io/file log-file)
+        pb (doto (ProcessBuilder. ^java.util.List cmd)
+             (.directory (io/file "."))
+             (.redirectInput (java.lang.ProcessBuilder$Redirect/from (io/file "/dev/null")))
+             (.redirectOutput (java.lang.ProcessBuilder$Redirect/appendTo log))
+             (.redirectError (java.lang.ProcessBuilder$Redirect/appendTo log)))
+        proc (.start pb)
+        pid (.pid proc)]
+    ;; Give spawn a short window before validation checks liveness.
+    (Thread/sleep 100)
+    (when-not (pid-alive? pid)
+      (throw (ex-info "Detached spawn process died immediately"
+                      {:cmd cmd
+                       :log-file log-file})))
+    pid))
 
 (defn- pid-alive?
   [pid]
