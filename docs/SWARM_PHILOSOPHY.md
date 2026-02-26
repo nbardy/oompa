@@ -2,7 +2,7 @@
 
 When designing a swarm, you are not writing code; you are designing an **information flow**. You are managing how ambiguity is processed into deterministic tasks.
 
-## The Meta-Principles of Swarm Engineering
+## Part 1: The Meta-Principles of Swarm Engineering
 
 ### 1. The Principle of Artificial Generalism
 "Do not handicap an oracle to simulate a human."
@@ -37,25 +37,37 @@ In a swarm, shared reality drifts instantly. If 10 agents run for an hour, the d
 
 ---
 
-## Technical Configuration Patterns
+## Part 2: The Philosophy of Oompa Swarm Design
 
-When writing \`oompa.json\`, apply the philosophy through these patterns:
+### 1. The "Generalist Founder" Principle (Anti-Specialization)
+Unlike humans, an LLM does not need to forget how to code in order to be a good game designer. Over-constraining an agent with a hyper-specific persona ("You only write CSS", "You only do math") cripples their greatest strength: cross-domain intuition.
+* The Theory: A "Game Designer" agent should consider latency implications while designing a mechanic. An "Execution Engineer" should push back on a mechanic if it fundamentally breaks the UI flow.
+* The Implication: We should not write prompts that put blinders on the agents. Instead, roles should be defined by the tasks they are allowed to pull from the queue, not by artificially capping their intelligence. Every lead agent should essentially be prompted as a "Technical Founder" whose current focus just happens to be a specific domain.
 
-1. **Gate Planning by Phase, Not by Count:**
-   You can have many planners (\`can_plan: true\`), but they must be structured to prevent them from overwriting each other's work in chaos. Use tag-based routing so one planner handles `#backend-design` and another handles `#frontend-design`, or use a sequential file-based pipeline where planners hand off markdown files to each other.
+### 2. The Waterfall of Design vs. The Flat Field of Execution
+Oompa Loompas are designed to operate as a flat, asynchronous field (not a rigid Directed Acyclic Graph). They can hallucinate dependencies, build stubs, and integrate later. However, you accurately noted the one exception: Design.
+* Design is inherently Waterfall: You cannot parallelize finding "the core loop of a game." Ideation, critique, and refinement must happen in a tight, sequential loop. Only after the core theory converges into an artifact (a Markdown spec) can the swarm fan out.
+* Engineering is Flat: Once the artifact exists, engineering can happen in parallel. You don't need a rigid DAG because LLMs can assume the shape of dependent work (e.g., frontend can mock the backend API until the backend agent finishes it).
 
-2. **Restrict Execution-Only Models (\`can_plan: false\`):**
-   If a model is deployed purely for velocity and volume, it MUST have \`can_plan: false\`. Their prompt must explicitly forbid creating new tasks. They only consume existing task files.
+### 3. The Token/Speed Tradeoff (Cost is a Feature)
+We do not shy away from burning tokens when it matters.
+* High-Cost Planning (The Slow Squeeze): Spending massive tokens on a slow, intelligent model (opus, codex:xhigh) upfront to produce a dense, mathematically sound plan is the best investment you can make. It removes ambiguity.
+* Low-Cost Execution (The Fast Swarm): When a plan has zero ambiguity, high intelligence is wasted. We trade intelligence for speed and concurrency. We deploy 10 fast, cheap models (haiku, kimi) to slam out the code. If they fail, they fail fast, and the high-level Reviewer catches it.
+* The Constant Reviewer: The final gatekeeper must always be a high-tier model. They reflect, critique, and enforce the high standard on the cheap work produced by the swarm.
 
-3. **Patience for Executors (\`max_wait_for_tasks\`):**
-   If your Planners are slow models reading a massive codebase, the Executors will time out waiting for the first task. Set \`max_wait_for_tasks\` high (e.g., 1800 / 30 minutes) on executors to give the Planners time to work.
+---
 
-4. **The Code Standard Sandbox Prompting:**
-   For simple executors, inject an exact code block in their prompt showing how to import, how to query the DB, and how to throw errors. Do not rely on cheap models reading the whole codebase to infer conventions.
+## Part 3: Concepts to Extract to the Skill Doc
 
-## Tag-Based Task Routing
+1. **The Shape of the Queue Determines the Swarm:**
+   * If the goal is Design (divergent), use the filesystem (Markdown files moving through folders) to force a sequential waterfall.
+   * If the goal is Execution (convergent), use the EDN task queue to enable flat, massively parallel work.
 
-Use tags in the EDN task queue to cleanly coordinate parallel planning and execution without collisions.
-* **Planners/Directors:** Output high-level epics tagged \`#meta-task\`.
-* **Architects:** Consume \`#meta-task\` and break them down into type-safe, dense \`#eng-task\` files.
-* **Executors:** ONLY claim tasks tagged \`#eng-task\`.
+2. **Tag-Based Routing over Permission Silos:**
+   * Stop trying to control agents by turning off their brains. Control them by tagging the work. Give them all access to the full context, but tell the "Executors" to only pick up #eng-task files, and the "Directors" to only pick up #meta-task files.
+
+3. **The "Docs Architect" Pattern:**
+   * In any swarm that lasts longer than an hour, documentation drifts. You must dedicate one high-tier, low-iteration agent to continuously read, consolidate, and clean the central .md specs so the Executors don't get confused by stale rules.
+
+4. **The Stub & Smooth Principle:**
+   * Teach agents explicitly not to wait for dependencies. If an executor is building the UI and the API doesn't exist yet, the prompt must explicitly encourage them to write a mock/stub, merge it, and let the swarm smooth it out in a later iteration. This is the secret to unlocking true flat parallelism.
