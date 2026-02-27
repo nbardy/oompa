@@ -48,7 +48,14 @@
 (def merge-strategies #{:fast-forward :no-ff :squash :rebase})
 (def conflict-resolutions #{:ours :theirs :manual :abort})
 
-(defn agent-type? [x] (contains? agent-types x))
+(defn- gemini-indexed-account?
+  [x]
+  (and (keyword? x)
+       (re-matches #"^gemini\d+$" (name x))))
+
+(defn agent-type? [x]
+  (or (contains? agent-types x)
+      (gemini-indexed-account? x)))
 (defn agent-role? [x] (contains? agent-roles x))
 (defn task-status? [x] (contains? task-statuses x))
 (defn worktree-status? [x] (contains? worktree-statuses x))

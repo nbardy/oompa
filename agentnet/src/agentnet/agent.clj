@@ -88,16 +88,39 @@
       attach (into ["--attach" attach])
       true (conj prompt))))
 
-(defmethod build-command :gemini
-  [_ {:keys [model]} prompt cwd]
-  (cond-> ["gemini" "--yolo"]
+(defn- gemini-cmd
+  [agent-type model prompt]
+  (cond-> [(name agent-type) "--yolo"]
     model (into ["-m" model])
     true (into ["-p" prompt])))
 
+(defn- gemini-alias?
+  [agent-type]
+  (and (keyword? agent-type)
+       (re-matches #"^gemini\\d+$" (name agent-type))))
+
+(defmethod build-command :gemini
+  [_ {:keys [model]} prompt cwd]
+  (gemini-cmd :gemini model prompt))
+
+(defmethod build-command :gemini1
+  [agent-type {:keys [model]} prompt cwd]
+  (gemini-cmd agent-type model prompt))
+
+(defmethod build-command :gemini2
+  [agent-type {:keys [model]} prompt cwd]
+  (gemini-cmd agent-type model prompt))
+
+(defmethod build-command :gemini3
+  [agent-type {:keys [model]} prompt cwd]
+  (gemini-cmd agent-type model prompt))
+
 (defmethod build-command :default
-  [agent-type _ _ _]
-  (throw (ex-info (str "Unknown agent type: " agent-type)
-                  {:agent-type agent-type})))
+  [agent-type {:keys [model]} prompt _]
+  (if (gemini-alias? agent-type)
+    (gemini-cmd agent-type model prompt)
+    (throw (ex-info (str "Unknown agent type: " agent-type)
+                    {:agent-type agent-type}))))
 
 ;; =============================================================================
 ;; Process Execution
@@ -396,12 +419,13 @@
 (defn check-available
   "Check if agent backend is available"
   [agent-type]
-  (let [cmd (case agent-type
-              :codex ["codex" "--version"]
-              :claude ["claude" "--version"]
-              :opencode ["opencode" "--version"]
-              :gemini ["gemini" "--version"]
-              ["echo" "unknown"])]
+  (let [cmd (cond
+              (= :codex agent-type) ["codex" "--version"]
+              (= :claude agent-type) ["claude" "--version"]
+              (= :opencode agent-type) ["opencode" "--version"]
+              (= :gemini agent-type) ["gemini" "--version"]
+              (gemini-alias? agent-type) [(name agent-type) "--version"]
+              :else ["echo" "unknown"])]
     (try
       (let [{:keys [exit]} (process/sh cmd {:out :string :err :string})]
         (zero? exit))

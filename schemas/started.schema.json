@@ -17,7 +17,12 @@
         "required": ["id", "harness", "model", "iterations", "can-plan", "prompts"],
         "properties": {
           "id": { "type": "string" },
-          "harness": { "type": "string", "enum": ["codex", "claude", "opencode", "gemini"] },
+          "harness": {
+            "oneOf": [
+              { "type": "string", "enum": ["codex", "claude", "opencode", "gemini"] },
+              { "type": "string", "pattern": "^gemini\\d+$" }
+            ]
+          },
           "model": { "type": "string" },
           "reasoning": { "type": ["string", "null"] },
           "iterations": { "type": "integer", "minimum": 1 },
@@ -30,7 +35,12 @@
     "planner": {
       "type": ["object", "null"],
       "properties": {
-        "harness": { "type": "string", "enum": ["codex", "claude", "opencode", "gemini"] },
+        "harness": {
+          "oneOf": [
+            { "type": "string", "enum": ["codex", "claude", "opencode", "gemini"] },
+            { "type": "string", "pattern": "^gemini\\d+$" }
+          ]
+        },
         "model": { "type": "string" },
         "prompts": { "type": "array", "items": { "type": "string" } },
         "max-pending": { "type": "integer", "minimum": 1 }
@@ -40,7 +50,12 @@
     "reviewer": {
       "type": ["object", "null"],
       "properties": {
-        "harness": { "type": "string", "enum": ["codex", "claude", "opencode", "gemini"] },
+        "harness": {
+          "oneOf": [
+            { "type": "string", "enum": ["codex", "claude", "opencode", "gemini"] },
+            { "type": "string", "pattern": "^gemini\\d+$" }
+          ]
+        },
         "model": { "type": "string" },
         "prompts": { "type": "array", "items": { "type": "string" } }
       },

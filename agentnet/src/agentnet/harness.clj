@@ -94,11 +94,29 @@
 ;;   :session - session ID strategy (:uuid, :extracted, :implicit)
 ;;   :output  - output format (:plain or :ndjson)
 
+(def ^:private gemini-behavior
+  {:stdin :close :session :implicit :output :ndjson})
+
 (def registry
-  {:codex    {:stdin :close   :session :uuid      :output :plain}
-   :claude   {:stdin :prompt  :session :uuid      :output :plain}
-   :opencode {:stdin :close   :session :extracted  :output :ndjson}
-   :gemini   {:stdin :close   :session :implicit   :output :ndjson}})
+  (merge
+   {:codex    {:stdin :close   :session :uuid      :output :plain}
+    :claude   {:stdin :prompt  :session :uuid      :output :plain}
+    :opencode {:stdin :close   :session :extracted  :output :ndjson}
+    :gemini   gemini-behavior}
+   {:gemini1 gemini-behavior
+    :gemini2 gemini-behavior
+    :gemini3 gemini-behavior}))
+
+(defn- gemini-alias?
+  [harness-kw]
+  (and (keyword? harness-kw)
+       (re-matches #"^gemini\\d+$" (name harness-kw))))
+
+(defn valid-harness?
+  "True for explicit registry entries and any `geminiNN` alias."
+  [harness-kw]
+  (or (contains? (set (keys registry)) harness-kw)
+      (gemini-alias? harness-kw)))
 
 ;; =============================================================================
 ;; Registry Access
@@ -108,6 +126,7 @@
   "Look up harness config. Throws on unknown harness (no silent fallback)."
   [harness-kw]
   (or (get registry harness-kw)
+      (when (gemini-alias? harness-kw) gemini-behavior)
       (throw (ex-info (str "Unknown harness: " harness-kw
                            ". Known: " (str/join ", " (map name (keys registry))))
                       {:harness harness-kw}))))
