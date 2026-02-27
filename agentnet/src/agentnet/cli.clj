@@ -166,19 +166,14 @@
 (declare cmd-swarm parse-model-string pid-alive?)
 
 (defn- check-git-clean!
-  "Abort if git working tree is dirty. Dirty index causes merge conflicts
-   and wasted worker iterations."
+  "Warn if git working tree is dirty. Dirty index may cause merge conflicts."
   []
   (let [result (process/sh ["git" "status" "--porcelain"]
                            {:out :string :err :string})
         output (str/trim (:out result))]
     (when (and (zero? (:exit result)) (not (str/blank? output)))
-      (println "ERROR: Git working tree is dirty. Resolve before running swarm.")
-      (println)
-      (println output)
-      (println)
-      (println "Run 'git stash' or 'git commit' first.")
-      (System/exit 1))))
+      (println "WARNING: Git working tree is dirty. You may experience merge conflicts.")
+      (println output))))
 
 (defn- check-stale-worktrees!
   "Abort if stale oompa worktrees or branches exist from a prior run.
@@ -222,12 +217,15 @@
 
 (defn- probe-model
   "Send 'say ok' to a model via its harness CLI. Returns true if model responds.
-   Uses harness/build-probe-cmd for the command, /dev/null stdin to prevent hang."
+   Uses harness/build-probe-cmd for the command.
+   For stdin-based harnesses (e.g. claude), delivers the probe prompt via stdin.
+   For close-stdin harnesses, uses /dev/null to prevent hang."
   [harness-kw model]
   (try
     (let [cmd (harness/build-probe-cmd harness-kw model)
-          null-in (io/input-stream (io/file "/dev/null"))
-          proc (process/process cmd {:out :string :err :string :in null-in})
+          probe-prompt "[_HIDE_TEST_] say ok"
+          stdin-val (harness/process-stdin harness-kw probe-prompt)
+          proc (process/process cmd {:out :string :err :string :in stdin-val})
           result (deref proc 30000 :timeout)]
       (if (= result :timeout)
         (do (.destroyForcibly (:proc proc)) false)
@@ -395,10 +393,6 @@
         pid (.pid proc)]
     ;; Give spawn a short window before validation checks liveness.
     (Thread/sleep 100)
-    (when-not (pid-alive? pid)
-      (throw (ex-info "Detached spawn process died immediately"
-                      {:cmd cmd
-                       :log-file log-file})))
     pid))
 
 (defn- pid-alive?
@@ -569,46 +563,72 @@
       (orchestrator/run-once! opts))))
 
 (defn cmd-status
-  "Show status of last run — reads event-sourced runs/{swarm-id}/ data."
+  "Show running swarms."
   [opts args]
   (let [run-ids (runs/list-runs)]
     (if (seq run-ids)
-      (let [swarm-id (or (first args) (first run-ids))
-            started (runs/read-started swarm-id)
-            stopped (runs/read-stopped swarm-id)
-            cycles (runs/list-cycles swarm-id)
-            reviews (runs/list-reviews swarm-id)]
-        (println (format "Swarm: %s" swarm-id))
-        (when started
-          (println (format "  Started: %s" (:started-at started)))
-          (println (format "  PID:     %s" (or (:pid started) "N/A")))
-          (println (format "  Config:  %s" (or (:config-file started) "N/A")))
-          (println (format "  Workers: %d" (count (:workers started)))))
-        (println)
-        (if stopped
-          (println (format "Stopped: %s (reason: %s%s)"
-                           (:stopped-at stopped)
-                           (:reason stopped)
-                           (if (:error stopped)
-                             (str ", error: " (:error stopped))
-                             "")))
-          (println "  (still running — no stopped event yet)"))
-        (when (seq cycles)
-          (println)
-          (println (format "Cycles: %d total" (count cycles)))
-          (doseq [c cycles]
-            (println (format "  %s-c%d: %s (%dms, claimed: %s)"
-                             (:worker-id c) (:cycle c)
-                             (:outcome c)
-                             (or (:duration-ms c) 0)
-                             (str/join ", " (or (:claimed-task-ids c) []))))))
-        (when (seq reviews)
-          (println)
-          (println (format "Reviews: %d total" (count reviews)))
-          (doseq [r reviews]
-            (println (format "  %s-c%d-r%d: %s"
-                             (:worker-id r) (:cycle r) (:round r)
-                             (:verdict r))))))
+      (let [running (for [id run-ids
+                          :let [started (runs/read-started id)
+                                stopped (runs/read-stopped id)
+                                pid (:pid started)]
+                          :when (and started (not stopped) pid (pid-alive? pid))]
+                      {:id id 
+                       :pid pid 
+                       :workers (count (:workers started))
+                       :work-count (count (runs/list-cycles id))})]
+        (if (seq running)
+          (do
+            (println (format "Running Swarms: %d" (count running)))
+            (doseq [r running]
+              (println (format "  Swarm: %s | PID: %s | Workers: %d | Work Count: %d" 
+                               (:id r) (:pid r) (:workers r) (:work-count r)))))
+          (println "No running swarms.")))
+      (println "No swarms found."))))
+
+(defn cmd-info
+  "Show detailed information of a swarm run — reads event-sourced runs/{swarm-id}/ data."
+  [opts args]
+  (let [run-ids (runs/list-runs)]
+    (if (seq run-ids)
+      (let [target-ids (if (seq args) [(first args)] run-ids)]
+        (doseq [swarm-id target-ids]
+          (let [started (runs/read-started swarm-id)
+                stopped (runs/read-stopped swarm-id)
+                cycles (runs/list-cycles swarm-id)
+                reviews (runs/list-reviews swarm-id)]
+            (println "--------------------------------------------------")
+            (println (format "Swarm: %s" swarm-id))
+            (when started
+              (println (format "  Started: %s" (:started-at started)))
+              (println (format "  PID:     %s" (or (:pid started) "N/A")))
+              (println (format "  Config:  %s" (or (:config-file started) "N/A")))
+              (println (format "  Workers: %d" (count (:workers started)))))
+            (println)
+            (if stopped
+              (println (format "Stopped: %s (reason: %s%s)"
+                               (:stopped-at stopped)
+                               (:reason stopped)
+                               (if (:error stopped)
+                                 (str ", error: " (:error stopped))
+                                 "")))
+              (println "  (still running — no stopped event yet)"))
+            (when (seq cycles)
+              (println)
+              (println (format "Cycles: %d total" (count cycles)))
+              (doseq [c cycles]
+                (println (format "  %s-c%d: %s (%dms, claimed: %s)"
+                                 (:worker-id c) (:cycle c)
+                                 (:outcome c)
+                                 (or (:duration-ms c) 0)
+                                 (str/join ", " (or (:claimed-task-ids c) []))))))
+            (when (seq reviews)
+              (println)
+              (println (format "Reviews: %d total" (count reviews)))
+              (doseq [r reviews]
+                (println (format "  %s-c%d-r%d: %s"
+                                 (:worker-id r) (:cycle r) (:round r)
+                                 (:verdict r)))))
+            (println))))
       ;; Fall back to legacy JSONL format
       (let [runs-dir (io/file "runs")
             files (when (.exists runs-dir)
@@ -630,6 +650,9 @@
 
 (def ^:private error-outcomes
   #{"error" "merge-failed" "rejected" "stuck"})
+
+(def ^:private terminal-run-outcomes
+  #{"merged" "rejected" "error" "merge-failed" "sync-failed" "stuck" "no-changes"})
 
 (defn- run-state
   "Derive run lifecycle state from started/stopped events + PID liveness."
@@ -655,12 +678,12 @@
 
 (defn- worker-runtime
   "Best-effort worker runtime classification for view output."
-  [worker latest-cycle run-state*]
-  (let [iter-max (or (:iterations worker) 0)
-        iter-done (or (:cycle latest-cycle) 0)
+  [worker latest-cycle worker-cycles run-state*]
+  (let [run-max (or (:runs worker) (:iterations worker) 0)
+        runs-done (count (filter #(terminal-run-outcomes (:outcome %)) worker-cycles))
         outcome (or (:outcome latest-cycle) "-")]
     (cond
-      (>= iter-done iter-max) "exhausted"
+      (>= runs-done run-max) "completed"
       (str/starts-with? run-state* "stopped/") "stopped"
       (= run-state* "stale") "stale"
       (nil? latest-cycle) "starting"
@@ -699,7 +722,8 @@
           workers (or (:workers started) [])
           run-state* (run-state started stopped)
           metrics (run-metrics cycles)
-          latest-by-worker (latest-cycles-by-worker cycles)]
+          latest-by-worker (latest-cycles-by-worker cycles)
+          cycles-by-worker (group-by :worker-id cycles)]
       (println (format "Swarm:   %s" swarm-id))
       (println (format "State:   %s" run-state*))
       (println (format "Started: %s" (:started-at started)))
@@ -714,17 +738,20 @@
       (println (format "Reviews: %d" (count reviews)))
       (println)
       (println "Workers:")
-      (println "ID  | Runtime   | Progress | Last Outcome   | Claimed | Model")
-      (println "----+-----------+----------+----------------+---------+------------------------------")
+      (println "ID  | Runtime   | Runs   | Cycles  | Last Outcome   | Claimed | Model")
+      (println "----+-----------+--------+---------+----------------+---------+------------------------------")
       (doseq [w (sort-by :id workers)]
         (let [wid (:id w)
               latest (get latest-by-worker wid)
-              progress (format "%d/%d" (or (:cycle latest) 0) (or (:iterations w) 0))
-              runtime (worker-runtime w latest run-state*)
+              worker-cycles (or (get cycles-by-worker wid) [])
+              run-max (or (:runs w) (:iterations w) 0)
+              runs-done (count (filter #(terminal-run-outcomes (:outcome %)) worker-cycles))
+              cycles-done (or (:cycle latest) 0)
+              runtime (worker-runtime w latest worker-cycles run-state*)
               outcome (or (:outcome latest) "-")
               claimed (count (or (:claimed-task-ids latest) []))]
-          (println (format "%-3s | %-9s | %-8s | %-14s | %-7d | %s"
-                           wid runtime progress outcome claimed (model-label w))))))
+          (println (format "%-3s | %-9s | %4d/%-3d | %7d | %-14s | %-7d | %s"
+                           wid runtime runs-done run-max cycles-done outcome claimed (model-label w))))))
     (do
       (println (format "Swarm not found: %s" swarm-id))
       (System/exit 1))))
@@ -747,12 +774,15 @@
                 workers (or (:workers started) [])
                 metrics (run-metrics cycles)
                 latest-by-worker (latest-cycles-by-worker cycles)
+                cycles-by-worker (group-by :worker-id cycles)
                 state* (run-state started stopped)
                 active-count (if (= state* "running")
                                (count (filter (fn [w]
-                                                (let [latest (get latest-by-worker (:id w))]
-                                                  (< (or (:cycle latest) 0)
-                                                     (or (:iterations w) 0))))
+                                                (let [wid (:id w)
+                                                      run-max (or (:runs w) (:iterations w) 0)
+                                                      runs-done (count (filter #(terminal-run-outcomes (:outcome %))
+                                                                               (or (get cycles-by-worker wid) [])))]
+                                                  (< runs-done run-max)))
                                               workers))
                                0)]
             (println (format "%-8s | %-16s | %-6s | %7d | %6d | %6d | %6d | %6d | %4d | %s"
@@ -931,6 +961,8 @@
                            :harness harness
                            :model model
                            :reasoning reasoning
+                           :runs (or (:runs wc) (:iterations wc) 10)
+                           :max-cycles (or (:max_cycles wc) (:iterations wc) (:runs wc) 10)
                            :iterations (or (:iterations wc) 10)
                            :prompts (:prompt wc)
                            :can-plan (:can_plan wc)
@@ -962,12 +994,13 @@
       (println (format "  Workers: %d total" (count workers)))
       (doseq [[idx wc] (map-indexed vector worker-configs)]
         (let [{:keys [harness model reasoning]} (parse-model-string (:model wc))]
-          (println (format "    - %dx %s:%s%s (%d iters%s)"
+          (println (format "    - %dx %s:%s%s (%d runs, %d cycle cap%s)"
                            (or (:count wc) 1)
                            (name harness)
                            model
                            (if reasoning (str ":" reasoning) "")
-                           (or (:iterations wc) 10)
+                           (or (:runs wc) (:iterations wc) 10)
+                           (or (:max_cycles wc) (:iterations wc) (:runs wc) 10)
                            (if (:prompt wc) (str ", " (:prompt wc)) "")))))
       (println)
 
@@ -1092,7 +1125,8 @@
   (println "  swarm [file]     Run multiple worker configs from oompa.json (parallel)")
   (println "  tasks            Show task status (pending/current/complete)")
   (println "  prompt \"...\"     Run ad-hoc prompt")
-  (println "  status           Show last run summary")
+  (println "  status           Show running swarms")
+  (println "  info             Show detailed summary of the last run")
   (println "  list             List recent swarms (default: 20, --all for full history)")
   (println "  view [swarm-id]  Show detailed single-swarm runtime (default: latest)")
   (println "  worktrees        List worktree status")
@@ -1136,6 +1170,7 @@
    "tasks" cmd-tasks
    "prompt" cmd-prompt
    "status" cmd-status
+   "info" cmd-info
    "list" cmd-list
    "view" cmd-view
    "stop" cmd-stop

@@ -66,8 +66,10 @@
                 :workers (mapv (fn [w]
                                  {:id (:id w)
                                   :harness (name (:harness w))
-                                  :model (:model w)
-                                  :reasoning (:reasoning w)
+                                 :model (:model w)
+                                 :reasoning (:reasoning w)
+                                 :runs (:runs w)
+                                 :max-cycles (:max-cycles w)
                                   :iterations (:iterations w)
                                   :can-plan (:can-plan w)
                                   :prompts (:prompts w)})
@@ -125,13 +127,14 @@
    session-id links to the Claude CLI conversation on disk for debugging.
    Written at cycle end so dashboards can track progress in real-time."
   [swarm-id worker-id cycle
-   {:keys [outcome duration-ms claimed-task-ids recycled-tasks
+   {:keys [run outcome duration-ms claimed-task-ids recycled-tasks
            error-snippet review-rounds session-id]}]
   (when swarm-id
     (let [filename (format "%s-c%d.json" worker-id cycle)]
       (write-json! (str (cycles-dir swarm-id) "/" filename)
                    {:worker-id worker-id
                     :cycle cycle
+                    :run (or run 1)
                     :outcome (name outcome)
                     :timestamp (str (java.time.Instant/now))
                     :duration-ms duration-ms
