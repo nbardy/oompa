@@ -102,7 +102,7 @@
    :max-wait-for-tasks max seconds a non-planner waits for tasks before giving up (default 600).
    :max-working-resumes max consecutive working resumes before nudge+kill (default 5)."
   [{:keys [id swarm-id harness model runs max-cycles iterations prompts can-plan reasoning
-           review-harness review-model review-prompts wait-between
+           reviewers wait-between
            max-working-resumes max-wait-for-tasks]}]
   (let [cycle-cap (or max-cycles iterations runs 10)
         run-goal (or runs iterations 10)]
@@ -125,12 +125,7 @@
                          (if (and (number? v) (pos? v))
                            v
                            default-max-wait-for-tasks))
-   :review-harness review-harness
-   :review-model review-model
-   :review-prompts (cond
-                     (vector? review-prompts) review-prompts
-                     (string? review-prompts) [review-prompts]
-                     :else [])
+   :reviewers reviewers
    :max-working-resumes (or max-working-resumes default-max-working-resumes)
    :completed 0
    :status :idle}))
@@ -278,7 +273,7 @@
    Uses custom review-prompts when configured, otherwise falls back to default.
    prev-feedback: vector of previous review outputs (for multi-round context).
    Returns {:verdict :approved|:needs-changes|:rejected, :comments [...], :output string}"
-  [{:keys [id swarm-id review-harness review-model review-prompts]} worktree-path prev-feedback]
+  [{:keys [id swarm-id reviewers]} worktree-path prev-feedback]
   (let [;; Get actual diff content (not just stat) — truncate to 8000 chars for prompt budget
         diff-result (process/sh ["git" "diff" "main"]
                                 {:dir worktree-path :out :string :err :string})
@@ -288,15 +283,9 @@
                          d))
 
         swarm-id* (or swarm-id "unknown")
-        custom-prompt (when (seq review-prompts)
-                        (->> review-prompts
-                             (map load-prompt)
-                             (remove nil?)
-                             (str/join "\n\n")))
 
         ;; Only include the most recent round's feedback — the worker has already
         ;; attempted fixes based on it, so the reviewer just needs to verify.
-        ;; Including all prior rounds bloats the prompt and causes empty output.
         history-block (when (seq prev-feedback)
                         (let [latest (last prev-feedback)
                               truncated (if (> (count latest) 2000)
@@ -308,40 +297,52 @@
                                truncated
                                "\n\n")))
 
-        review-body (str (or custom-prompt
-                              (str "Review the changes in this worktree.\n"
-                                   "Focus on architecture and design, not style.\n"))
-                         "\n\nDiff:\n```\n" diff-content "\n```\n"
-                         (when history-block history-block)
-                         "\nYour verdict MUST be on its own line, exactly one of:\n"
-                         "VERDICT: APPROVED\n"
-                         "VERDICT: NEEDS_CHANGES\n\n"
-                         "Do NOT use REJECTED. Always use NEEDS_CHANGES with specific, "
-                         "actionable feedback explaining what must change and why. "
-                         "The worker will attempt fixes based on your feedback.\n"
-                         "After your verdict line, list every issue as a numbered item with "
-                         "the file path and what needs to change.\n")
-        review-prompt (str "[oompa:" swarm-id* ":" id "] " review-body)
-
         abs-wt (.getAbsolutePath (io/file worktree-path))
 
-        ;; No session, no resume, no format flags — reviewer is stateless one-shot
-        cmd (harness/build-cmd review-harness
-              {:cwd abs-wt :model review-model :prompt review-prompt})
-
-        result (try
-                 (process/sh cmd {:dir abs-wt
-                                  :in (harness/process-stdin review-harness review-prompt)
-                                  :out :string :err :string})
-                 (catch Exception e
-                   {:exit -1 :out "" :err (.getMessage e)}))
+        ;; Try each reviewer until one succeeds and returns a verdict
+        result (reduce (fn [_ {:keys [harness model prompts]}]
+                         (let [custom-prompt (when (seq prompts)
+                                               (->> prompts
+                                                    (map load-prompt)
+                                                    (remove nil?)
+                                                    (str/join "\n\n")))
+                               review-body (str (or custom-prompt
+                                                     (str "Review the changes in this worktree.\n"
+                                                          "Focus on architecture and design, not style.\n"))
+                                                "\n\nDiff:\n```\n" diff-content "\n```\n"
+                                                (when history-block history-block)
+                                                "\nYour verdict MUST be on its own line, exactly one of:\n"
+                                                "VERDICT: APPROVED\n"
+                                                "VERDICT: NEEDS_CHANGES\n\n"
+                                                "Do NOT use REJECTED. Always use NEEDS_CHANGES with specific, "
+                                                "actionable feedback explaining what must change and why. "
+                                                "The worker will attempt fixes based on your feedback.\n"
+                                                "After your verdict line, list every issue as a numbered item with "
+                                                "the file path and what needs to change.\n")
+                               review-prompt (str "[oompa:" swarm-id* ":" id "] " review-body)
+                               cmd (harness/build-cmd harness {:cwd abs-wt :model model :prompt review-prompt})
+                               res (try
+                                        (process/sh cmd {:dir abs-wt
+                                                         :in (harness/process-stdin harness review-prompt)
+                                                         :out :string :err :string})
+                                        (catch Exception e
+                                          {:exit -1 :out "" :err (.getMessage e)}))
+                               output (or (:out res) "")
+                               has-verdict? (or (re-find #"VERDICT:\s*APPROVED" output)
+                                                (re-find #"VERDICT:\s*NEEDS_CHANGES" output)
+                                                (re-find #"VERDICT:\s*REJECTED" output)
+                                                (re-find #"(?i)\bAPPROVED\b" output))]
+                           (if (and (= (:exit res) 0) has-verdict?)
+                             (reduced res)
+                             (do
+                               (println (format "[%s] Reviewer %s failed or returned no verdict, falling back..." id model))
+                               res))))
+                       {:exit -1 :out "" :err "No reviewers configured or no verdict returned"}
+                       reviewers)
 
         output (:out result)
 
-        ;; Parse verdict — require explicit VERDICT: prefix to avoid false matches.
-        ;; REJECTED is treated as NEEDS_CHANGES: the reviewer must always give
-        ;; actionable feedback so the worker can attempt fixes. Hard rejection
-        ;; only happens when max review rounds are exhausted.
+        ;; Parse verdict
         verdict (cond
                   (re-find #"VERDICT:\s*APPROVED" output) :approved
                   (re-find #"VERDICT:\s*NEEDS_CHANGES" output) :needs-changes
@@ -653,7 +654,7 @@
    Writes review logs to runs/{swarm-id}/reviews/ for post-mortem analysis.
    Returns {:approved? bool, :attempts int}"
   [worker wt-path worker-id iteration]
-  (if-not (and (:review-harness worker) (:review-model worker))
+  (if (empty? (:reviewers worker))
     ;; No reviewer configured, auto-approve
     {:approved? true :attempts 0}
 

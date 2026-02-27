@@ -46,7 +46,7 @@
   (let [[harness count-str] (str/split s #":" 2)
         h (keyword harness)
         cnt (parse-int count-str 0)]
-    (when-not (harnesses h)
+    (when-not (harness/valid-harness? h)
       (throw (ex-info (str "Unknown harness in worker spec: " s ". Known: " (str/join ", " (map name (sort harnesses)))) {})))
     (when (zero? cnt)
       (throw (ex-info (str "Invalid count in worker spec: " s ". Use format 'harness:count'") {})))
@@ -101,7 +101,7 @@
 
         (= arg "--harness")
         (let [h (keyword (second remaining))]
-          (when-not (harnesses h)
+          (when-not (harness/valid-harness? h)
             (throw (ex-info (str "Unknown harness: " (second remaining) ". Known: " (str/join ", " (map name (sort harnesses)))) {})))
           (recur (assoc opts :harness h)
                  (nnext remaining)))
@@ -234,14 +234,14 @@
 
 (defn- validate-models!
   "Probe each unique harness:model pair. Prints results and exits if any fail."
-  [worker-configs review-model]
+  [worker-configs review-models]
   (let [;; Deduplicate by harness:model only (ignore reasoning level)
-        models (cond-> (->> worker-configs
+        models (into (->> worker-configs
                             (map (fn [wc]
                                    (let [{:keys [harness model]} (parse-model-string (:model wc))]
                                      {:harness harness :model model})))
                             set)
-                 review-model (conj (select-keys review-model [:harness :model])))
+                     (map #(select-keys % [:harness :model]) review-models))
         _ (println "Validating models...")
         results (pmap (fn [{:keys [harness model]}]
                         (let [ok (probe-model harness model)]
@@ -860,27 +860,23 @@
 
    Supported formats:
    - harness:model
-   - harness:model:reasoning (codex only)
+   - harness:model:reasoning (if reasoning is in reasoning-variants)
    - model (defaults harness to :codex)
 
-   Note: non-codex model identifiers may contain ':' (for example
-   openrouter/...:free). Those suffixes are preserved in :model."
+   Note: model identifiers may contain ':' (for example openrouter/...:free).
+   Those suffixes are preserved in :model if not a known reasoning variant."
   [s]
   (if (and s (str/includes? s ":"))
     (let [[harness-str rest*] (str/split s #":" 2)
           harness (keyword harness-str)]
-      (if (contains? harnesses harness)
-        (if (= harness :codex)
-          ;; Codex may include a reasoning suffix at the end. Only treat the
-          ;; last segment as reasoning if it matches a known variant.
-          (if-let [idx (str/last-index-of rest* ":")]
-            (let [model* (subs rest* 0 idx)
-                  reasoning* (subs rest* (inc idx))]
-              (if (contains? reasoning-variants reasoning*)
-                {:harness harness :model model* :reasoning reasoning*}
-                {:harness harness :model rest*}))
-            {:harness harness :model rest*})
-          ;; Non-codex: preserve full model string (including any ':suffix').
+      (if (harness/valid-harness? harness)
+        ;; Check for reasoning suffix for any valid harness
+        (if-let [idx (str/last-index-of rest* ":")]
+          (let [model* (subs rest* 0 idx)
+                reasoning* (subs rest* (inc idx))]
+            (if (contains? reasoning-variants reasoning*)
+              {:harness harness :model model* :reasoning reasoning*}
+              {:harness harness :model rest*}))
           {:harness harness :model rest*})
         ;; Not a known harness prefix, treat as raw model on default harness.
         {:harness :codex :model s}))
@@ -915,20 +911,14 @@
           ;; Parse reviewer config — supports both formats:
           ;; Legacy: {"review_model": "harness:model:reasoning"}
           ;; New:    {"reviewer": {"model": "harness:model:reasoning", "prompt": ["path.md"]}}
-          reviewer-config (:reviewer config)
-          review-parsed (cond
-                          reviewer-config
-                          (let [parsed (parse-model-string (:model reviewer-config))
-                                prompts (let [p (:prompt reviewer-config)]
-                                          (cond (vector? p) p
-                                                (string? p) [p]
-                                                :else []))]
-                            (assoc parsed :prompts prompts))
-
-                          (:review_model config)
-                          (parse-model-string (:review_model config))
-
-                          :else nil)
+          generic-reviewers (cond
+                              (:review_models config)
+                              (mapv parse-model-string (:review_models config))
+                              
+                              (:review_model config)
+                              [(parse-model-string (:review_model config))]
+                              
+                              :else [])
 
           ;; Parse planner config — optional dedicated planner
           ;; Runs in project root, no worktree/review/merge, respects max_pending backpressure
@@ -954,7 +944,20 @@
           ;; Convert to worker format
           workers (map-indexed
                     (fn [idx wc]
-                      (let [{:keys [harness model reasoning]} (parse-model-string (:model wc))]
+                      (let [{:keys [harness model reasoning]} (parse-model-string (:model wc))
+                            ;; Support per-worker reviewer override
+                            worker-reviewer-config (:reviewer wc)
+                            specific-reviewer (when worker-reviewer-config
+                                                (let [parsed (parse-model-string (:model worker-reviewer-config))
+                                                      prompts (let [p (:prompt worker-reviewer-config)]
+                                                                (cond (vector? p) p
+                                                                      (string? p) [p]
+                                                                      :else []))]
+                                                  (assoc parsed :prompts prompts)))
+                            all-reviewers (->> (concat (if specific-reviewer [specific-reviewer] []) generic-reviewers)
+                                               (map #(select-keys % [:harness :model :reasoning :prompts]))
+                                               (distinct)
+                                               (vec))]
                         (worker/create-worker
                           {:id (str "w" idx)
                            :swarm-id swarm-id
@@ -969,9 +972,7 @@
                            :wait-between (:wait_between wc)
                            :max-wait-for-tasks (:max_wait_for_tasks wc)
                            :max-working-resumes (:max_working_resumes wc)
-                           :review-harness (:harness review-parsed)
-                           :review-model (:model review-parsed)
-                           :review-prompts (:prompts review-parsed)})))
+                           :reviewers all-reviewers})))
                     expanded-workers)]
 
       (println (format "Swarm config from %s:" config-file))
@@ -984,13 +985,9 @@
                          (if (seq (:prompts planner-parsed))
                            (str ", prompts: " (str/join ", " (:prompts planner-parsed)))
                            ""))))
-      (when review-parsed
-        (println (format "  Reviewer: %s:%s%s"
-                         (name (:harness review-parsed))
-                         (:model review-parsed)
-                         (if (seq (:prompts review-parsed))
-                           (str " (prompts: " (str/join ", " (:prompts review-parsed)) ")")
-                           ""))))
+      (when (seq generic-reviewers)
+        (println (format "  Generic Reviewers: %s"
+                         (str/join ", " (map #(str (name (:harness %)) ":" (:model %)) generic-reviewers)))))
       (println (format "  Workers: %d total" (count workers)))
       (doseq [[idx wc] (map-indexed vector worker-configs)]
         (let [{:keys [harness model reasoning]} (parse-model-string (:model wc))]
@@ -1008,13 +1005,13 @@
       ;; Include planner model in validation if configured
       (validate-models! (cond-> worker-configs
                           planner-config (conj planner-config))
-                        review-parsed)
+                        generic-reviewers)
 
       ;; Write started event to runs/{swarm-id}/started.json
       (runs/write-started! swarm-id
                            {:workers workers
                             :planner-config planner-parsed
-                            :reviewer-config review-parsed
+                            :reviewer-configs generic-reviewers
                             :config-file config-file})
       (println (format "\nStarted event written to runs/%s/started.json" swarm-id))
 
