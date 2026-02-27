@@ -697,7 +697,14 @@
 ;; Workers can wait for tasks before giving up; default is 10 minutes.
 ;; This keeps workers alive while planners/designers ramp up the queue.
 (def ^:private wait-poll-interval 10)
-(def ^:private max-consecutive-errors 3)
+(def ^:private max-consecutive-errors 5)
+
+(defn- backoff-sleep! [id errors]
+  (when (< errors max-consecutive-errors)
+    (let [wait-sec (* 60 (int (Math/pow 2 (dec errors))))]
+      (println (format "[%s] Backing off for %d seconds before next retry (%d/%d)..." id wait-sec errors (dec max-consecutive-errors)))
+      (Thread/sleep (* 1000 wait-sec)))))
+
 
 (defn- wait-for-tasks!
   "Wait up to max-wait-seconds for pending/current tasks to appear.
@@ -825,7 +832,7 @@
                     (do
                       (println (format "[%s] %d consecutive errors, stopping" id errors))
                       (finish :error))
-                    (recur (inc cycle) completed-runs errors metrics nil nil #{} nil 0)))
+                    (do (backoff-sleep! id errors) (recur (inc cycle) completed-runs errors metrics nil nil #{} nil 0))))
 
                 (let [resume? (or (some? session-id) (some? claim-resume-prompt))
                       cycle-start-ms (System/currentTimeMillis)
@@ -855,7 +862,7 @@
                         (do
                           (println (format "[%s] %d consecutive errors, stopping" id errors))
                           (finish :error))
-                        (recur (inc cycle) (inc completed-runs) errors metrics nil nil #{} nil 0)))
+                        (do (backoff-sleep! id errors) (recur (inc cycle) (inc completed-runs) errors metrics nil nil #{} nil 0))))
 
                     (and (seq claim-ids) (not merge?) (not done?))
                     (let [_ (println (format "[%s] CLAIM signal: %s" id (str/join ", " claim-ids)))
