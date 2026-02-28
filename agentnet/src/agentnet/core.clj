@@ -8,6 +8,21 @@
 (defn now-ms []
   (System/currentTimeMillis))
 
+(defn- normalize-priority
+  "Coerce :priority to a sortable number.
+   Accepts: integer, \"P1\"/\"P2\" strings, numeric strings, nil.
+   Unknown/nil → 1000 (low priority)."
+  [p]
+  (cond
+    (number? p) p
+    (nil? p) 1000
+    (string? p)
+    (let [s (str/upper-case (str/trim p))]
+      (cond
+        (str/starts-with? s "P") (try (Integer/parseInt (subs s 1)) (catch Exception _ 1000))
+        :else (try (Integer/parseInt s) (catch Exception _ 1000))))
+    :else 1000))
+
 (defn format-ago
   "Return human-readable relative time string for epoch milliseconds."
   [^long ts-ms]
@@ -50,7 +65,7 @@
 
 (defn- queue-lines [tasks]
   (->> tasks
-       (sort-by (juxt (comp (fnil identity 1000) :priority) :id))
+       (sort-by (juxt (comp normalize-priority :priority) :id))
        (map (fn [{:keys [id summary]}]
               (format "`%s` • %s" id summary)))))
 
@@ -82,7 +97,7 @@
 
 (defn- backlog-entries [tasks]
   (->> tasks
-       (sort-by (juxt (comp (fnil identity 1000) :priority) :id))
+       (sort-by (juxt (comp normalize-priority :priority) :id))
        (map #(select-keys % [:id :summary]))
        (remove #(nil? (:id %)))
        (take 7)

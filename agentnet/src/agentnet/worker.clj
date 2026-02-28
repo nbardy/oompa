@@ -1023,11 +1023,23 @@
                       (map-indexed
                         (fn [idx worker]
                           (let [worker (assoc worker :id (or (:id worker) (str "w" idx)))]
-                            (future (run-worker! worker))))
+                            (future
+                              (try
+                                (run-worker! worker)
+                                (catch Exception e
+                                  (println (format "[%s] FATAL: %s" (:id worker) (.getMessage e)))
+                                  (.printStackTrace e)
+                                  (throw e))))))
                         workers))]
 
         (println "All workers launched. Waiting for completion...")
-        (let [results (mapv deref futures)]
+        (let [results (mapv (fn [f]
+                              (try
+                                (deref f)
+                                (catch Exception e
+                                  (println (format "Worker future failed: %s" (.getMessage e)))
+                                  {:status :fatal-error :error (.getMessage e)})))
+                            futures)]
           ;; Clean exit — tell shutdown hook not to write stopped.json
           (reset! shutdown-requested? false)
           ;; Remove the hook so it doesn't accumulate across calls

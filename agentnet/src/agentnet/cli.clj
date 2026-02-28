@@ -914,10 +914,20 @@
           generic-reviewers (cond
                               (:review_models config)
                               (mapv parse-model-string (:review_models config))
-                              
+
                               (:review_model config)
                               [(parse-model-string (:review_model config))]
-                              
+
+                              ;; New format: {"reviewer": {"model": "harness:model", "prompt": [...]}}
+                              (:reviewer config)
+                              (let [rc (:reviewer config)
+                                    parsed (parse-model-string (:model rc))
+                                    prompts (let [p (:prompt rc)]
+                                              (cond (vector? p) p
+                                                    (string? p) [p]
+                                                    :else []))]
+                                [(assoc parsed :prompts prompts)])
+
                               :else [])
 
           ;; Parse planner config — optional dedicated planner
@@ -1157,6 +1167,26 @@
   (println "  ./swarm.bb loop --workers claude:5 opencode:2 --iterations 20")
   (println "  ./swarm.bb swarm oompa.json  # Run multi-model config"))
 
+(defn cmd-docs
+  "Dump core architecture and design documents"
+  [opts args]
+  (let [docs-dir "docs"
+        core-docs ["SWARM_PHILOSOPHY.md" "SWARM_GUIDE.md" "EDN_TICKETS.md" "SYSTEMS_DESIGN.md" "OOMPA.md"]
+        package-dir (or (System/getenv "OOMPA_PACKAGE_ROOT") ".")
+        doc-paths (map #(str package-dir "/" docs-dir "/" %) core-docs)]
+    (println "# Oompa Loompas Core Documentation")
+    (println)
+    (doseq [path doc-paths]
+      (try
+        (let [content (slurp path)]
+          (println (str "## " path))
+          (println "```markdown")
+          (println content)
+          (println "```")
+          (println))
+        (catch Exception e
+          (println (str "Could not read " path ": " (.getMessage e))))))))
+
 ;; =============================================================================
 ;; Main Entry Point
 ;; =============================================================================
@@ -1196,23 +1226,3 @@
           (println)
           (println (format "Unknown command: %s" cmd)))
         (System/exit (if cmd 1 0))))))
-
-(defn cmd-docs
-  "Dump core architecture and design documents"
-  [opts args]
-  (let [docs-dir "docs"
-        core-docs ["SWARM_PHILOSOPHY.md" "SWARM_GUIDE.md" "EDN_TICKETS.md" "SYSTEMS_DESIGN.md" "OOMPA.md"]
-        package-dir (or (System/getenv "OOMPA_PACKAGE_ROOT") ".")
-        doc-paths (map #(str package-dir "/" docs-dir "/" %) core-docs)]
-    (println "# Oompa Loompas Core Documentation")
-    (println)
-    (doseq [path doc-paths]
-      (try
-        (let [content (slurp path)]
-          (println (str "## " path))
-          (println "```markdown")
-          (println content)
-          (println "```")
-          (println))
-        (catch Exception e
-          (println (str "Could not read " path ": " (.getMessage e))))))))
