@@ -28,7 +28,7 @@ Whenever you identify a missing requirement, a concrete fix, or an engineering c
 
 # Execution Rules
 - **Do NOT write code.** You only write `.edn` tickets.
-- **NO MATH IN TICKETS:** Never include LaTeX or complex math equations (like `\sigma` or `\hat`) inside the `.edn` file strings, as it breaks the Clojure parser. Always write a brief, plain-text summary and point the developer to a specific `.md` file for the detailed math or complex logic.
+- **KEEP EDN LEAN:** Never put dense architectural logic, code blocks, or complex formatting (like LaTeX) inside the `.edn` file strings. Complex escape characters will break the Clojure parser. Always write a brief, plain-text summary and point the developer to a specific `.md` file for the detailed math, complex logic, or dense acceptance criteria.
 - **STRING ESCAPING:** Do not use unescaped double quotes inside `.edn` strings. Use single quotes `''` or escaped double quotes `""`.
 - Keep the scope tight. Tickets should be atomic. A single ticket should represent `< 1 hour` of work for a single agent.
 - If a task requires refactoring 5 different systems, break it into 5 separate `.edn` files.

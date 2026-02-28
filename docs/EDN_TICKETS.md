@@ -20,13 +20,13 @@ Every ticket must be a valid EDN map with specific keys.
 }
 ```
 
-## 2. No LaTeX or Complex Math
-**The EDN parser will crash if it encounters invalid escape sequences like `\sigma`, `\s`, `\hat`, etc.**
+## 2. Keep EDN Files Lean (Avoid Complex Escape Characters)
+**The EDN parser will crash if it encounters invalid or complex escape sequences (e.g., from LaTeX, code blocks, or nested formats).**
 
-*   **Wrong:** `:description "Compute the rolling $\sigma$ using jump-diffusion."`
-*   **Right:** `:description "Compute the rolling volatility (sigma) using jump-diffusion. See docs/research_notes/jump_diffusion.md for the exact math."`
+*   **Wrong:** Putting dense architectural logic, complex mathematical formulas (like `\sigma` or `\hat`), or multi-line code blocks directly into the `:description` or `:acceptance` string.
+*   **Right:** `:description "Implement the high-frequency volatility oracle. See docs/research_notes/volatility.md for the exact mathematical formulas and edge cases."`
 
-Keep the `.edn` description plain text. Use markdown files (`.md`) to store any complex math, proofs, or code snippets, and simply point the developer to that file in the EDN ticket.
+Keep the `.edn` strings plain text and brief. Use markdown files (`.md`) to store any complex requirements, equations, deep technical contexts, or dense acceptance criteria. Simply point the developer to that specific `.md` file in the EDN ticket.
 
 ## 3. String Escaping
 Values in the `.edn` map are strings enclosed in double quotes `""`. 
