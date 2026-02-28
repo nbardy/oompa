@@ -1133,6 +1133,7 @@
   (println "  context          Print context block")
   (println "  check            Check agent backends")
   (println "  help             Show this help")
+  (println "  docs             Dump all core architecture and swarm design docs")
   (println)
   (println "Options:")
   (println "  --workers N              Number of parallel workers (default: 2)")
@@ -1176,7 +1177,8 @@
    "cleanup" cmd-cleanup
    "context" cmd-context
    "check" cmd-check
-   "help" cmd-help})
+   "help" cmd-help
+   "docs" cmd-docs})
 
 (defn -main [& args]
   (let [[cmd & rest-args] args]
@@ -1194,3 +1196,23 @@
           (println)
           (println (format "Unknown command: %s" cmd)))
         (System/exit (if cmd 1 0))))))
+
+(defn cmd-docs
+  "Dump core architecture and design documents"
+  [opts args]
+  (let [docs-dir "docs"
+        core-docs ["SWARM_PHILOSOPHY.md" "SWARM_GUIDE.md" "EDN_TICKETS.md" "SYSTEMS_DESIGN.md" "OOMPA.md"]
+        package-dir (or (System/getenv "OOMPA_PACKAGE_ROOT") ".")
+        doc-paths (map #(str package-dir "/" docs-dir "/" %) core-docs)]
+    (println "# Oompa Loompas Core Documentation")
+    (println)
+    (doseq [path doc-paths]
+      (try
+        (let [content (slurp path)]
+          (println (str "## " path))
+          (println "```markdown")
+          (println content)
+          (println "```")
+          (println))
+        (catch Exception e
+          (println (str "Could not read " path ": " (.getMessage e))))))))
