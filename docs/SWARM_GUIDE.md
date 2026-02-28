@@ -10,7 +10,7 @@ The Philosophy's Intelligence-to-Ambiguity Ratio maps directly to three worker p
 ### The Planner (High Ambiguity → Burn Tokens)
 
 - **Model:** Large, high-reasoning (e.g., `claude:opus`, `codex:gpt-5.3-codex:xhigh`).
-- **Role:** The Planner does **not** write code. It reads the initial `spec.md`, explores the codebase, and breaks the work down into atomic, highly detailed `.edn` files in `tasks/pending/`. This is the Slow Squeeze—spending massive tokens upfront to produce a dense, mathematically sound plan.
+- **Role:** The Planner does **not** write code. It reads the initial `spec.md`, explores the codebase, and breaks the work down into atomic, highly detailed `.edn` files in `tasks/pending/`. This is the Slow Squeeze—spending massive tokens upfront to produce a dense, mathematically sound plan. **Crucially, the Planner must format tickets according to the rules in [`EDN_TICKETS.md`](./EDN_TICKETS.md) to prevent complex escape characters (like LaTeX math) from crashing the Clojure parser.**
 - **Config:** `can_plan: true`, low iterations (e.g., 3–5), single instance (`count: 1`).
 - **Prompt:** `config/prompts/planner.md`
 
