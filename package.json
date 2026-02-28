@@ -1,6 +1,6 @@
 {
   "name": "@nbardy/oompa",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "description": "Git-worktree multi-agent swarm orchestrator for Codex, Claude, and Opencode",
   "license": "MIT",
   "type": "commonjs",
@@ -14,12 +14,14 @@
     "agentnet/src/",
     "config/prompts/",
     "oompa.example.json",
-    "README.md"
+    "README.md",
+    "scripts/"
   ],
   "scripts": {
     "check": "node bin/oompa.js check",
     "help": "node bin/oompa.js help",
-    "pack:dry": "npm pack --dry-run"
+    "pack:dry": "npm pack --dry-run",
+    "postinstall": "node scripts/install-babashka.js"
   },
   "engines": {
     "node": ">=18"

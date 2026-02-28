@@ -15,7 +15,11 @@ if (!fs.existsSync(swarmScript) || !fs.existsSync(classpath)) {
   process.exit(1);
 }
 
-const result = spawnSync("bb", ["--classpath", classpath, swarmScript, ...argv], {
+// Try to use the locally bundled bb if it exists (from postinstall)
+const localBb = path.join(__dirname, "bb");
+const bbPath = fs.existsSync(localBb) ? localBb : "bb";
+
+const result = spawnSync(bbPath, ["--classpath", classpath, swarmScript, ...argv], {
   stdio: "inherit",
   cwd: process.cwd(),
   env: { ...process.env, OOMPA_PACKAGE_ROOT: packageRoot }
