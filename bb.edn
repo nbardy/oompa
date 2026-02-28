@@ -30,4 +30,7 @@
          :task (shell "./agentnet.bb" "check")}
 
   lint-notes {:doc "Validate agent notes front-matter"
-              :task (shell "./agentnet.bb" "lint-notes")}}}
+              :task (shell "./agentnet.bb" "lint-notes")}
+
+  docs {:doc "Dump core architecture and design documents"
+        :task (shell "./agentnet.bb" "docs")}}}
