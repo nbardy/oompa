@@ -175,45 +175,181 @@
       (println "WARNING: Git working tree is dirty. You may experience merge conflicts.")
       (println output))))
 
-(defn- check-stale-worktrees!
-  "Abort if stale oompa worktrees or branches exist from a prior run.
-   Corrupted .git/worktrees/ entries poison git worktree add for ALL workers,
-   not just the worker whose entry is stale. (See swarm af32b180 — kimi-k2.5
-   w9 went 20/20 doing nothing because w10's corrupt commondir blocked it.)"
-  []
-  ;; Prune orphaned metadata first — cleans entries whose directories are gone
+(defn- dirty-worktree?
+  "Returns true if the git worktree at path has uncommitted changes."
+  [path]
+  (let [{:keys [exit out]} (process/sh ["git" "-C" path "status" "--porcelain"]
+                                       {:out :string :err :string})]
+    (and (zero? exit) (not (str/blank? out)))))
+
+(defn- worktree-branch-name
+  "Returns the current branch name for the worktree at path, or nil on failure."
+  [path]
+  (let [{:keys [exit out]} (process/sh ["git" "-C" path "rev-parse" "--abbrev-ref" "HEAD"]
+                                       {:out :string :err :string})]
+    (when (zero? exit) (str/trim out))))
+
+(defn- remove-stale-worktree!
+  "Remove a stale worktree directory and delete its branch."
+  [path branch]
+  (process/sh ["git" "worktree" "remove" "--force" path] {:out :string :err :string})
+  (when (and branch (not (str/blank? branch)) (not= branch "HEAD"))
+    (process/sh ["git" "branch" "-D" branch] {:out :string :err :string})))
+
+(defn- run-stale-review!
+  "Invoke the reviewer model on partial worktree changes.
+   Tries each reviewer in the fallback chain until one returns a verdict.
+   Returns :merge to merge the branch into main, :discard to throw it away."
+  [reviewer-configs worktree-path branch]
+  (let [diff-out (:out (process/sh ["git" "-C" worktree-path "diff" "HEAD"]
+                                   {:out :string :err :string}))
+        diff     (if (> (count diff-out) 8000)
+                   (str (subs diff-out 0 8000) "\n...[diff truncated at 8000 chars]")
+                   diff-out)
+        status-out (:out (process/sh ["git" "-C" worktree-path "status" "--short"]
+                                     {:out :string}))
+        prompt   (str "You are reviewing partial/incomplete changes from an interrupted swarm run.\n\n"
+                      "Branch: " branch "\n"
+                      "Status:\n" status-out "\n\n"
+                      "Diff:\n```\n" diff "\n```\n\n"
+                      "Should these changes be merged into main or discarded?\n"
+                      "MERGE if: changes are correct, complete, or valuable enough to keep.\n"
+                      "DISCARD if: changes are broken, trivial, or not worth merging.\n\n"
+                      "Your verdict MUST appear on its own line, exactly one of:\n"
+                      "VERDICT: MERGE\n"
+                      "VERDICT: DISCARD\n\n"
+                      "Then briefly explain why.\n")
+        result   (reduce (fn [_ {:keys [harness model]}]
+                           (try
+                             (let [cmd (harness/build-cmd harness {:model model :prompt prompt})
+                                   res (process/sh cmd
+                                                   {:in  (harness/process-stdin harness prompt)
+                                                    :out :string :err :string})
+                                   output       (:out res)
+                                   has-verdict? (or (re-find #"VERDICT:\s*MERGE" output)
+                                                    (re-find #"VERDICT:\s*DISCARD" output))]
+                               (if (and (zero? (:exit res)) has-verdict?)
+                                 (reduced res)
+                                 res))
+                             (catch Exception e
+                               {:exit -1 :out "" :err (.getMessage e)})))
+                         {:exit -1 :out ""}
+                         reviewer-configs)
+        output   (:out result)]
+    (cond
+      (re-find #"VERDICT:\s*MERGE"   output) :merge
+      (re-find #"VERDICT:\s*DISCARD" output) :discard
+      :else                                   :discard)))
+
+(defn- handle-stale-worktrees!
+  "Handle stale oompa worktrees from a prior interrupted run.
+
+   - Prunes orphaned git worktree metadata.
+   - Auto-removes empty (clean) worktrees and orphaned branches silently.
+   - For worktrees with uncommitted changes, shows a summary and prompts
+     (y/n) to invoke the reviewer agent. Reviewer decides merge vs discard:
+     merge = git merge --no-ff branch into main; discard = rm worktree+branch.
+
+   reviewer-configs: vec of {:harness kw :model str} — the swarm reviewer
+   fallback chain. If empty, dirty worktrees are auto-discarded.
+
+   Background: corrupted .git/worktrees/ entries poison git worktree add for
+   ALL workers — one stale entry caused w9 to run 20/20 cycles doing nothing
+   (swarm af32b180, kimi-k2.5 incident)."
+  [reviewer-configs]
+  ;; Step 1: prune orphaned git metadata first
   (let [prune-result (process/sh ["git" "worktree" "prune"] {:out :string :err :string})]
     (when-not (zero? (:exit prune-result))
       (println "WARNING: git worktree prune failed:")
       (println (:err prune-result))))
-  (let [;; Find .ww* directories (oompa per-iteration worktree naming convention)
-        ls-result (process/sh ["find" "." "-maxdepth" "1" "-type" "d" "-name" ".ww*"]
-                              {:out :string})
-        stale-dirs (when (zero? (:exit ls-result))
-                     (->> (str/split-lines (:out ls-result))
-                          (remove str/blank?)))
-        ;; Find oompa/* branches
-        br-result (process/sh ["git" "branch" "--list" "oompa/*"]
-                              {:out :string})
-        stale-branches (when (zero? (:exit br-result))
-                         (->> (str/split-lines (:out br-result))
-                              (map str/trim)
-                              (remove str/blank?)))]
-    (when (or (seq stale-dirs) (seq stale-branches))
-      (println "ERROR: Stale oompa worktrees detected from a prior run.")
-      (println "       Corrupt worktree metadata will cause worker failures.")
-      (println)
-      (when (seq stale-dirs)
-        (println (format "  Stale directories (%d):" (count stale-dirs)))
-        (doseq [d stale-dirs] (println (str "    " d))))
-      (when (seq stale-branches)
-        (println (format "  Stale branches (%d):" (count stale-branches)))
-        (doseq [b stale-branches] (println (str "    " b))))
-      (println)
-      (println "Clean up with:")
-      (println "  git worktree prune; for d in .ww*/; do git worktree remove --force \"$d\" 2>/dev/null; done; git branch --list 'oompa/*' | xargs git branch -D 2>/dev/null; rm -rf .ww*")
-      (println)
-      (System/exit 1))))
+
+  ;; Step 2: discover stale .ww* dirs and oompa/* branches
+  (let [ls-result          (process/sh ["find" "." "-maxdepth" "1" "-type" "d" "-name" ".ww*"]
+                                       {:out :string})
+        stale-dirs         (when (zero? (:exit ls-result))
+                             (->> (str/split-lines (:out ls-result))
+                                  (remove str/blank?)))
+        br-result          (process/sh ["git" "branch" "--list" "oompa/*"] {:out :string})
+        all-oompa-branches (when (zero? (:exit br-result))
+                             (->> (str/split-lines (:out br-result))
+                                  (map str/trim)
+                                  (remove str/blank?)))]
+
+    (when (or (seq stale-dirs) (seq all-oompa-branches))
+      ;; Step 3: classify each dir as clean or dirty
+      (let [classified      (mapv (fn [dir]
+                                    {:dir    dir
+                                     :branch (worktree-branch-name dir)
+                                     :dirty? (dirty-worktree? dir)})
+                                  stale-dirs)
+            clean           (filter (complement :dirty?) classified)
+            dirty           (filter :dirty? classified)
+            ;; Branches whose .ww* dir no longer exists (pruned but branch remains)
+            dir-branches    (set (keep :branch classified))
+            orphan-branches (remove #(contains? dir-branches %) all-oompa-branches)]
+
+        ;; Step 4: auto-remove clean worktrees and orphaned branches silently
+        (doseq [{:keys [dir branch]} clean]
+          (remove-stale-worktree! dir branch))
+        (doseq [b orphan-branches]
+          (process/sh ["git" "branch" "-D" b] {:out :string :err :string}))
+        (when (or (seq clean) (seq orphan-branches))
+          (println (format "Auto-cleaned %d empty worktree(s) and %d orphaned branch(es)."
+                           (count clean) (count orphan-branches))))
+
+        ;; Step 5: handle dirty worktrees interactively
+        (when (seq dirty)
+          (println)
+          (println (format "Found %d worktree(s) with uncommitted changes:" (count dirty)))
+          (doseq [{:keys [dir branch]} dirty]
+            (let [status-out (:out (process/sh ["git" "-C" dir "status" "--short"]
+                                               {:out :string}))]
+              (println (format "\n  %s  (branch: %s)" dir (or branch "unknown")))
+              (doseq [line (str/split-lines status-out)]
+                (when-not (str/blank? line)
+                  (println (str "    " line))))))
+          (println)
+          (if (seq reviewer-configs)
+            (do
+              (print "Run reviewer agent on these worktrees? (y/n) ")
+              (flush)
+              (let [answer (str/trim (or (read-line) "n"))]
+                (if (= "y" answer)
+                  ;; Review each dirty worktree
+                  (doseq [{:keys [dir branch]} dirty]
+                    (println (format "\nReviewing %s (%s)..." dir (or branch "?")))
+                    (let [verdict (run-stale-review! reviewer-configs dir branch)]
+                      (case verdict
+                        :merge
+                        (do
+                          (println (format "  Verdict: MERGE — merging %s" branch))
+                          (let [res (process/sh ["git" "merge" "--no-ff" branch
+                                                 "-m" (format "chore: recover partial work from %s" branch)]
+                                               {:out :string :err :string})]
+                            (if (zero? (:exit res))
+                              (do (println "  Merged successfully.")
+                                  (remove-stale-worktree! dir branch))
+                              (do (println (format "  ERROR: Merge failed: %s" (str/trim (:err res))))
+                                  (println "         Resolve manually before restarting the swarm.")
+                                  (System/exit 1)))))
+                        :discard
+                        (do
+                          (println (format "  Verdict: DISCARD — removing %s" dir))
+                          (remove-stale-worktree! dir branch)
+                          (println "  Removed.")))))
+                  ;; User declined review — discard all dirty worktrees
+                  (doseq [{:keys [dir branch]} dirty]
+                    (println (format "Discarding %s..." dir))
+                    (remove-stale-worktree! dir branch)
+                    (println "  Done.")))))
+            ;; No reviewer configured — auto-discard dirty worktrees
+            (do
+              (println "No reviewer configured in config. Auto-discarding dirty worktrees.")
+              (doseq [{:keys [dir branch]} dirty]
+                (println (format "  Removing %s..." dir))
+                (remove-stale-worktree! dir branch)
+                (println "  Done.")))))))))
+
 
 (defn- probe-model
   "Send 'say ok' to a model via its harness CLI. Returns true if model responds.
@@ -429,7 +565,11 @@
   [opts config-file]
   (print-preflight-warnings!)
   (when-not (.exists (io/file config-file))
-    (println (format "Config not found: %s" config-file))
+    (println (format "ERROR: Config file not found: %s" (.getCanonicalPath (io/file config-file))))
+    (println (format "       Working directory: %s" (.getCanonicalPath (io/file "."))))
+    (println)
+    (println "Tip: paths are relative to the working directory. Did you mean:")
+    (println (format "       oompa run --config oompa/%s" (.getName (io/file config-file))))
     (System/exit 1))
   (let [timeout-sec (or (:startup-timeout opts)
                         (parse-int (System/getenv "OOMPA_DETACH_STARTUP_TIMEOUT")
@@ -889,23 +1029,14 @@
         f (io/file config-file)
         swarm-id (make-swarm-id)]
     (when-not (.exists f)
-      (println (format "Config file not found: %s" config-file))
+      (println (format "ERROR: Config file not found: %s" (.getCanonicalPath f)))
+      (println (format "       Working directory: %s" (.getCanonicalPath (io/file "."))))
       (println)
-      (println "Create oompa.json with format:")
-      (println "{")
-      (println "  \"workers\": [")
-      (println "    {\"model\": \"codex:gpt-5.3-codex:medium\", \"prompt\": \"prompts/executor.md\", \"iterations\": 10, \"count\": 3, \"can_plan\": false},")
-      (println "    {\"model\": \"claude:opus\", \"prompt\": [\"prompts/base.md\", \"prompts/planner.md\"], \"count\": 1},")
-      (println "    {\"model\": \"gemini:gemini-3-pro-preview\", \"prompt\": [\"prompts/executor.md\"], \"count\": 1}")
-      (println "  ]")
-      (println "}")
-      (println)
-      (println "prompt: string or array of paths — concatenated into one prompt.")
+      (println "Tip: paths are relative to the working directory. Did you mean:")
+      (println (format "       oompa run --config oompa/%s" (.getName f)))
       (System/exit 1))
     ;; Preflight: abort if git is dirty to prevent merge conflicts
     (check-git-clean!)
-    ;; Preflight: abort if stale worktrees from prior runs would poison git
-    (check-stale-worktrees!)
 
     (let [config (json/parse-string (slurp f) true)
           ;; Parse reviewer config — supports both formats:
@@ -984,6 +1115,10 @@
                            :max-working-resumes (:max_working_resumes wc)
                            :reviewers all-reviewers})))
                     expanded-workers)]
+
+      ;; Preflight: handle stale worktrees from prior runs before launching workers.
+      ;; Empty ones are auto-cleaned silently; dirty ones trigger an interactive review.
+      (handle-stale-worktrees! generic-reviewers)
 
       (println (format "Swarm config from %s:" config-file))
       (println (format "  Swarm ID: %s" swarm-id))
