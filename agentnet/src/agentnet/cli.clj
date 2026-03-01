@@ -242,29 +242,22 @@
       :else                                   :discard)))
 
 (defn- handle-stale-worktrees!
-  "Handle stale oompa worktrees from a prior interrupted run.
+  "Non-destructive startup check for existing oompa worktrees.
 
-   - Prunes orphaned git worktree metadata.
-   - Auto-removes empty (clean) worktrees and orphaned branches silently.
-   - For worktrees with uncommitted changes, shows a summary and prompts
-     (y/n) to invoke the reviewer agent. Reviewer decides merge vs discard:
-     merge = git merge --no-ff branch into main; discard = rm worktree+branch.
+   - Always runs `git worktree prune` to clear orphaned metadata.
+   - Never auto-removes/merges/discards worktrees at startup.
+   - Prints a warning summary so concurrent swarms are not disrupted.
 
-   reviewer-configs: vec of {:harness kw :model str} — the swarm reviewer
-   fallback chain. If empty, dirty worktrees are auto-discarded.
-
-   Background: corrupted .git/worktrees/ entries poison git worktree add for
-   ALL workers — one stale entry caused w9 to run 20/20 cycles doing nothing
-   (swarm af32b180, kimi-k2.5 incident)."
-  [reviewer-configs]
+   This avoids clobbering active work from another swarm in the same repo."
+  [_reviewer-configs]
   ;; Step 1: prune orphaned git metadata first
   (let [prune-result (process/sh ["git" "worktree" "prune"] {:out :string :err :string})]
     (when-not (zero? (:exit prune-result))
       (println "WARNING: git worktree prune failed:")
       (println (:err prune-result))))
 
-  ;; Step 2: discover stale .ww* dirs and oompa/* branches
-  (let [ls-result          (process/sh ["find" "." "-maxdepth" "1" "-type" "d" "-name" ".ww*"]
+  ;; Step 2: discover existing oompa worktree dirs and oompa/* branches
+  (let [ls-result          (process/sh ["find" "." "-maxdepth" "1" "-type" "d" "-name" ".w*-i*"]
                                        {:out :string})
         stale-dirs         (when (zero? (:exit ls-result))
                              (->> (str/split-lines (:out ls-result))
@@ -276,7 +269,7 @@
                                   (remove str/blank?)))]
 
     (when (or (seq stale-dirs) (seq all-oompa-branches))
-      ;; Step 3: classify each dir as clean or dirty
+      ;; Step 3: classify for warning output only (no mutation)
       (let [classified      (mapv (fn [dir]
                                     {:dir    dir
                                      :branch (worktree-branch-name dir)
@@ -284,71 +277,42 @@
                                   stale-dirs)
             clean           (filter (complement :dirty?) classified)
             dirty           (filter :dirty? classified)
-            ;; Branches whose .ww* dir no longer exists (pruned but branch remains)
             dir-branches    (set (keep :branch classified))
             orphan-branches (remove #(contains? dir-branches %) all-oompa-branches)]
-
-        ;; Step 4: auto-remove clean worktrees and orphaned branches silently
-        (doseq [{:keys [dir branch]} clean]
-          (remove-stale-worktree! dir branch))
-        (doseq [b orphan-branches]
-          (process/sh ["git" "branch" "-D" b] {:out :string :err :string}))
-        (when (or (seq clean) (seq orphan-branches))
-          (println (format "Auto-cleaned %d empty worktree(s) and %d orphaned branch(es)."
-                           (count clean) (count orphan-branches))))
-
-        ;; Step 5: handle dirty worktrees interactively
+        (println)
+        (println "WARNING: Existing oompa worktrees/branches detected; leaving them untouched.")
+        (println (format "  Worktrees: %d (%d dirty, %d clean)"
+                         (count classified) (count dirty) (count clean)))
+        (println (format "  Orphan branches: %d" (count orphan-branches)))
         (when (seq dirty)
-          (println)
-          (println (format "Found %d worktree(s) with uncommitted changes:" (count dirty)))
+          (println "  Dirty worktrees:")
           (doseq [{:keys [dir branch]} dirty]
-            (let [status-out (:out (process/sh ["git" "-C" dir "status" "--short"]
-                                               {:out :string}))]
-              (println (format "\n  %s  (branch: %s)" dir (or branch "unknown")))
-              (doseq [line (str/split-lines status-out)]
-                (when-not (str/blank? line)
-                  (println (str "    " line))))))
-          (println)
-          (if (seq reviewer-configs)
-            (do
-              (print "Run reviewer agent on these worktrees? (y/n) ")
-              (flush)
-              (let [answer (str/trim (or (read-line) "n"))]
-                (if (= "y" answer)
-                  ;; Review each dirty worktree
-                  (doseq [{:keys [dir branch]} dirty]
-                    (println (format "\nReviewing %s (%s)..." dir (or branch "?")))
-                    (let [verdict (run-stale-review! reviewer-configs dir branch)]
-                      (case verdict
-                        :merge
-                        (do
-                          (println (format "  Verdict: MERGE — merging %s" branch))
-                          (let [res (process/sh ["git" "merge" "--no-ff" branch
-                                                 "-m" (format "chore: recover partial work from %s" branch)]
-                                               {:out :string :err :string})]
-                            (if (zero? (:exit res))
-                              (do (println "  Merged successfully.")
-                                  (remove-stale-worktree! dir branch))
-                              (do (println (format "  ERROR: Merge failed: %s" (str/trim (:err res))))
-                                  (println "         Resolve manually before restarting the swarm.")
-                                  (System/exit 1)))))
-                        :discard
-                        (do
-                          (println (format "  Verdict: DISCARD — removing %s" dir))
-                          (remove-stale-worktree! dir branch)
-                          (println "  Removed.")))))
-                  ;; User declined review — discard all dirty worktrees
-                  (doseq [{:keys [dir branch]} dirty]
-                    (println (format "Discarding %s..." dir))
-                    (remove-stale-worktree! dir branch)
-                    (println "  Done.")))))
-            ;; No reviewer configured — auto-discard dirty worktrees
-            (do
-              (println "No reviewer configured in config. Auto-discarding dirty worktrees.")
-              (doseq [{:keys [dir branch]} dirty]
-                (println (format "  Removing %s..." dir))
-                (remove-stale-worktree! dir branch)
-                (println "  Done.")))))))))
+            (println (format "    %s (branch: %s)" dir (or branch "unknown")))))
+        (println "  Run `oompa cleanup` manually when you want to reclaim them.")))))
+
+(defn- cleanup-iteration-worktrees!
+  "Remove swarm iteration worktree dirs (.w*-i*) and oompa/* branches.
+   Returns {:dirs-removed n :branches-removed n}."
+  []
+  (let [ls-result (process/sh ["find" "." "-maxdepth" "1" "-type" "d" "-name" ".w*-i*"]
+                              {:out :string})
+        dirs (if (zero? (:exit ls-result))
+               (->> (str/split-lines (:out ls-result))
+                    (remove str/blank?))
+               [])
+        _ (doseq [dir dirs]
+            (remove-stale-worktree! dir (worktree-branch-name dir)))
+        br-result (process/sh ["git" "branch" "--list" "oompa/*"] {:out :string})
+        branches (if (zero? (:exit br-result))
+                   (->> (str/split-lines (:out br-result))
+                        (map str/trim)
+                        (remove str/blank?))
+                   [])
+        ;; Branches may already be deleted by remove-stale-worktree!, so ignore failures.
+        _ (doseq [b branches]
+            (process/sh ["git" "branch" "-D" b] {:out :string :err :string}))]
+    {:dirs-removed (count dirs)
+     :branches-removed (count branches)}))
 
 
 (defn- probe-model
@@ -966,15 +930,18 @@
       (println "No worktrees initialized."))))
 
 (defn cmd-cleanup
-  "Remove all worktrees"
+  "Remove all worktrees (legacy pool + swarm iteration worktrees)."
   [opts args]
   (let [state-file (io/file ".workers/state.edn")]
+    (println "Removing worktrees...")
     (if (.exists state-file)
       (let [pool (read-string (slurp state-file))]
-        (println "Removing worktrees...")
-        (worktree/cleanup-pool! pool)
-        (println "Done."))
-      (println "No worktrees to clean up."))))
+        (worktree/cleanup-pool! pool))
+      (println "No legacy pool worktrees to clean up."))
+    (let [{:keys [dirs-removed branches-removed]} (cleanup-iteration-worktrees!)]
+      (println (format "Removed %d swarm worktree dir(s) and %d oompa branch(es)."
+                       dirs-removed branches-removed)))
+    (println "Done.")))
 
 (defn cmd-context
   "Print current context (for debugging prompts)"

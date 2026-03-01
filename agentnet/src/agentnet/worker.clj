@@ -529,9 +529,11 @@
 (defn- create-iteration-worktree!
   "Create a fresh worktree for an iteration. Returns {:dir :branch :path}.
    Force-removes stale worktree+branch from previous failed runs first."
-  [project-root worker-id iteration]
-  (let [wt-dir (format ".w%s-i%d" worker-id iteration)
-        wt-branch (format "oompa/%s-i%d" worker-id iteration)
+  [project-root swarm-id worker-id iteration]
+  (let [swarm-token (or swarm-id (subs (str (java.util.UUID/randomUUID)) 0 8))
+        work-id (format "s%s-%s-i%d" swarm-token worker-id iteration)
+        wt-dir (format ".w%s" work-id)
+        wt-branch (format "oompa/%s" work-id)
         wt-path (str project-root "/" wt-dir)]
     ;; Clean stale worktree/branch from previous failed runs
     (process/sh ["git" "worktree" "remove" wt-dir "--force"] {:dir project-root})
@@ -1001,8 +1003,8 @@
               (println (format "[%s] Queue empty, waiting for tasks before cycle %d" id cycle))
               (wait-for-tasks! id max-wait-for-tasks))
 
-            (let [wt-state (try
-                             (or wt-state (create-iteration-worktree! project-root id cycle))
+                (let [wt-state (try
+                             (or wt-state (create-iteration-worktree! project-root swarm-id id cycle))
                              (catch Exception e
                                (println (format "[%s] Worktree creation failed: %s" id (.getMessage e)))
                                nil))]
