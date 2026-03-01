@@ -40,6 +40,7 @@
 (def ^:private shutdown-requested? (atom false))
 
 (declare task-root-for-cwd)
+(declare verify-mergeable?)
 
 (defn- load-prompt
   "Load a prompt file. Tries path as-is first, then from package root."
@@ -406,6 +407,68 @@
      :main-log   (or main-log "(none)")
      :diff-stat  (or diff-stat "(none)")}))
 
+(defn- first-nonblank-line
+  "Return first non-blank line from text for compact logging."
+  [s]
+  (some->> (or s "")
+           str/split-lines
+           (remove str/blank?)
+           first))
+
+(defn- classify-merge-failure
+  "Classify git merge/checkout failure text for better logs."
+  [failure-text]
+  (cond
+    (re-find #"untracked working tree files would be overwritten by merge" (or failure-text ""))
+    :untracked-overwrite
+    (re-find #"CONFLICT|Merge conflict" (or failure-text ""))
+    :conflict
+    (re-find #"Your local changes to the following files would be overwritten" (or failure-text ""))
+    :local-changes-overwrite
+    :else
+    :unknown))
+
+(defn- run-resolver-agent!
+  "Run resolver agent with divergence + failure context.
+   Returns :resolved when branch verifies as mergeable, else :failed."
+  [worker wt-path worker-id reason-details]
+  (println (format "[%s] Branch diverged from main, launching resolver agent%s"
+                   worker-id
+                   (if (str/blank? reason-details)
+                     ""
+                     (str " (" reason-details ")"))))
+  (let [{:keys [branch-log main-log diff-stat]} (collect-divergence-context wt-path)
+        resolve-prompt (str "[oompa:" (or (:swarm-id worker) "unknown") ":" worker-id "] "
+                            "Your branch cannot currently be merged safely into main.\n\n"
+                            (when-not (str/blank? reason-details)
+                              (str "Failure context from previous merge attempt:\n"
+                                   reason-details "\n\n"))
+                            "Your branch's commits (not on main):\n" branch-log "\n\n"
+                            "Commits on main since you branched:\n" main-log "\n\n"
+                            "Divergence scope:\n" diff-stat "\n\n"
+                            "Make this branch cleanly mergeable into main. "
+                            "Preserve the intent of your branch's changes.\n"
+                            "You have full git access — rebase, cherry-pick, resolve conflicts, "
+                            "or clean up merge blockers.\n"
+                            "When done, verify with: git diff main --stat")
+        abs-wt (.getAbsolutePath (io/file wt-path))
+        cmd (harness/build-cmd (:harness worker)
+              {:cwd abs-wt :model (:model worker) :prompt resolve-prompt})
+        result (try
+                 (process/sh cmd {:dir abs-wt
+                                  :in (harness/process-stdin (:harness worker) resolve-prompt)
+                                  :out :string :err :string})
+                 (catch Exception e
+                   {:exit -1 :out "" :err (.getMessage e)}))]
+    (if (zero? (:exit result))
+      (if (verify-mergeable? wt-path)
+        (do (println (format "[%s] Agent resolved divergence, branch is mergeable" worker-id))
+            :resolved)
+        (do (println (format "[%s] Agent ran but branch still can't merge cleanly" worker-id))
+            :failed))
+      (do (println (format "[%s] Resolver agent failed (exit %d)" worker-id (:exit result)))
+          :failed))))
+
 (defn- verify-mergeable?
   "Dry-run merge to verify a worktree branch merges cleanly into main.
    Does NOT leave merge state behind — always cleans up the dry-run.
@@ -437,36 +500,10 @@
       ;; Conflict — abort merge to restore clean worktree state, then
       ;; hand the problem to the agent with full divergence context.
       (let [_ (process/sh ["git" "merge" "--abort"] {:dir wt-path})
-            _ (println (format "[%s] Branch diverged from main, launching resolver agent" worker-id))
-            {:keys [branch-log main-log diff-stat]} (collect-divergence-context wt-path)
-            resolve-prompt (str "[oompa:" (or (:swarm-id worker) "unknown") ":" worker-id "] "
-                                "Your branch has diverged from main and cannot merge cleanly.\n\n"
-                                "Your branch's commits (not on main):\n" branch-log "\n\n"
-                                "Commits on main since you branched:\n" main-log "\n\n"
-                                "Divergence scope:\n" diff-stat "\n\n"
-                                "Make this branch cleanly mergeable into main. "
-                                "Preserve the intent of your branch's changes.\n"
-                                "You have full git access — rebase, cherry-pick, resolve conflicts, "
-                                "whatever works.\n"
-                                "When done, verify with: git diff main --stat")
-            abs-wt (.getAbsolutePath (io/file wt-path))
-            cmd (harness/build-cmd (:harness worker)
-                  {:cwd abs-wt :model (:model worker) :prompt resolve-prompt})
-            result (try
-                     (process/sh cmd {:dir abs-wt
-                                      :in (harness/process-stdin (:harness worker) resolve-prompt)
-                                      :out :string :err :string})
-                     (catch Exception e
-                       {:exit -1 :out "" :err (.getMessage e)}))]
-        (if (zero? (:exit result))
-          ;; Agent ran — verify the branch actually merges cleanly now
-          (if (verify-mergeable? wt-path)
-            (do (println (format "[%s] Agent resolved divergence, branch is mergeable" worker-id))
-                :resolved)
-            (do (println (format "[%s] Agent ran but branch still can't merge cleanly" worker-id))
-                :failed))
-          (do (println (format "[%s] Resolver agent failed (exit %d)" worker-id (:exit result)))
-              :failed))))))
+            failure-snippet (first-nonblank-line (str (:out merge-result) "\n" (:err merge-result)))]
+        (run-resolver-agent! worker wt-path worker-id
+                             (str "sync_worktree_to_main failed"
+                                  (when failure-snippet (str ": " failure-snippet))))))))
 
 (defn- worktree-has-changes?
   "Check if worktree has committed OR uncommitted changes vs main.
@@ -580,7 +617,8 @@
 (defn- merge-to-main!
   "Merge worktree changes to main branch. Serialized via merge-lock to prevent
    concurrent workers from corrupting the git index. On success, moves claimed
-   tasks current→complete and annotates metadata. Returns true on success.
+   tasks current→complete and annotates metadata. Returns
+   {:ok? bool :reason keyword :message string}.
    claimed-task-ids: set of task IDs this worker claimed (framework owns completion)."
   [wt-path wt-id worker-id project-root review-rounds claimed-task-ids]
   (locking merge-lock
@@ -599,7 +637,16 @@
                          (process/sh ["git" "merge" wt-id "--no-edit"]
                                      {:dir project-root :out :string :err :string}))
           success (and (zero? (:exit checkout-result))
-                       (zero? (:exit merge-result)))]
+                       (zero? (:exit merge-result)))
+          failure-text (str/join "\n"
+                                 (remove str/blank?
+                                         [(:out checkout-result)
+                                          (:err checkout-result)
+                                          (when merge-result (:out merge-result))
+                                          (when merge-result (:err merge-result))]))
+          failure-reason (if (not (zero? (:exit checkout-result)))
+                           :checkout-failed
+                           (classify-merge-failure failure-text))]
       (if success
         (do
           (println (format "[%s] Merge successful" worker-id))
@@ -610,20 +657,43 @@
                 (println (format "[%s] Completed %d task(s): %s"
                                  worker-id (count completed) (str/join ", " completed))))))
           ;; Annotate completed tasks with metadata while still holding merge-lock
-          (annotate-completed-tasks! project-root worker-id review-rounds))
+          (annotate-completed-tasks! project-root worker-id review-rounds)
+          {:ok? true :reason :merged :message "merge successful"})
         ;; FAILED: Clean up git state before releasing merge-lock.
         ;; Without this, a conflict leaves .git/MERGE_HEAD and poisons the
         ;; shared index — every subsequent worker fails on `git checkout main`.
         (do
-          (println (format "[%s] MERGE FAILED: %s" worker-id
-                           (or (:err merge-result) (:err checkout-result))))
+          (println (format "[%s] MERGE FAILED (%s): %s"
+                           worker-id
+                           (name failure-reason)
+                           (or (first-nonblank-line failure-text)
+                               "no output")))
           (let [abort-result (process/sh ["git" "merge" "--abort"]
                                          {:dir project-root :out :string :err :string})]
             (when-not (zero? (:exit abort-result))
               ;; Abort failed (no merge in progress, or other issue) — hard reset.
               (process/sh ["git" "reset" "--hard" "HEAD"]
-                          {:dir project-root :out :string :err :string})))))
-      success)))
+                          {:dir project-root :out :string :err :string})))
+          {:ok? false
+           :reason failure-reason
+           :message (or (first-nonblank-line failure-text) "merge failed")})))))
+
+(defn- recover-merge-failure!
+  "On merge-to-main failure, launch resolver agent and retry merge once.
+   Must run outside merge-lock to avoid blocking other workers."
+  [worker wt-path wt-id worker-id project-root review-rounds claimed-task-ids merge-result]
+  (let [reason (:reason merge-result)
+        msg (:message merge-result)
+        _ (println (format "[%s] Launching resolver after merge failure (%s): %s"
+                           worker-id (name (or reason :unknown)) (or msg "merge failed")))
+        resolve-status (run-resolver-agent! worker wt-path worker-id
+                                            (str "merge_to_main failed (" (name (or reason :unknown)) ")"
+                                                 (when msg (str ": " msg))))]
+    (if (= :failed resolve-status)
+      merge-result
+      (do
+        (println (format "[%s] Retrying merge after resolver" worker-id))
+        (merge-to-main! wt-path wt-id worker-id project-root review-rounds claimed-task-ids)))))
 
 (defn- task-only-diff?
   "Check if all changes in worktree are task files only (no code changes).
@@ -889,7 +959,12 @@
                                                  {:outcome :sync-failed :claimed-task-ids (vec all-claimed)})
                                 (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                                 (recur (inc cycle) (inc completed-runs) 0 metrics nil nil #{} nil 0))
-                              (let [merged? (merge-to-main! (:path wt-state) (:branch wt-state) id project-root 0 all-claimed)
+                              (let [merge-result (merge-to-main! (:path wt-state) (:branch wt-state) id project-root 0 all-claimed)
+                                    merge-result (if (:ok? merge-result)
+                                                   merge-result
+                                                   (recover-merge-failure! worker (:path wt-state) (:branch wt-state)
+                                                                           id project-root 0 all-claimed merge-result))
+                                    merged? (:ok? merge-result)
                                     metrics (if merged? (update metrics :merges inc) metrics)]
                                 (println (format "[%s] Cycle %d/%d complete" id cycle cycle-cap))
                                 (emit-cycle-log! swarm-id id cycle current-run cycle-start-ms new-session-id
@@ -914,7 +989,12 @@
                                                     :review-rounds (or attempts 0)})
                                   (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                                   (recur (inc cycle) (inc completed-runs) 0 metrics nil nil #{} nil 0))
-                                (let [merged? (merge-to-main! (:path wt-state) (:branch wt-state) id project-root (or attempts 0) all-claimed)
+                                (let [merge-result (merge-to-main! (:path wt-state) (:branch wt-state) id project-root (or attempts 0) all-claimed)
+                                      merge-result (if (:ok? merge-result)
+                                                     merge-result
+                                                     (recover-merge-failure! worker (:path wt-state) (:branch wt-state)
+                                                                             id project-root (or attempts 0) all-claimed merge-result))
+                                      merged? (:ok? merge-result)
                                       metrics (if merged? (update metrics :merges inc) metrics)]
                                   (println (format "[%s] Cycle %d/%d complete" id cycle cycle-cap))
                                   (emit-cycle-log! swarm-id id cycle current-run cycle-start-ms new-session-id
