@@ -24,7 +24,51 @@
       "items": { "type": "string" }
     },
     "error-snippet": { "type": ["string", "null"] },
-    "review-rounds": { "type": "integer", "minimum": 0 }
+    "review-rounds": { "type": "integer", "minimum": 0 },
+    "timing-ms": {
+      "type": "object",
+      "properties": {
+        "implementation-rounds-ms": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "reviewer-response-ms": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "review-fixes-ms": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "optional-review-ms": {
+          "type": "array",
+          "items": { "type": "integer", "minimum": 0 }
+        },
+        "harness-ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "other-ms": {
+          "type": "integer",
+          "minimum": 0
+        },
+        "llm-calls": {
+          "type": "array",
+          "items": {
+            "type": "object",
+            "required": ["name", "section", "duration-ms"],
+            "properties": {
+              "name": { "type": "string" },
+              "section": { "type": "string" },
+              "duration-ms": { "type": "integer", "minimum": 0 },
+              "percent": { "type": "number", "minimum": 0, "maximum": 100 }
+            },
+            "additionalProperties": false
+          }
+        }
+      },
+      "additionalProperties": false
+    }
   },
   "additionalProperties": false
 }

@@ -28,6 +28,11 @@
       "format": "date-time",
       "description": "ISO-8601 instant when the review completed"
     },
+    "duration-ms": {
+      "type": ["integer", "null"],
+      "minimum": 0,
+      "description": "Duration of the review LLM call for this round"
+    },
     "output": {
       "type": ["string", "null"],
       "description": "Full reviewer agent output (null if process failed before producing output)"

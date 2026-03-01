@@ -105,7 +105,7 @@
   "Write a review log for one cycle of a worker.
    Contains: verdict, round number, full reviewer output, diff file list."
   [swarm-id worker-id cycle round
-   {:keys [verdict output diff-files]}]
+   {:keys [verdict output diff-files duration-ms]}]
   (ensure-run-dirs! swarm-id)
   (let [filename (format "%s-c%d-r%d.json" worker-id cycle round)]
     (write-json! (str (reviews-dir swarm-id) "/" filename)
@@ -115,6 +115,7 @@
                   :verdict (name verdict)
                   :timestamp (str (java.time.Instant/now))
                   :output output
+                  :duration-ms (or duration-ms 0)
                   :diff-files (vec diff-files)})))
 
 ;; =============================================================================
@@ -128,7 +129,7 @@
    Written at cycle end so dashboards can track progress in real-time."
   [swarm-id worker-id cycle
    {:keys [run outcome duration-ms claimed-task-ids recycled-tasks
-           error-snippet review-rounds session-id]}]
+           error-snippet review-rounds session-id timing-ms]}]
   (when swarm-id
     (let [filename (format "%s-c%d.json" worker-id cycle)]
       (write-json! (str (cycles-dir swarm-id) "/" filename)
@@ -142,7 +143,8 @@
                     :recycled-tasks (or recycled-tasks [])
                     :error-snippet error-snippet
                     :review-rounds (or review-rounds 0)
-                    :session-id session-id}))))
+                    :session-id session-id
+                    :timing-ms timing-ms}))))
 
 ;; =============================================================================
 ;; Read helpers (for cmd-status, dashboards)

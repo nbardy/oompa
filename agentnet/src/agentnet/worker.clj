@@ -275,7 +275,8 @@
    prev-feedback: vector of previous review outputs (for multi-round context).
    Returns {:verdict :approved|:needs-changes|:rejected, :comments [...], :output string}"
   [{:keys [id swarm-id reviewers]} worktree-path prev-feedback]
-  (let [;; Get actual diff content (not just stat) — truncate to 8000 chars for prompt budget
+  (let [start-ms (System/currentTimeMillis)
+        ;; Get actual diff content (not just stat) — truncate to 8000 chars for prompt budget
         diff-result (process/sh ["git" "diff" "main"]
                                 {:dir worktree-path :out :string :err :string})
         diff-content (let [d (:out diff-result)]
@@ -349,7 +350,8 @@
                   (re-find #"VERDICT:\s*NEEDS_CHANGES" output) :needs-changes
                   (re-find #"VERDICT:\s*REJECTED" output) :needs-changes
                   (re-find #"(?i)\bAPPROVED\b" output) :approved
-                  :else :needs-changes)]
+                  :else :needs-changes)
+        duration-ms (- (System/currentTimeMillis) start-ms)]
 
     (println (format "[%s] Reviewer verdict: %s" id (name verdict)))
     (let [summary (subs output 0 (min 300 (count output)))]
@@ -359,14 +361,16 @@
     {:verdict verdict
      :comments (when (not= (:exit result) 0)
                  [(:err result)])
-     :output output}))
+     :output output
+     :duration-ms duration-ms}))
 
 (defn- run-fix!
   "Ask worker to fix issues based on reviewer feedback.
    all-feedback: vector of all reviewer outputs so far (accumulated across rounds).
    Returns {:output string, :exit int}"
   [{:keys [id swarm-id harness model]} worktree-path all-feedback]
-  (let [swarm-id* (or swarm-id "unknown")
+  (let [start-ms (System/currentTimeMillis)
+        swarm-id* (or swarm-id "unknown")
         feedback-text (if (> (count all-feedback) 1)
                         (str "The reviewer has given feedback across " (count all-feedback) " rounds.\n"
                              "Fix ALL outstanding issues:\n\n"
@@ -390,10 +394,12 @@
                                   :in (harness/process-stdin harness fix-prompt)
                                   :out :string :err :string})
                  (catch Exception e
-                   {:exit -1 :out "" :err (.getMessage e)}))]
+                   {:exit -1 :out "" :err (.getMessage e)}))
+        duration-ms (- (System/currentTimeMillis) start-ms)]
 
     {:output (:out result)
-     :exit (:exit result)}))
+     :exit (:exit result)
+     :duration-ms duration-ms}))
 
 (defn- collect-divergence-context
   "Collect context about how a worktree branch has diverged from main.
@@ -544,13 +550,106 @@
   (let [post-ids (tasks/current-task-ids)]
     (clojure.set/difference post-ids pre-current-ids)))
 
+(defn- now-ms
+  []
+  (System/currentTimeMillis))
+
+(defn- ms->seconds
+  [ms]
+  (/ ms 1000.0))
+
+(defn- pct-of
+  [part total]
+  (if (pos? total)
+    (* 100.0 (/ part (double total)))
+    0.0))
+
+(defn- init-cycle-timing
+  []
+  {:implementation-rounds-ms []
+   :reviewer-response-ms []
+   :review-fixes-ms []
+   :optional-review-ms []
+   :llm-calls []})
+
+(defn- add-llm-call
+  [timing section-name call-name duration-ms]
+  (let [timing (or timing (init-cycle-timing))
+        duration-ms (max 0 (long (or duration-ms 0)))]
+    (-> timing
+        (update section-name (fnil conj []) duration-ms)
+        (update :llm-calls conj {:name call-name
+                                 :section section-name
+                                 :duration-ms duration-ms}))))
+
+(defn- cycle-llm-total-ms
+  [timing]
+  (->> timing
+       (select-keys [:implementation-rounds-ms :reviewer-response-ms :review-fixes-ms :optional-review-ms])
+       vals
+       (map #(reduce + 0 %))
+       (reduce + 0)))
+
+(defn- with-call-percent
+  [timing total-ms]
+  (update timing :llm-calls
+          (fn [calls]
+            (mapv (fn [{:keys [duration-ms] :as call}]
+                    (assoc call :percent (pct-of duration-ms total-ms)))
+                  calls))))
+
+(defn- format-timing-segment
+  [label durations total-ms]
+  (let [durations (vec (or durations []))
+        items (if (seq durations)
+                (str/join ", "
+                          (map #(format "%.2fs (%.1f%%)"
+                                        (ms->seconds %) (pct-of % total-ms))
+                               durations))
+                "-")
+        section-ms (reduce + 0 durations)]
+    (format "%s=[%s] %.2fs (%.1f%%)"
+            label
+            items
+            (ms->seconds section-ms)
+            (pct-of section-ms total-ms))))
+
+(defn- format-cycle-timing
+  [{:keys [implementation-rounds-ms reviewer-response-ms review-fixes-ms optional-review-ms]}
+   total-ms]
+  (let [llm-ms (cycle-llm-total-ms {:implementation-rounds-ms implementation-rounds-ms
+                                    :reviewer-response-ms reviewer-response-ms
+                                    :review-fixes-ms review-fixes-ms
+                                    :optional-review-ms optional-review-ms})
+        harness-ms (max 0 (- total-ms llm-ms))]
+    (str "timing: "
+         (format-timing-segment "Implementation" implementation-rounds-ms total-ms)
+         " | "
+         (format-timing-segment "Reviewer" reviewer-response-ms total-ms)
+         " | "
+         (format-timing-segment "Fixes" review-fixes-ms total-ms)
+         " | "
+         (format-timing-segment "OptionalReview" optional-review-ms total-ms)
+         " | LLM="
+         (format "%.2fs (%.1f%%)" (ms->seconds llm-ms) (pct-of llm-ms total-ms))
+         " | Harness="
+         (format "%.2fs (%.1f%%)" (ms->seconds harness-ms) (pct-of harness-ms total-ms))
+         " | Total="
+         (format "%.2fs" (ms->seconds total-ms)))))
+
 (defn- emit-cycle-log!
   "Write cycle event log. Called at every cycle exit point.
    session-id links to the Claude CLI conversation transcript on disk.
    No mutable summary state — all state is derived from immutable cycle logs."
   [swarm-id worker-id cycle run start-ms session-id
-   {:keys [outcome claimed-task-ids recycled-tasks error-snippet review-rounds]}]
-  (let [duration-ms (- (System/currentTimeMillis) start-ms)]
+   {:keys [outcome claimed-task-ids recycled-tasks error-snippet review-rounds timing-ms]}]
+  (let [duration-ms (- (now-ms) start-ms)
+        timing-ms (or timing-ms (init-cycle-timing))
+        harness-ms (max 0 (- duration-ms (cycle-llm-total-ms timing-ms)))
+        timing-ms (with-call-percent (assoc timing-ms
+                                           :harness-ms harness-ms
+                                           :llm-calls (or (:llm-calls timing-ms) []))
+                                    duration-ms)]
     (runs/write-cycle-log!
       swarm-id worker-id cycle
       {:run run
@@ -560,7 +659,9 @@
        :recycled-tasks (or recycled-tasks [])
        :error-snippet error-snippet
        :review-rounds (or review-rounds 0)
-       :session-id session-id})))
+       :session-id session-id
+       :timing-ms timing-ms})
+    (println (format "[%s] %s" worker-id (format-cycle-timing timing-ms duration-ms)))))
 
 (defn- recycle-orphaned-tasks!
   "Recycle tasks that a worker claimed but didn't complete.
@@ -723,16 +824,21 @@
    and fixer has full context of all prior feedback.
    Writes review logs to runs/{swarm-id}/reviews/ for post-mortem analysis.
    Returns {:approved? bool, :attempts int}"
-  [worker wt-path worker-id iteration]
+  [worker wt-path worker-id iteration & [cycle-timing]]
   (if (empty? (:reviewers worker))
     ;; No reviewer configured, auto-approve
-    {:approved? true :attempts 0}
+    {:approved? true :attempts 0 :timing (or cycle-timing (init-cycle-timing))}
 
     ;; Run review loop with accumulated feedback
     (loop [attempt 1
-           prev-feedback []]
+           prev-feedback []
+           timing (or cycle-timing (init-cycle-timing))]
       (println (format "[%s] Review attempt %d/%d" worker-id attempt max-review-retries))
-      (let [{:keys [verdict output]} (run-reviewer! worker wt-path prev-feedback)
+      (let [{:keys [verdict output duration-ms]} (run-reviewer! worker wt-path prev-feedback)
+            timing (add-llm-call timing
+                                 :reviewer-response-ms
+                                 (str "review_" attempt)
+                                 (or duration-ms 0))
             diff-files (diff-file-names wt-path)]
 
         ;; Persist review log for this round
@@ -740,13 +846,14 @@
           (runs/write-review-log! (:swarm-id worker) worker-id iteration attempt
                                   {:verdict verdict
                                    :output output
+                                   :duration-ms (or duration-ms 0)
                                    :diff-files (or diff-files [])}))
 
         (case verdict
           :approved
           (do
             (println (format "[%s] Reviewer APPROVED (attempt %d)" worker-id attempt))
-            {:approved? true :attempts attempt})
+            {:approved? true :attempts attempt :timing timing})
 
           ;; :needs-changes — always give the worker a chance to fix.
           ;; Hard rejection only happens when max review rounds are exhausted.
@@ -754,11 +861,15 @@
             (if (>= attempt max-review-retries)
               (do
                 (println (format "[%s] Max review retries reached (%d rounds)" worker-id attempt))
-                {:approved? false :attempts attempt})
+                {:approved? false :attempts attempt :timing timing})
               (do
                 (println (format "[%s] Reviewer requested changes, fixing..." worker-id))
-                (run-fix! worker wt-path all-feedback)
-                (recur (inc attempt) all-feedback)))))))))
+                (let [{:keys [duration-ms]} (run-fix! worker wt-path all-feedback)
+                      timing (add-llm-call timing
+                                           :review-fixes-ms
+                                           (str "fix_" attempt)
+                                           (or duration-ms 0))]
+                   (recur (inc attempt) all-feedback timing))))))))))
 
 ;; =============================================================================
 ;; Worker Loop
@@ -876,8 +987,9 @@
                   (when (seq recycled)
                     (println (format "[%s] Recycled %d claimed task(s) on shutdown" id (count recycled))))))
               (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state)))
-            (emit-cycle-log! swarm-id id cycle current-run (System/currentTimeMillis) session-id
-                             {:outcome :interrupted})
+            (emit-cycle-log! swarm-id id cycle current-run (now-ms) session-id
+                             {:timing-ms (init-cycle-timing)
+                              :outcome :interrupted})
             (finish :interrupted))
 
           :else
@@ -905,14 +1017,20 @@
                     (do (backoff-sleep! id errors) (recur (inc cycle) completed-runs errors metrics nil nil #{} nil 0))))
 
                 (let [resume? (or (some? session-id) (some? claim-resume-prompt))
-                      cycle-start-ms (System/currentTimeMillis)
+                      cycle-start-ms (now-ms)
+                      cycle-timing (init-cycle-timing)
                       pre-current-ids (tasks/current-task-ids)
                       _ (println (format "[%s] %s cycle %d/%d (run %d/%d)"
                                          id (if resume? "Resuming" "Starting") cycle cycle-cap current-run run-goal))
                       context (build-context)
+                      agent-start-ms (now-ms)
                       {:keys [output exit done? merge? claim-ids] :as agent-result}
                       (run-agent! worker (:path wt-state) context session-id resume?
                                   :resume-prompt-override claim-resume-prompt)
+                      cycle-timing (add-llm-call cycle-timing
+                                                 :implementation-rounds-ms
+                                                 "implementation"
+                                                 (- (now-ms) agent-start-ms))
                       new-session-id (:session-id agent-result)
                       mv-claimed-tasks (detect-claimed-tasks pre-current-ids)]
                   (cond
@@ -923,7 +1041,8 @@
                           error-msg (subs (or output "") 0 (min 200 (count (or output ""))))]
                       (println (format "[%s] Agent error (exit %d): %s" id exit error-msg))
                       (emit-cycle-log! swarm-id id cycle current-run cycle-start-ms new-session-id
-                                       {:outcome :error
+                                       {:timing-ms cycle-timing
+                                        :outcome :error
                                         :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))
                                         :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))
                                         :error-snippet error-msg})
@@ -941,7 +1060,8 @@
                           metrics (update metrics :claims + (count claimed))]
                       (println (format "[%s] Claimed %d/%d tasks" id (count claimed) (count claim-ids)))
                       (emit-cycle-log! swarm-id id cycle current-run cycle-start-ms new-session-id
-                                       {:outcome :claimed :claimed-task-ids (vec claimed)})
+                                       {:timing-ms cycle-timing
+                                        :outcome :claimed :claimed-task-ids (vec claimed)})
                       (recur (inc cycle) completed-runs 0 metrics new-session-id wt-state
                              new-claimed-ids resume-prompt 0))
 
@@ -956,7 +1076,8 @@
                               (do
                                 (println (format "[%s] Sync to main failed, skipping merge" id))
                                 (emit-cycle-log! swarm-id id cycle current-run cycle-start-ms new-session-id
-                                                 {:outcome :sync-failed :claimed-task-ids (vec all-claimed)})
+                                                 {:timing-ms cycle-timing
+                                                  :outcome :sync-failed :claimed-task-ids (vec all-claimed)})
                                 (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                                 (recur (inc cycle) (inc completed-runs) 0 metrics nil nil #{} nil 0))
                               (let [merge-result (merge-to-main! (:path wt-state) (:branch wt-state) id project-root 0 all-claimed)
@@ -968,13 +1089,15 @@
                                     metrics (if merged? (update metrics :merges inc) metrics)]
                                 (println (format "[%s] Cycle %d/%d complete" id cycle cycle-cap))
                                 (emit-cycle-log! swarm-id id cycle current-run cycle-start-ms new-session-id
-                                                 {:outcome (if merged? :merged :merge-failed)
+                                                 {:timing-ms cycle-timing
+                                                  :outcome (if merged? :merged :merge-failed)
                                                   :claimed-task-ids (vec all-claimed)
                                                   :review-rounds 0})
                                 (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                                 (recur (inc cycle) (inc completed-runs) 0 metrics nil nil #{} nil 0)))))
-                        (let [{:keys [approved? attempts]} (review-loop! worker (:path wt-state) id cycle)
-                              metrics (-> metrics
+                              (let [{:keys [approved? attempts timing]} (review-loop! worker (:path wt-state) id cycle cycle-timing)
+                                cycle-timing (or timing cycle-timing)
+                                metrics (-> metrics
                                           (update :review-rounds-total + (or attempts 0))
                                           (cond-> (not approved?) (update :rejections inc)))]
                           (if approved?
@@ -984,7 +1107,8 @@
                                 (do
                                   (println (format "[%s] Sync to main failed after approval, skipping merge" id))
                                   (emit-cycle-log! swarm-id id cycle current-run cycle-start-ms new-session-id
-                                                   {:outcome :sync-failed
+                                                   {:timing-ms cycle-timing
+                                                    :outcome :sync-failed
                                                     :claimed-task-ids (vec all-claimed)
                                                     :review-rounds (or attempts 0)})
                                   (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
@@ -998,7 +1122,8 @@
                                       metrics (if merged? (update metrics :merges inc) metrics)]
                                   (println (format "[%s] Cycle %d/%d complete" id cycle cycle-cap))
                                   (emit-cycle-log! swarm-id id cycle current-run cycle-start-ms new-session-id
-                                                   {:outcome (if merged? :merged :merge-failed)
+                                                   {:timing-ms cycle-timing
+                                                    :outcome (if merged? :merged :merge-failed)
                                                     :claimed-task-ids (vec all-claimed)
                                                     :review-rounds (or attempts 0)})
                                   (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
@@ -1007,7 +1132,8 @@
                                   metrics (update metrics :recycled + recycled)]
                               (println (format "[%s] Cycle %d/%d rejected" id cycle cycle-cap))
                               (emit-cycle-log! swarm-id id cycle current-run cycle-start-ms new-session-id
-                                               {:outcome :rejected
+                                               {:timing-ms cycle-timing
+                                                :outcome :rejected
                                                 :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))
                                                 :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))
                                                 :review-rounds (or attempts 0)})
@@ -1017,7 +1143,8 @@
                             metrics (update metrics :recycled + recycled)]
                         (println (format "[%s] Merge signaled but no changes, skipping" id))
                         (emit-cycle-log! swarm-id id cycle current-run cycle-start-ms new-session-id
-                                         {:outcome :no-changes
+                                         {:timing-ms cycle-timing
+                                          :outcome :no-changes
                                           :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))
                                           :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))})
                         (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
@@ -1028,7 +1155,8 @@
                           metrics (update metrics :recycled + recycled)]
                       (println (format "[%s] __DONE__ signal, resetting session (cycle %d/%d)" id cycle cycle-cap))
                       (emit-cycle-log! swarm-id id cycle current-run cycle-start-ms new-session-id
-                                       {:outcome :executor-done
+                                       {:timing-ms cycle-timing
+                                        :outcome :executor-done
                                         :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))
                                         :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))})
                       (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
@@ -1043,7 +1171,8 @@
                               metrics (update metrics :recycled + recycled)]
                           (println (format "[%s] Stuck after %d working resumes + nudge, resetting session" id wr))
                           (emit-cycle-log! swarm-id id cycle current-run cycle-start-ms new-session-id
-                                           {:outcome :stuck
+                                           {:timing-ms cycle-timing
+                                            :outcome :stuck
                                             :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))
                                             :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))})
                           (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
@@ -1053,7 +1182,8 @@
                         (do
                           (println (format "[%s] Working... %d/%d resumes, nudging agent to wrap up" id wr max-wr))
                           (emit-cycle-log! swarm-id id cycle current-run cycle-start-ms new-session-id
-                                           {:outcome :working
+                                           {:timing-ms cycle-timing
+                                            :outcome :working
                                             :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))})
                           (recur (inc cycle) completed-runs 0 metrics new-session-id wt-state
                                  claimed-ids nudge-prompt wr))
@@ -1062,7 +1192,8 @@
                         (do
                           (println (format "[%s] Working... (will resume, %d/%d)" id wr max-wr))
                           (emit-cycle-log! swarm-id id cycle current-run cycle-start-ms new-session-id
-                                           {:outcome :working
+                                           {:timing-ms cycle-timing
+                                            :outcome :working
                                             :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))})
                           (recur (inc cycle) completed-runs 0 metrics new-session-id wt-state
                                  claimed-ids nil wr))))))))))))))
