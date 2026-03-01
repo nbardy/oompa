@@ -584,11 +584,10 @@
 
 (defn- cycle-llm-total-ms
   [timing]
-  (->> timing
-       (select-keys [:implementation-rounds-ms :reviewer-response-ms :review-fixes-ms :optional-review-ms])
-       vals
-       (map #(reduce + 0 %))
-       (reduce + 0)))
+  (let [sections [:implementation-rounds-ms :reviewer-response-ms :review-fixes-ms :optional-review-ms]]
+    (->> sections
+         (map #(reduce + 0 (or (get timing %) [])))
+         (reduce + 0))))
 
 (defn- with-call-percent
   [timing total-ms]
