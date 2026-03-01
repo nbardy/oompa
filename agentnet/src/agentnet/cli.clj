@@ -1022,6 +1022,30 @@
         {:harness :codex :model s}))
     {:harness :codex :model s}))
 
+(defn- parse-reviewer-entry
+  "Parse reviewer config entry from either:
+   1) string model spec: \"harness:model[:reasoning]\"
+   2) map: {:model \"...\" :prompt \"path\"|[...]}.
+   Returns nil for invalid entries."
+  [entry]
+  (cond
+    (string? entry)
+    (parse-model-string entry)
+
+    (map? entry)
+    (let [model (:model entry)]
+      (when (string? model)
+        (let [parsed (parse-model-string model)
+              prompts (let [p (:prompt entry)]
+                        (cond
+                          (vector? p) p
+                          (string? p) [p]
+                          :else []))]
+          (assoc parsed :prompts prompts))))
+
+    :else
+    nil))
+
 (defn cmd-swarm
   "Run multiple worker configs from oompa.json in parallel"
   [opts args]
@@ -1039,25 +1063,25 @@
     (check-git-clean!)
 
     (let [config (json/parse-string (slurp f) true)
-          ;; Parse reviewer config — supports both formats:
-          ;; Legacy: {"review_model": "harness:model:reasoning"}
-          ;; New:    {"reviewer": {"model": "harness:model:reasoning", "prompt": ["path.md"]}}
+          ;; Parse reviewer config — supports legacy + new formats.
           generic-reviewers (cond
                               (:review_models config)
-                              (mapv parse-model-string (:review_models config))
+                              (->> (:review_models config)
+                                   (map parse-reviewer-entry)
+                                   (remove nil?)
+                                   vec)
 
                               (:review_model config)
-                              [(parse-model-string (:review_model config))]
+                              (->> [(:review_model config)]
+                                   (map parse-reviewer-entry)
+                                   (remove nil?)
+                                   vec)
 
-                              ;; New format: {"reviewer": {"model": "harness:model", "prompt": [...]}}
                               (:reviewer config)
-                              (let [rc (:reviewer config)
-                                    parsed (parse-model-string (:model rc))
-                                    prompts (let [p (:prompt rc)]
-                                              (cond (vector? p) p
-                                                    (string? p) [p]
-                                                    :else []))]
-                                [(assoc parsed :prompts prompts)])
+                              (->> [(:reviewer config)]
+                                   (map parse-reviewer-entry)
+                                   (remove nil?)
+                                   vec)
 
                               :else [])
 
@@ -1086,16 +1110,38 @@
           workers (map-indexed
                     (fn [idx wc]
                       (let [{:keys [harness model reasoning]} (parse-model-string (:model wc))
-                            ;; Support per-worker reviewer override
-                            worker-reviewer-config (:reviewer wc)
-                            specific-reviewer (when worker-reviewer-config
-                                                (let [parsed (parse-model-string (:model worker-reviewer-config))
-                                                      prompts (let [p (:prompt worker-reviewer-config)]
-                                                                (cond (vector? p) p
-                                                                      (string? p) [p]
-                                                                      :else []))]
-                                                  (assoc parsed :prompts prompts)))
-                            all-reviewers (->> (concat (if specific-reviewer [specific-reviewer] []) generic-reviewers)
+                            ;; Support per-worker reviewer override (legacy + new):
+                            ;; - review_model: "harness:model"
+                            ;; - review_models: ["harness:model", ...]
+                            ;; - reviewer: {model, prompt}
+                            ;; - reviewers: [string|map, ...]
+                            worker-reviewers (cond
+                                               (:reviewers wc)
+                                               (->> (:reviewers wc)
+                                                    (map parse-reviewer-entry)
+                                                    (remove nil?)
+                                                    vec)
+
+                                               (:review_models wc)
+                                               (->> (:review_models wc)
+                                                    (map parse-reviewer-entry)
+                                                    (remove nil?)
+                                                    vec)
+
+                                               (:reviewer wc)
+                                               (->> [(:reviewer wc)]
+                                                    (map parse-reviewer-entry)
+                                                    (remove nil?)
+                                                    vec)
+
+                                               (:review_model wc)
+                                               (->> [(:review_model wc)]
+                                                    (map parse-reviewer-entry)
+                                                    (remove nil?)
+                                                    vec)
+
+                                               :else [])
+                            all-reviewers (->> (concat worker-reviewers generic-reviewers)
                                                (map #(select-keys % [:harness :model :reasoning :prompts]))
                                                (distinct)
                                                (vec))]
