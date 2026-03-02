@@ -739,7 +739,7 @@
                          worker-id
                          cycle
                          (format "%.2fs" (ms->seconds impl-ms))))
-        (println (format "[%s] %s" worker-id (format-cycle-timing timing-ms duration-ms))))))
+        (println (format "[%s] %s" worker-id (format-cycle-timing timing-ms duration-ms)))))))
 
 
 (defn- recycle-orphaned-tasks!
@@ -1275,7 +1275,7 @@
                                             :outcome :working
                                             :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))})
                           (recur (inc cycle) completed-runs 0 metrics new-session-id wt-state
-                                 claimed-ids nil wr)))))))))))))))
+                                 claimed-ids nil wr))))))))))))))
 
 ;; =============================================================================
 ;; Multi-Worker Execution
