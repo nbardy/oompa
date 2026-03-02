@@ -21,6 +21,7 @@
             [babashka.process :as process]
             [clojure.java.io :as io]
             [clojure.set]
+            [clojure.pprint :refer [print-table]]
             [clojure.string :as str]))
 
 ;; =============================================================================
@@ -638,6 +639,74 @@
          " | Total="
          (format "%.2fs" (ms->seconds total-ms)))))
 
+(defn- safe-number
+  [v]
+  (if (number? v) (long v) 0))
+
+(defn- safe-sum
+  [v]
+  (reduce + 0 (or v [])))
+
+(defn- format-ms
+  [ms]
+  (format "%.2fs" (ms->seconds (safe-number ms))))
+
+(defn- cycle-time-sum
+  [{:keys [implementation-rounds-ms reviewer-response-ms review-fixes-ms optional-review-ms] :as timing-ms}
+   duration-ms]
+  (let [impl (safe-sum implementation-rounds-ms)
+        review (safe-sum reviewer-response-ms)
+        fixes (safe-sum review-fixes-ms)
+        optional (safe-sum optional-review-ms)
+        total (safe-number duration-ms)
+        llm (+ impl review fixes optional)
+        harness (max 0 (- total llm))]
+    {:implementation-ms impl
+     :review-ms review
+     :fixes-ms fixes
+     :optional-review-ms optional
+     :llm-ms llm
+     :harness-ms harness
+     :total-ms total}))
+
+(def ^:private empty-cycle-total
+  {:implementation-ms 0
+   :review-ms 0
+   :fixes-ms 0
+   :optional-review-ms 0
+   :llm-ms 0
+   :harness-ms 0
+   :total-ms 0})
+
+(defn- aggregate-cycle-timings-by-worker
+  [swarm-id]
+  (reduce (fn [acc {:keys [worker-id timing-ms duration-ms]}]
+            (update acc worker-id
+                    (fn [current]
+                      (merge-with + (or current empty-cycle-total)
+                                  (cycle-time-sum timing-ms duration-ms)))))
+          {}
+          (or (when swarm-id (runs/list-cycles swarm-id)) [])))
+
+(defn- worker-summary-row
+  [{:keys [id status completed cycles-completed merges claims rejections errors recycled review-rounds-total] :as _worker}
+   {:keys [implementation-ms review-ms fixes-ms harness-ms total-ms]}]
+  {:Worker id
+   :Runs (or completed cycles-completed 0)
+   :Cycles (or cycles-completed 0)
+   :Status (name status)
+   :Merges (or merges 0)
+   :Claims (or claims 0)
+   :Rejects (or rejections 0)
+   :Errors (or errors 0)
+   :Recycled (or recycled 0)
+   :ReviewRounds (or review-rounds-total 0)
+   :ImplMs (format-ms implementation-ms)
+   :ReviewMs (format-ms review-ms)
+   :FixMs (format-ms fixes-ms)
+   :HarnessMs (format-ms harness-ms)
+   :TotalMs (format-ms total-ms)})
+
 (defn- emit-cycle-log!
   "Write cycle event log. Called at every cycle exit point.
    session-id links to the Claude CLI conversation transcript on disk.
@@ -659,10 +728,19 @@
        :claimed-task-ids (vec (or claimed-task-ids []))
        :recycled-tasks (or recycled-tasks [])
        :error-snippet error-snippet
-       :review-rounds (or review-rounds 0)
-       :session-id session-id
-       :timing-ms timing-ms})
-    (println (format "[%s] %s" worker-id (format-cycle-timing timing-ms duration-ms)))))
+                                        :review-rounds (or review-rounds 0)
+                                        :session-id session-id
+                                        :timing-ms timing-ms})
+    (let [timing-ms (or timing-ms (init-cycle-timing))
+          impl-ms (reduce + 0 (or (:implementation-rounds-ms timing-ms) []))
+          short-outcomes #{:claimed :working :no-changes :executor-done :stuck}]
+      (if (and outcome (contains? short-outcomes outcome))
+        (println (format "[%s] Cycle %d continuing; implementation=%s this cycle"
+                         worker-id
+                         cycle
+                         (format "%.2fs" (ms->seconds impl-ms))))
+        (println (format "[%s] %s" worker-id (format-cycle-timing timing-ms duration-ms))))))
+
 
 (defn- recycle-orphaned-tasks!
   "Recycle tasks that a worker claimed but didn't complete.
@@ -1197,7 +1275,7 @@
                                             :outcome :working
                                             :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))})
                           (recur (inc cycle) completed-runs 0 metrics new-session-id wt-state
-                                 claimed-ids nil wr))))))))))))))
+                                 claimed-ids nil wr)))))))))))))))
 
 ;; =============================================================================
 ;; Multi-Worker Execution
@@ -1257,17 +1335,16 @@
           ;; Remove the hook so it doesn't accumulate across calls
           (try (.removeShutdownHook (Runtime/getRuntime) hook) (catch Exception _))
           (println "\nAll workers complete.")
-          (doseq [w results]
-            (println (format "  [%s] %s - %d completed, %d merges, %d claims, %d rejections, %d errors, %d recycled, %d review rounds"
-                             (:id w)
-                             (name (:status w))
-                             (:completed w)
-                             (or (:merges w) 0)
-                             (or (:claims w) 0)
-                             (or (:rejections w) 0)
-                             (or (:errors w) 0)
-                             (or (:recycled w) 0)
-                             (or (:review-rounds-total w) 0))))
+          (let [timing-by-worker (aggregate-cycle-timings-by-worker swarm-id)
+                rows (mapv (fn [result]
+                             (let [row-id (or (:id result) "")
+                                   totals (get timing-by-worker row-id empty-cycle-total)]
+                               (worker-summary-row result totals)))
+                            results)]
+            (println "\nWorker Summary")
+            (print-table [:Worker :Runs :Cycles :Status :Merges :Claims :Rejects :Errors :Recycled
+                          :ReviewRounds :ImplMs :ReviewMs :FixMs :HarnessMs :TotalMs]
+                         rows))
 
           ;; Write stopped event — all state derivable from cycle logs
           (when swarm-id
