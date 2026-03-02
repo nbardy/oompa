@@ -3,28 +3,28 @@
     {
       "model": "claude:opus",
       "prompt": ["config/prompts/planner.md"],
-      "iterations": 5,
+      "max_cycle": 5,
       "count": 1,
       "wait_between": 60
     },
     {
       "model": "codex:gpt-5.3-codex:medium",
       "prompt": ["config/prompts/executor.md"],
-      "iterations": 10,
+      "max_cycle": 10,
       "count": 2,
       "can_plan": false
     },
     {
       "model": "opencode:opencode/kimi-k2.5-free",
       "prompt": ["config/prompts/executor.md"],
-      "iterations": 10,
+      "max_cycle": 10,
       "count": 1,
       "can_plan": false
     },
     {
       "model": "gemini:gemini-3-pro-preview",
       "prompt": ["config/prompts/executor.md"],
-      "iterations": 10,
+      "max_cycle": 10,
       "count": 1,
       "can_plan": false
     }

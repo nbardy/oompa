@@ -708,10 +708,10 @@
    :TotalMs (format-ms total-ms)})
 
 (defn- emit-cycle-log!
-  "Write cycle event log. Called at every cycle exit point.
+  "Write cycle event log. Called at every cycle attempt exit point.
    session-id links to the Claude CLI conversation transcript on disk.
    No mutable summary state — all state is derived from immutable cycle logs."
-  [swarm-id worker-id cycle run start-ms session-id
+  [swarm-id worker-id cycle attempt run start-ms session-id
    {:keys [outcome claimed-task-ids recycled-tasks error-snippet review-rounds timing-ms]}]
   (let [duration-ms (- (now-ms) start-ms)
         timing-ms (or timing-ms (init-cycle-timing))
@@ -723,6 +723,7 @@
     (runs/write-cycle-log!
       swarm-id worker-id cycle
       {:run run
+       :attempt attempt
        :outcome outcome
        :duration-ms duration-ms
        :claimed-task-ids (vec (or claimed-task-ids []))
@@ -731,15 +732,12 @@
                                         :review-rounds (or review-rounds 0)
                                         :session-id session-id
                                         :timing-ms timing-ms})
-    (let [timing-ms (or timing-ms (init-cycle-timing))
-          impl-ms (reduce + 0 (or (:implementation-rounds-ms timing-ms) []))
-          short-outcomes #{:claimed :working :no-changes :executor-done :stuck}]
-      (if (and outcome (contains? short-outcomes outcome))
-        (println (format "[%s] Cycle %d continuing; implementation=%s this cycle"
-                         worker-id
-                         cycle
-                         (format "%.2fs" (ms->seconds impl-ms))))
-        (println (format "[%s] %s" worker-id (format-cycle-timing timing-ms duration-ms)))))))
+    (let [terminal-outcomes #{:merged :merge-failed :rejected :sync-failed :no-changes
+                              :executor-done :stuck :error :interrupted}]
+      (if (and outcome (contains? terminal-outcomes outcome))
+        (println (format "[%s] %s" worker-id (format-cycle-timing timing-ms duration-ms)))
+        (println (format "[%s] Cycle %d attempt %d continuing"
+                         worker-id cycle attempt))))))
 
 
 (defn- recycle-orphaned-tasks!
@@ -828,17 +826,20 @@
                            :checkout-failed
                            (classify-merge-failure failure-text))]
       (if success
-        (do
+        (let [completed (when (seq claimed-task-ids)
+                          (tasks/complete-by-ids! claimed-task-ids))
+              completed-count (count (or completed []))]
           (println (format "[%s] Merge successful" worker-id))
           ;; Framework-owned completion: move claimed tasks current→complete
-          (when (seq claimed-task-ids)
-            (let [completed (tasks/complete-by-ids! claimed-task-ids)]
-              (when (seq completed)
-                (println (format "[%s] Completed %d task(s): %s"
-                                 worker-id (count completed) (str/join ", " completed))))))
+          (when (seq completed)
+            (println (format "[%s] Completed %d task(s): %s"
+                             worker-id completed-count (str/join ", " completed))))
           ;; Annotate completed tasks with metadata while still holding merge-lock
           (annotate-completed-tasks! project-root worker-id review-rounds)
-          {:ok? true :reason :merged :message "merge successful"})
+          {:ok? true
+           :reason :merged
+           :message "merge successful"
+           :completed-count completed-count})
         ;; FAILED: Clean up git state before releasing merge-lock.
         ;; Without this, a conflict leaves .git/MERGE_HEAD and poisons the
         ;; shared index — every subsequent worker fails on `git checkout main`.
@@ -1019,6 +1020,7 @@
       (wait-for-tasks! id max-wait-for-tasks))
 
     (loop [cycle 1
+           attempt 1
            completed-runs 0
            consec-errors 0
            metrics {:merges 0 :rejections 0 :errors 0 :recycled 0 :review-rounds-total 0 :claims 0}
@@ -1066,7 +1068,7 @@
                   (when (seq recycled)
                     (println (format "[%s] Recycled %d claimed task(s) on shutdown" id (count recycled))))))
               (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state)))
-            (emit-cycle-log! swarm-id id cycle current-run (now-ms) session-id
+            (emit-cycle-log! swarm-id id cycle attempt current-run (now-ms) session-id
                              {:timing-ms (init-cycle-timing)
                               :outcome :interrupted})
             (finish :interrupted))
@@ -1093,14 +1095,16 @@
                     (do
                       (println (format "[%s] %d consecutive errors, stopping" id errors))
                       (finish :error))
-                    (do (backoff-sleep! id errors) (recur (inc cycle) completed-runs errors metrics nil nil #{} nil 0))))
+                    (do (backoff-sleep! id errors) (recur (inc cycle) 1 completed-runs errors metrics nil nil #{} nil 0))))
 
                 (let [resume? (or (some? session-id) (some? claim-resume-prompt))
                       cycle-start-ms (now-ms)
                       cycle-timing (init-cycle-timing)
                       pre-current-ids (tasks/current-task-ids)
-                      _ (println (format "[%s] %s cycle %d/%d (run %d/%d)"
-                                         id (if resume? "Resuming" "Starting") cycle cycle-cap current-run run-goal))
+                      _ (println (format "[%s] %s cycle %d/%d (run %d/%d, attempt %d)"
+                                         id
+                                         (if (= attempt 1) "Starting" "Resuming")
+                                         cycle cycle-cap current-run run-goal attempt))
                       context (build-context)
                       agent-start-ms (now-ms)
                       {:keys [output exit done? merge? claim-ids] :as agent-result}
@@ -1119,7 +1123,7 @@
                           metrics (-> metrics (update :errors inc) (update :recycled + recycled))
                           error-msg (subs (or output "") 0 (min 200 (count (or output ""))))]
                       (println (format "[%s] Agent error (exit %d): %s" id exit error-msg))
-                      (emit-cycle-log! swarm-id id cycle current-run cycle-start-ms new-session-id
+                      (emit-cycle-log! swarm-id id cycle attempt current-run cycle-start-ms new-session-id
                                        {:timing-ms cycle-timing
                                         :outcome :error
                                         :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))
@@ -1130,7 +1134,7 @@
                         (do
                           (println (format "[%s] %d consecutive errors, stopping" id errors))
                           (finish :error))
-                        (do (backoff-sleep! id errors) (recur (inc cycle) (inc completed-runs) errors metrics nil nil #{} nil 0))))
+                        (do (backoff-sleep! id errors) (recur (inc cycle) 1 (inc completed-runs) errors metrics nil nil #{} nil 0))))
 
                     (and (seq claim-ids) (not merge?) (not done?))
                     (let [_ (println (format "[%s] CLAIM signal: %s" id (str/join ", " claim-ids)))
@@ -1138,10 +1142,10 @@
                           new-claimed-ids (into claimed-ids claimed)
                           metrics (update metrics :claims + (count claimed))]
                       (println (format "[%s] Claimed %d/%d tasks" id (count claimed) (count claim-ids)))
-                      (emit-cycle-log! swarm-id id cycle current-run cycle-start-ms new-session-id
+                      (emit-cycle-log! swarm-id id cycle attempt current-run cycle-start-ms new-session-id
                                        {:timing-ms cycle-timing
                                         :outcome :claimed :claimed-task-ids (vec claimed)})
-                      (recur (inc cycle) completed-runs 0 metrics new-session-id wt-state
+                      (recur cycle (inc attempt) completed-runs 0 metrics new-session-id wt-state
                              new-claimed-ids resume-prompt 0))
 
                     merge?
@@ -1154,26 +1158,29 @@
                             (if (= :failed sync-status)
                               (do
                                 (println (format "[%s] Sync to main failed, skipping merge" id))
-                                (emit-cycle-log! swarm-id id cycle current-run cycle-start-ms new-session-id
+                                (emit-cycle-log! swarm-id id cycle attempt current-run cycle-start-ms new-session-id
                                                  {:timing-ms cycle-timing
                                                   :outcome :sync-failed :claimed-task-ids (vec all-claimed)})
                                 (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                                (recur (inc cycle) (inc completed-runs) 0 metrics nil nil #{} nil 0))
+                                (recur (inc cycle) 1 (inc completed-runs) 0 metrics nil nil #{} nil 0))
                               (let [merge-result (merge-to-main! (:path wt-state) (:branch wt-state) id project-root 0 all-claimed)
                                     merge-result (if (:ok? merge-result)
                                                    merge-result
                                                    (recover-merge-failure! worker (:path wt-state) (:branch wt-state)
                                                                            id project-root 0 all-claimed merge-result))
                                     merged? (:ok? merge-result)
-                                    metrics (if merged? (update metrics :merges inc) metrics)]
+                                    completed-count (or (:completed-count merge-result) 0)
+                                    metrics (if (and merged? (pos? completed-count))
+                                              (update metrics :merges inc)
+                                              metrics)]
                                 (println (format "[%s] Cycle %d/%d complete" id cycle cycle-cap))
-                                (emit-cycle-log! swarm-id id cycle current-run cycle-start-ms new-session-id
+                                (emit-cycle-log! swarm-id id cycle attempt current-run cycle-start-ms new-session-id
                                                  {:timing-ms cycle-timing
                                                   :outcome (if merged? :merged :merge-failed)
                                                   :claimed-task-ids (vec all-claimed)
                                                   :review-rounds 0})
                                 (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                                (recur (inc cycle) (inc completed-runs) 0 metrics nil nil #{} nil 0)))))
+                                (recur (inc cycle) 1 (inc completed-runs) 0 metrics nil nil #{} nil 0)))))
                               (let [{:keys [approved? attempts timing]} (review-loop! worker (:path wt-state) id cycle cycle-timing)
                                 cycle-timing (or timing cycle-timing)
                                 metrics (-> metrics
@@ -1185,61 +1192,64 @@
                               (if (= :failed sync-status)
                                 (do
                                   (println (format "[%s] Sync to main failed after approval, skipping merge" id))
-                                  (emit-cycle-log! swarm-id id cycle current-run cycle-start-ms new-session-id
+                                  (emit-cycle-log! swarm-id id cycle attempt current-run cycle-start-ms new-session-id
                                                    {:timing-ms cycle-timing
                                                     :outcome :sync-failed
                                                     :claimed-task-ids (vec all-claimed)
                                                     :review-rounds (or attempts 0)})
                                   (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                                  (recur (inc cycle) (inc completed-runs) 0 metrics nil nil #{} nil 0))
+                                  (recur (inc cycle) 1 (inc completed-runs) 0 metrics nil nil #{} nil 0))
                                 (let [merge-result (merge-to-main! (:path wt-state) (:branch wt-state) id project-root (or attempts 0) all-claimed)
                                       merge-result (if (:ok? merge-result)
                                                      merge-result
                                                      (recover-merge-failure! worker (:path wt-state) (:branch wt-state)
                                                                              id project-root (or attempts 0) all-claimed merge-result))
                                       merged? (:ok? merge-result)
-                                      metrics (if merged? (update metrics :merges inc) metrics)]
+                                      completed-count (or (:completed-count merge-result) 0)
+                                      metrics (if (and merged? (pos? completed-count))
+                                              (update metrics :merges inc)
+                                              metrics)]
                                   (println (format "[%s] Cycle %d/%d complete" id cycle cycle-cap))
-                                  (emit-cycle-log! swarm-id id cycle current-run cycle-start-ms new-session-id
+                                  (emit-cycle-log! swarm-id id cycle attempt current-run cycle-start-ms new-session-id
                                                    {:timing-ms cycle-timing
                                                     :outcome (if merged? :merged :merge-failed)
                                                     :claimed-task-ids (vec all-claimed)
                                                     :review-rounds (or attempts 0)})
                                   (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                                  (recur (inc cycle) (inc completed-runs) 0 metrics nil nil #{} nil 0))))
+                                  (recur (inc cycle) 1 (inc completed-runs) 0 metrics nil nil #{} nil 0))))
                             (let [recycled (recycle-orphaned-tasks! id pre-current-ids)
                                   metrics (update metrics :recycled + recycled)]
                               (println (format "[%s] Cycle %d/%d rejected" id cycle cycle-cap))
-                              (emit-cycle-log! swarm-id id cycle current-run cycle-start-ms new-session-id
+                              (emit-cycle-log! swarm-id id cycle attempt current-run cycle-start-ms new-session-id
                                                {:timing-ms cycle-timing
                                                 :outcome :rejected
                                                 :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))
                                                 :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))
                                                 :review-rounds (or attempts 0)})
                               (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                              (recur (inc cycle) (inc completed-runs) 0 metrics nil nil #{} nil 0)))))
+                              (recur (inc cycle) 1 (inc completed-runs) 0 metrics nil nil #{} nil 0)))))
                       (let [recycled (recycle-orphaned-tasks! id pre-current-ids)
                             metrics (update metrics :recycled + recycled)]
                         (println (format "[%s] Merge signaled but no changes, skipping" id))
-                        (emit-cycle-log! swarm-id id cycle current-run cycle-start-ms new-session-id
+                        (emit-cycle-log! swarm-id id cycle attempt current-run cycle-start-ms new-session-id
                                          {:timing-ms cycle-timing
                                           :outcome :no-changes
                                           :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))
                                           :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))})
                         (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                        (recur (inc cycle) (inc completed-runs) 0 metrics nil nil #{} nil 0)))
+                        (recur (inc cycle) 1 (inc completed-runs) 0 metrics nil nil #{} nil 0)))
 
                     done?
                     (let [recycled (recycle-orphaned-tasks! id pre-current-ids)
                           metrics (update metrics :recycled + recycled)]
                       (println (format "[%s] __DONE__ signal, resetting session (cycle %d/%d)" id cycle cycle-cap))
-                      (emit-cycle-log! swarm-id id cycle current-run cycle-start-ms new-session-id
+                      (emit-cycle-log! swarm-id id cycle attempt current-run cycle-start-ms new-session-id
                                        {:timing-ms cycle-timing
                                         :outcome :executor-done
                                         :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))
                                         :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))})
                       (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                      (recur (inc cycle) completed-runs 0 metrics nil nil #{} nil 0))
+                      (recur (inc cycle) 1 completed-runs 0 metrics nil nil #{} nil 0))
 
                     :else
                     (let [wr (inc working-resumes)
@@ -1249,32 +1259,32 @@
                         (let [recycled (recycle-orphaned-tasks! id pre-current-ids)
                               metrics (update metrics :recycled + recycled)]
                           (println (format "[%s] Stuck after %d working resumes + nudge, resetting session" id wr))
-                          (emit-cycle-log! swarm-id id cycle current-run cycle-start-ms new-session-id
+                          (emit-cycle-log! swarm-id id cycle attempt current-run cycle-start-ms new-session-id
                                            {:timing-ms cycle-timing
                                             :outcome :stuck
                                             :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))
                                             :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))})
                           (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                          (recur (inc cycle) (inc completed-runs) 0 metrics nil nil #{} nil 0))
+                          (recur (inc cycle) 1 (inc completed-runs) 0 metrics nil nil #{} nil 0))
 
                         (= wr max-wr)
                         (do
                           (println (format "[%s] Working... %d/%d resumes, nudging agent to wrap up" id wr max-wr))
-                          (emit-cycle-log! swarm-id id cycle current-run cycle-start-ms new-session-id
+                          (emit-cycle-log! swarm-id id cycle attempt current-run cycle-start-ms new-session-id
                                            {:timing-ms cycle-timing
                                             :outcome :working
                                             :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))})
-                          (recur (inc cycle) completed-runs 0 metrics new-session-id wt-state
+                          (recur cycle (inc attempt) completed-runs 0 metrics new-session-id wt-state
                                  claimed-ids nudge-prompt wr))
 
                         :else
                         (do
                           (println (format "[%s] Working... (will resume, %d/%d)" id wr max-wr))
-                          (emit-cycle-log! swarm-id id cycle current-run cycle-start-ms new-session-id
+                          (emit-cycle-log! swarm-id id cycle attempt current-run cycle-start-ms new-session-id
                                            {:timing-ms cycle-timing
                                             :outcome :working
                                             :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))})
-                          (recur (inc cycle) completed-runs 0 metrics new-session-id wt-state
+                          (recur cycle (inc attempt) completed-runs 0 metrics new-session-id wt-state
                                  claimed-ids nil wr))))))))))))))
 
 ;; =============================================================================

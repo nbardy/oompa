@@ -1065,7 +1065,15 @@
                                     :prompts prompts
                                     :max-pending (or (:max_pending planner-config) 10))))
 
+
           worker-configs (:workers config)
+
+          ;; Require max_cycle to be present on all workers
+          _ (doseq [[idx wc] (map-indexed vector worker-configs)]
+              (when-not (:max_cycle wc)
+                (println (format "ERROR: Worker %d missing 'max_cycle' in config. 'iterations' has been deprecated in favor of 'max_cycle' for defining the number of full worker loops." idx))
+                (System/exit 1)))
+
 
           ;; Expand worker configs by count
           expanded-workers (mapcat (fn [wc]
@@ -1118,9 +1126,9 @@
                            :harness harness
                            :model model
                            :reasoning reasoning
-                           :runs (or (:runs wc) (:iterations wc) 10)
-                           :max-cycles (or (:max_cycles wc) (:iterations wc) (:runs wc) 10)
-                           :iterations (or (:iterations wc) 10)
+                           :runs (or (:runs wc) (:max_working_resumes wc) 10)
+                           :max-cycles (:max_cycle wc)
+                           :iterations (or (:max_working_resumes wc) 10)
                            :prompts (:prompt wc)
                            :can-plan (:can_plan wc)
                            :wait-between (:wait_between wc)
@@ -1154,8 +1162,8 @@
                            (name harness)
                            model
                            (if reasoning (str ":" reasoning) "")
-                           (or (:runs wc) (:iterations wc) 10)
-                           (or (:max_cycles wc) (:iterations wc) (:runs wc) 10)
+                           (or (:runs wc) (:max_working_resumes wc) 10)
+                           (or (:max_cycles wc) (:max_working_resumes wc) (:runs wc) 10)
                            (if (:prompt wc) (str ", " (:prompt wc)) "")))))
       (println)
 

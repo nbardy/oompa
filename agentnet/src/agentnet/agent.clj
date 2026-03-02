@@ -176,16 +176,12 @@
   #"(?m)^\s*#oompa_directive:include_file\s+\"([^\"]+)\"\s*$")
 
 (defn- read-file-cached
-  "Read a prompt file once and cache by canonical path."
+  "Reads prompts fresh on each run so roles can be edited live. It is a fast op."
   [path]
   (when path
-    (if-let [cached (get @prompt-file-cache path)]
-      cached
-      (let [f (io/file path)]
-        (when (.exists f)
-          (let [content (slurp f)]
-            (swap! prompt-file-cache assoc path content)
-            content))))))
+    (let [f (io/file path)]
+      (when (.exists f)
+        (slurp f)))))
 
 (defn- resolve-include-path
   "Resolve an include path relative to the file that declares it."
