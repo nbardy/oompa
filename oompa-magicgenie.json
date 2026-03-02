@@ -1,0 +1,15 @@
+{
+  "workers": [
+    {
+      "model": "codex:gpt-5.3-codex-spark",
+      "prompt": ["config/prompts/magicgenie-executor.md", "config/prompts/executor.md"],
+      "max_cycle": 180,
+      "count": 4,
+      "can_plan": false
+    }
+  ],
+  "reviewer": {
+    "model": "gemini:gemini-3.1",
+    "prompt": ["config/prompts/magicgenie-reviewer.md"]
+  }
+}
