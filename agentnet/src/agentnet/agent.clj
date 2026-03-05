@@ -272,6 +272,11 @@
   [output]
   (boolean (re-find #"COMPLETE_AND_READY_FOR_MERGE" (or output ""))))
 
+(defn needs-followup-signal?
+  "Check if output contains NEEDS_FOLLOWUP signal"
+  [output]
+  (boolean (re-find #"NEEDS_FOLLOWUP" (or output ""))))
+
 (defn parse-claim-signal
   "Extract task IDs from CLAIM(...) signal in output.
    Returns vector of task ID strings, or nil if no CLAIM signal found.

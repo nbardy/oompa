@@ -49,9 +49,7 @@
     (t/is (= :claimed (:outcome (first @logs))))
     (t/is (= ["task-001"] (:claimed-task-ids (first @logs))))))
 
-(t/deftest planner-done-signal-resets-like-executor
-  ;; After __DONE__ unification, planners and executors behave identically:
-  ;; each __DONE__ resets the session and continues to the next iteration.
+(t/deftest executor-done-signal-stops-worker-as-error
   (let [logs (atom [])
         result (stubbed-worker-shell
                  (fn [& _]
@@ -65,28 +63,11 @@
                    (swap! logs conj data))
                  :can-plan true
                  :iterations 3)]
-    (t/is (= :exhausted (:status result)))
-    (t/is (= 3 (count @logs)))
-    (t/is (every? #(= :executor-done (:outcome %)) @logs))))
-
-(t/deftest executor-done-signal-transitions-to-executor-done-cycle
-  (let [logs (atom [])
-        result (stubbed-worker-shell
-                 (fn [& _]
-                   {:output "__DONE__"
-                    :exit 0
-                    :done? true
-                    :merge? false
-                    :claim-ids nil
-                    :session-id "sid-3"})
-                 (fn [_ _ _ _ _ data]
-                   (swap! logs conj data))
-                 :can-plan false
-                 :iterations 1
-                 :recycle-fn (fn [& _] 0))]
-    (t/is (= :exhausted (:status result)))
+    (t/is (= :error (:status result)))
     (t/is (= 1 (count @logs)))
-    (t/is (= :executor-done (:outcome (first @logs))))))
+    (t/is (= :error (:outcome (first @logs))))
+    (t/is (re-find #"__DONE__ is not a valid executor signal"
+                   (or (:error-snippet (first @logs)) "")))))
 
 (t/deftest cycle-schema-includes-claimed-outcome
   (let [schema (json/parse-string (slurp (io/file "schemas/cycle.schema.json")) true)
@@ -104,6 +85,11 @@
   (let [schema (json/parse-string (slurp (io/file "schemas/cycle.schema.json")) true)
         outcomes (set (get-in schema [:properties :outcome :enum]))]
     (t/is (contains? outcomes "stuck"))))
+
+(t/deftest cycle-schema-includes-needs-followup-outcome
+  (let [schema (json/parse-string (slurp (io/file "schemas/cycle.schema.json")) true)
+        outcomes (set (get-in schema [:properties :outcome :enum]))]
+    (t/is (contains? outcomes "needs-followup"))))
 
 (t/deftest working-resumes-emits-stuck-after-max
   ;; With max-working-resumes=2, the worker should:

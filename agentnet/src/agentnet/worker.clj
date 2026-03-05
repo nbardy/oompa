@@ -43,11 +43,22 @@
 (declare task-root-for-cwd)
 (declare verify-mergeable?)
 
+(defn- log-ts
+  "Readable wall-clock timestamp for worker log lines."
+  []
+  (.format (java.time.format.DateTimeFormatter/ofPattern "yyyy-MM-dd HH:mm:ss")
+           (java.time.LocalDateTime/now)))
+
 (defn- load-prompt
   "Load a prompt file. Tries path as-is first, then from package root."
   [path]
   (or (agent/load-custom-prompt path)
       (agent/load-custom-prompt (str package-root "/" path))))
+
+(defn- snippet
+  [s limit]
+  (let [s (or s "")]
+    (subs s 0 (min limit (count s)))))
 
 (defn- build-template-tokens
   "Build token map for prompt template {var} substitution.
@@ -147,7 +158,8 @@
        "1. If you have meaningful changes: commit them and signal COMPLETE_AND_READY_FOR_MERGE\n"
        "2. If scope is too large: create follow-up tasks in tasks/pending/ for remaining work,\n"
        "   commit what you have (even partial notes/design docs), and signal COMPLETE_AND_READY_FOR_MERGE\n"
-       "3. If you are stuck and cannot make progress: signal __DONE__\n\n"
+       "3. If you truly cannot produce a merge-ready artifact this turn, signal NEEDS_FOLLOWUP\n"
+       "   and explain the remaining work. Treat this as a failure state, not success.\n\n"
        "Do NOT continue working without producing a signal."))
 
 (defn- build-context
@@ -189,7 +201,7 @@
                     "\n\n"
                     (if (seq claimed-ids)
                       "Work on your claimed tasks. Signal COMPLETE_AND_READY_FOR_MERGE when done."
-                      "No claims succeeded. CLAIM different tasks, or signal __DONE__ if no suitable work remains."))]
+                      "No claims succeeded. CLAIM different tasks. If you cannot finish a mergeable artifact after trying hard, signal NEEDS_FOLLOWUP with a short explanation."))]
     {:claimed claimed-ids
      :failed failed-ids
      :resume-prompt prompt}))
@@ -247,28 +259,27 @@
         tagged-prompt (str "[oompa:" swarm-id* ":" id "] " prompt)
         abs-worktree (.getAbsolutePath (io/file worktree-path))
 
-        cmd (harness/build-cmd harness
-              {:cwd abs-worktree :model model :reasoning reasoning
-               :session-id session-id :resume? resume?
-               :prompt tagged-prompt :format? true})
-
         result (try
-                 (process/sh cmd {:dir abs-worktree
-                                  :in (harness/process-stdin harness tagged-prompt)
-                                  :out :string :err :string})
+                 (harness/run-command! harness
+                                       {:cwd abs-worktree :model model :reasoning reasoning
+                                        :session-id session-id :resume? resume?
+                                        :prompt tagged-prompt :format? true})
                  (catch Exception e
                    (println (format "[%s] Agent exception: %s" id (.getMessage e)))
                    {:exit -1 :out "" :err (.getMessage e)}))
 
-        {:keys [output session-id]}
+        {:keys [output session-id warning raw-snippet]}
         (harness/parse-output harness (:out result) session-id)]
 
     {:output output
      :exit (:exit result)
      :done? (agent/done-signal? output)
      :merge? (agent/merge-signal? output)
+     :needs-followup? (agent/needs-followup-signal? output)
      :claim-ids (agent/parse-claim-signal output)
-     :session-id session-id}))
+     :session-id session-id
+     :parse-warning warning
+     :raw-snippet raw-snippet}))
 
 (defn- run-reviewer!
   "Run reviewer on worktree changes.
@@ -323,14 +334,12 @@
                                                 "After your verdict line, list every issue as a numbered item with "
                                                 "the file path and what needs to change.\n")
                                review-prompt (str "[oompa:" swarm-id* ":" id "] " review-body)
-                               cmd (harness/build-cmd harness {:cwd abs-wt :model model :prompt review-prompt})
                                res (try
-                                        (process/sh cmd {:dir abs-wt
-                                                         :in (harness/process-stdin harness review-prompt)
-                                                         :out :string :err :string})
+                                        (harness/run-command! harness {:cwd abs-wt :model model :prompt review-prompt})
                                         (catch Exception e
                                           {:exit -1 :out "" :err (.getMessage e)}))
-                               output (or (:out res) "")
+                               parsed (harness/parse-output harness (:out res) nil)
+                               output (or (:output parsed) "")
                                has-verdict? (or (re-find #"VERDICT:\s*APPROVED" output)
                                                 (re-find #"VERDICT:\s*NEEDS_CHANGES" output)
                                                 (re-find #"VERDICT:\s*REJECTED" output)
@@ -387,18 +396,15 @@
 
         abs-wt (.getAbsolutePath (io/file worktree-path))
 
-        cmd (harness/build-cmd harness
-              {:cwd abs-wt :model model :prompt fix-prompt})
-
         result (try
-                 (process/sh cmd {:dir abs-wt
-                                  :in (harness/process-stdin harness fix-prompt)
-                                  :out :string :err :string})
+                 (harness/run-command! harness
+                                       {:cwd abs-wt :model model :prompt fix-prompt})
                  (catch Exception e
                    {:exit -1 :out "" :err (.getMessage e)}))
+        parsed (harness/parse-output harness (:out result) nil)
         duration-ms (- (System/currentTimeMillis) start-ms)]
 
-    {:output (:out result)
+    {:output (:output parsed)
      :exit (:exit result)
      :duration-ms duration-ms}))
 
@@ -459,12 +465,9 @@
                             "or clean up merge blockers.\n"
                             "When done, verify with: git diff main --stat")
         abs-wt (.getAbsolutePath (io/file wt-path))
-        cmd (harness/build-cmd (:harness worker)
-              {:cwd abs-wt :model (:model worker) :prompt resolve-prompt})
         result (try
-                 (process/sh cmd {:dir abs-wt
-                                  :in (harness/process-stdin (:harness worker) resolve-prompt)
-                                  :out :string :err :string})
+                 (harness/run-command! (:harness worker)
+                                       {:cwd abs-wt :model (:model worker) :prompt resolve-prompt})
                  (catch Exception e
                    {:exit -1 :out "" :err (.getMessage e)}))]
     (if (zero? (:exit result))
@@ -977,11 +980,13 @@
       (pos? (tasks/pending-count)) true
       (pos? (tasks/current-count)) true
       (>= waited max-wait-seconds)
-      (do (println (format "[%s] No tasks after %ds, giving up" worker-id waited))
+      (do (println (format "[%s] [%s] No tasks after %ds, giving up"
+                           worker-id (log-ts) waited))
           false)
       :else
       (do (when (zero? (mod waited 60))
-            (println (format "[%s] Waiting for tasks... (%ds/%ds)" worker-id waited max-wait-seconds)))
+            (println (format "[%s] [%s] Waiting for tasks... (%ds/%ds)"
+                             worker-id (log-ts) waited max-wait-seconds)))
           (Thread/sleep (* wait-poll-interval 1000))
           (recur (+ waited wait-poll-interval))))))
 
@@ -1107,7 +1112,7 @@
                                          cycle cycle-cap current-run run-goal attempt))
                       context (build-context)
                       agent-start-ms (now-ms)
-                      {:keys [output exit done? merge? claim-ids] :as agent-result}
+                      {:keys [output exit done? merge? needs-followup? claim-ids parse-warning raw-snippet] :as agent-result}
                       (run-agent! worker (:path wt-state) context session-id resume?
                                   :resume-prompt-override claim-resume-prompt)
                       cycle-timing (add-llm-call cycle-timing
@@ -1241,19 +1246,48 @@
 
                     done?
                     (let [recycled (recycle-orphaned-tasks! id pre-current-ids)
-                          metrics (update metrics :recycled + recycled)]
-                      (println (format "[%s] __DONE__ signal, resetting session (cycle %d/%d)" id cycle cycle-cap))
+                          metrics (-> metrics
+                                      (update :recycled + recycled)
+                                      (update :errors inc))]
+                      (println (format "[%s] Invalid __DONE__ signal from executor; stopping worker (cycle %d/%d)" id cycle cycle-cap))
                       (emit-cycle-log! swarm-id id cycle attempt current-run cycle-start-ms new-session-id
                                        {:timing-ms cycle-timing
-                                        :outcome :executor-done
+                                        :outcome :error
                                         :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))
-                                        :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))})
+                                        :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))
+                                        :error-snippet "__DONE__ is not a valid executor signal; use CLAIM(...) or COMPLETE_AND_READY_FOR_MERGE"})
                       (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                      (recur (inc cycle) 1 completed-runs 0 metrics nil nil #{} nil 0))
+                      (finish :error))
+
+                    needs-followup?
+                    (let [recycled (recycle-orphaned-tasks! id pre-current-ids)
+                          metrics (-> metrics
+                                      (update :recycled + recycled)
+                                      (update :errors inc))
+                          summary (subs (or output "") 0 (min 240 (count (or output ""))))]
+                      (println (format "[%s] NEEDS_FOLLOWUP signal; stopping worker (cycle %d/%d)" id cycle cycle-cap))
+                      (emit-cycle-log! swarm-id id cycle attempt current-run cycle-start-ms new-session-id
+                                       {:timing-ms cycle-timing
+                                        :outcome :needs-followup
+                                        :claimed-task-ids (vec (into claimed-ids mv-claimed-tasks))
+                                        :recycled-tasks (when (pos? recycled) (vec mv-claimed-tasks))
+                                        :error-snippet summary})
+                      (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                      (finish :error))
 
                     :else
                     (let [wr (inc working-resumes)
                           max-wr (:max-working-resumes worker)]
+                      (when parse-warning
+                        (if (str/includes? parse-warning "AUTH_REQUIRED:")
+                          (println (format "[%s] LOGIN ISSUE: %s"
+                                           id
+                                           (str/replace parse-warning #"^AUTH_REQUIRED:\s*" "")))
+                          (println (format "[%s] WARNING: %s" id parse-warning))))
+                      (when (and parse-warning (seq raw-snippet))
+                        (println (format "[%s] Raw output snippet: %s"
+                                         id
+                                         (snippet (str/replace raw-snippet #"\s+" " ") 240))))
                       (cond
                         (> wr max-wr)
                         (let [recycled (recycle-orphaned-tasks! id pre-current-ids)
@@ -1402,16 +1436,12 @@
             tagged-prompt (str "[oompa:" swarm-id* ":planner] " prompt-text)
             abs-root (.getAbsolutePath (io/file project-root))
 
-            cmd (harness/build-cmd harness
-                  {:cwd abs-root :model model :prompt tagged-prompt})
-
             _ (println (format "[planner] Running (%s:%s, max_pending: %d, current: %d)"
                                (name harness) (or model "default") max-pending pending-before))
 
             result (try
-                     (process/sh cmd {:dir abs-root
-                                      :in (harness/process-stdin harness tagged-prompt)
-                                      :out :string :err :string})
+                     (harness/run-command! harness
+                                           {:cwd abs-root :model model :prompt tagged-prompt})
                      (catch Exception e
                        (println (format "[planner] Agent exception: %s" (.getMessage e)))
                        {:exit -1 :out "" :err (.getMessage e)}))

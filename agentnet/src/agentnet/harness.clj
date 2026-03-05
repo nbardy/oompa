@@ -37,9 +37,9 @@
 ;; NDJSON Output Parsing (harness-specific, lives here not in agent-cli)
 ;; =============================================================================
 
-(defn- parse-ndjson-output
-  "Parse NDJSON output from CLIs (opencode, gemini).
-   Returns {:session-id string|nil, :text string|nil}."
+(defn- parse-unified-jsonl-output
+  "Parse unified JSONL emitted by `agent-cli run`.
+   Returns {:session-id string|nil, :text string|nil, :warning string|nil}."
   [s]
   (let [raw (or s "")
         events (->> (str/split-lines raw)
@@ -49,27 +49,47 @@
                               (catch Exception _
                                 nil))))
                     doall)
-        session-id (or (some #(or (:sessionID %)
-                                   (:sessionId %)
-                                   (:session_id %)
-                                   (get-in % [:part :sessionID])
-                                   (get-in % [:part :sessionId]))
-                             events)
-                       (some-> (re-find #"(ses_[A-Za-z0-9]+)" raw) second))
+        event-types (->> events (keep :type) distinct (take 8) vec)
+        session-id (some->> events
+                            (keep #(when (= "session.started" (:type %))
+                                     (:sessionId %)))
+                            last)
         text (->> events
-                  (keep (fn [event]
-                          (let [event-type (or (:type event) (get-in event [:part :type]))
-                                role (or (:role event) (get-in event [:part :role]))
-                                chunk (or (:text event) (get-in event [:part :text]) (:content event))]
-                            (when (and (or (= event-type "text")
-                                           (and (= event-type "message")
-                                                (= role "assistant")))
-                                       (string? chunk)
-                                       (not (str/blank? chunk)))
-                              chunk))))
-                  (str/join ""))]
+                  (keep #(when (= "text.delta" (:type %)) (:text %)))
+                  (remove str/blank?)
+                  (str/join ""))
+        stderr-text (->> events
+                         (keep #(when (= "stderr" (:type %)) (:text %)))
+                         (remove str/blank?)
+                         (str/join ""))
+        errors (->> events
+                    (keep #(when (= "error" (:type %)) (:message %)))
+                    (remove str/blank?)
+                    vec)
+        warning (cond
+                  (and (not (str/blank? raw)) (empty? events))
+                  "agent-cli returned non-empty output, but no unified JSONL events were parsed."
+
+                  (seq errors)
+                  (str "agent-cli reported error events: " (str/join " | " (take 3 errors)))
+
+                  (and (seq events) (str/blank? text))
+                  (str "agent-cli returned unified events, but no text deltas were extracted"
+                       " (types=" (if (seq event-types)
+                                    (str/join "," event-types)
+                                    "unknown")
+                       ").")
+
+                  :else nil)]
     {:session-id session-id
-     :text (when-not (str/blank? text) text)}))
+     :text (cond
+             (not (str/blank? text)) text
+             (seq errors) (str/join "\n" errors)
+             (not (str/blank? stderr-text)) stderr-text
+             :else nil)
+     :warning warning
+     :raw-snippet (when-not (str/blank? raw)
+                    (subs raw 0 (min 400 (count raw))))}))
 
 ;; =============================================================================
 ;; Env Helpers
@@ -154,11 +174,7 @@
 
 (defn build-cmd
   "Build CLI command vector via agent-cli JSON input.
-   Sends a JSON dict to `agent-cli build --input -`, parses the CommandSpec,
-   and resolves the binary to an absolute path.
-
-   agent-cli owns all CLI flag syntax (session create/resume, model decomposition,
-   bypass flags, prompt delivery). This function just maps oompa opts to JSON."
+   Used for probe/debug flows. Execution should prefer `run-command!`."
   [harness-kw opts]
   (let [input (-> {:harness (name harness-kw)
                    :bypassPermissions true}
@@ -188,6 +204,24 @@
       :prompt prompt
       :close  "")))
 
+(defn run-command!
+  "Execute a harness through `agent-cli run`, which emits unified JSONL events."
+  [harness-kw opts]
+  (let [input (-> {:harness (name harness-kw)
+                   :mode "conversation"
+                   :prompt (:prompt opts)
+                   :cwd (:cwd opts)
+                   :yolo true}
+                  (cond->
+                    (:model opts)      (assoc :model (:model opts))
+                    (and (:session-id opts) (not (:resume? opts))) (assoc :sessionId (:session-id opts))
+                    (and (:session-id opts) (:resume? opts))       (assoc :resumeSessionId (:session-id opts))
+                    (:reasoning opts)  (assoc :reasoningEffort (:reasoning opts)))
+                  (add-extra-args harness-kw opts)
+                  json/generate-string)]
+    (process/sh ["agent-cli" "run" "--input" "-"]
+                {:in input :out :string :err :string})))
+
 ;; =============================================================================
 ;; Session Management
 ;; =============================================================================
@@ -207,17 +241,14 @@
 ;; =============================================================================
 
 (defn parse-output
-  "Parse agent output. For :ndjson harnesses, extracts session-id and text.
-   For :plain, returns output as-is.
+  "Parse unified JSONL output from `agent-cli run`.
    Returns {:output string, :session-id string}."
   [harness-kw raw-output session-id]
-  (let [{:keys [output]} (get-config harness-kw)]
-    (if (= output :ndjson)
-      (let [parsed (parse-ndjson-output raw-output)]
-        {:output     (or (:text parsed) raw-output)
-         :session-id (or (:session-id parsed) session-id)})
-      {:output     raw-output
-       :session-id session-id})))
+  (let [parsed (parse-unified-jsonl-output raw-output)]
+    {:output     (or (:text parsed) raw-output)
+     :session-id (or (:session-id parsed) session-id)
+     :warning    (:warning parsed)
+     :raw-snippet (:raw-snippet parsed)}))
 
 ;; =============================================================================
 ;; Probe / Health Check — delegates to agent-cli check

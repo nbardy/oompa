@@ -753,10 +753,10 @@
           (println "No runs found."))))))
 
 (def ^:private error-outcomes
-  #{"error" "merge-failed" "rejected" "stuck"})
+  #{"error" "merge-failed" "rejected" "stuck" "needs-followup"})
 
 (def ^:private terminal-run-outcomes
-  #{"merged" "rejected" "error" "merge-failed" "sync-failed" "stuck" "no-changes"})
+  #{"merged" "rejected" "error" "merge-failed" "sync-failed" "stuck" "no-changes" "needs-followup"})
 
 (defn- run-state
   "Derive run lifecycle state from started/stopped events + PID liveness."
