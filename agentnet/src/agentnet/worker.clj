@@ -803,21 +803,6 @@
                          worker-id cycle attempt))))))
 
 
-(defn- recycle-orphaned-tasks!
-  "Recycle tasks that a worker claimed but didn't complete.
-   Compares current/ task IDs before and after the agent ran —
-   new IDs that appeared are tasks this worker claimed. On failure
-   or rejection, move them back to pending/ so other workers can
-   pick them up. Returns count of recycled tasks."
-  [worker-id pre-current-ids]
-  (let [post-current-ids (tasks/current-task-ids)
-        orphaned-ids (clojure.set/difference post-current-ids pre-current-ids)
-        recycled (when (seq orphaned-ids)
-                   (tasks/recycle-tasks! orphaned-ids))]
-    (when (seq recycled)
-      (println (format "[%s] Recycled %d orphaned task(s): %s"
-                       worker-id (count recycled) (str/join ", " recycled))))
-    (count (or recycled []))))
 
 (defn- cleanup-worktree!
   "Remove worktree and branch."
@@ -1429,7 +1414,14 @@
    Returns seq of final worker states."
   [workers]
   (tasks/ensure-dirs!)
-  (let [swarm-id (-> workers first :swarm-id)]
+  (let [swarm-id (-> workers first :swarm-id)
+        stale-current (tasks/list-current)]
+    (when (seq stale-current)
+      (println (format "WARNING: %d task(s) already in current/ from a previous run. These may be stale claims."
+                       (count stale-current)))
+      (doseq [t stale-current]
+        (println (format "  - %s: %s" (:id t) (:summary t))))
+      (println "  Run `oompa requeue` to move them back to pending/ if they are stale."))
     (println (format "Launching %d workers..." (count workers)))
 
     ;; Register JVM shutdown hook so SIGTERM/SIGINT triggers graceful stop.
