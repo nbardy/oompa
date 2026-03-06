@@ -1,0 +1,1 @@
+{:description "Execute this roadmap item from TODO_plan.md under section: 5) UI strategy.\nRoadmap checkbox.", :difficulty :medium, :acceptance ["Complete work implied by: Route split:"], :targets ["app" "lib" "docs"], :summary "TODO plan: Route split:", :priority 2, :execution_type "wish", :plan_phase "5) UI strategy", :files ["TODO_plan.md"]}

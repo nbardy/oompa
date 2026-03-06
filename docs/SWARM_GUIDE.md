@@ -2,6 +2,8 @@
 
 This guide translates the [Oompa Swarm Philosophy](./oompa_philosophy.md) into concrete `oompa.json` configurations. Read the philosophy first—this doc assumes you understand Artificial Generalism, Divergence/Convergence, Stub & Smooth, the Intelligence-to-Ambiguity Ratio, and Resisting Entropy.
 
+For JSON worker configs, use `max_cycle`. The CLI `loop` command still uses `--iterations`.
+
 
 ## 1. Worker Profiles
 
@@ -11,21 +13,21 @@ The Philosophy's Intelligence-to-Ambiguity Ratio maps directly to three worker p
 
 - **Model:** Large, high-reasoning (e.g., `claude:opus`, `codex:gpt-5.3-codex:xhigh`).
 - **Role:** The Planner does **not** write code. It reads the initial `spec.md`, explores the codebase, and breaks the work down into atomic, highly detailed `.edn` files in `tasks/pending/`. This is the Slow Squeeze—spending massive tokens upfront to produce a dense, mathematically sound plan. **Crucially, the Planner must format tickets according to the rules in [`EDN_TICKETS.md`](./EDN_TICKETS.md) to prevent complex escape characters (like LaTeX math) from crashing the Clojure parser.**
-- **Config:** `can_plan: true`, low iterations (e.g., 3–5), single instance (`count: 1`).
+- **Config:** `can_plan: true`, low `max_cycle` (e.g., 3–5), single instance (`count: 1`).
 - **Prompt:** `config/prompts/planner.md`
 
 ### The Advanced Executor (Medium Ambiguity → Capable Generalists)
 
 - **Model:** Large/Medium (e.g., `codex:gpt-5.3-codex:high`, `claude:sonnet`).
 - **Role:** Takes on complex tasks that require structural changes, refactoring, or setting up new abstractions. Per the Generalist Founder principle, these agents have full context access and can push back on plans that break other domains. They can spawn sub-tasks if they realize a task is too big.
-- **Config:** `can_plan: false`, medium iterations.
+- **Config:** `can_plan: false`, medium `max_cycle`.
 - **Prompt:** `config/prompts/worker.md`
 
 ### The Simple Executor (Zero Ambiguity → Flood It)
 
 - **Model:** Small, fast, cheap (e.g., `opencode:opencode/kimi-k2.5-free`, `codex:gpt-5.3-codex:low`).
 - **Role:** Pure execution. They pick up densely scoped specs and expand them into code. The Simple Executor will panic, hallucinate an architecture, and fail the review if given vague tasks—so never give them vague tasks. These are the cheap, fast models you flood the problem with once ambiguity reaches zero.
-- **Config:** `can_plan: false`, high iterations (e.g., 15), multiple instances (`count: 3–5`).
+- **Config:** `can_plan: false`, high `max_cycle` (e.g., 15), multiple instances (`count: 3–5`).
 - **Prompt:** `config/prompts/executor.md` (strictly forbids creating new tasks)
 
 ### The Reviewer (The Constant Gatekeeper)
@@ -36,9 +38,9 @@ The Philosophy's Intelligence-to-Ambiguity Ratio maps directly to three worker p
 
 ### The Docs Architect (Resisting Entropy)
 
-- **Model:** High-tier, low iteration (e.g., `claude:sonnet`, iterations: 2–3).
+- **Model:** High-tier, low cycle count (e.g., `claude:sonnet`, `max_cycle: 2-3`).
 - **Role:** In any swarm that lasts longer than an hour, documentation drifts. This agent's sole purpose is to continuously read, consolidate, and clean the central `.md` specs so the executors don't get confused by stale reality. Not optional for long-running swarms.
-- **Config:** `can_plan: false`, low iterations, single instance. Runs on a loop or triggered periodically.
+- **Config:** `can_plan: false`, low `max_cycle`, single instance. Runs on a loop or triggered periodically.
 - **Prompt:** `config/prompts/docs_architect.md`
 
 
@@ -54,20 +56,20 @@ For taking a vague user spec and turning it into a massive PR. This pattern impl
     {
       "model": "codex:gpt-5.3-codex:xhigh",
       "prompt": ["config/prompts/planner.md"],
-      "iterations": 5,
+      "max_cycle": 5,
       "count": 1
     },
     {
       "model": "codex:gpt-5.3-codex:high",
       "prompt": ["config/prompts/worker.md"],
-      "iterations": 10,
+      "max_cycle": 10,
       "count": 2,
       "can_plan": false
     },
     {
       "model": "opencode:opencode/kimi-k2.5-free",
       "prompt": ["config/prompts/executor.md"],
-      "iterations": 15,
+      "max_cycle": 15,
       "count": 4,
       "can_plan": false
     }
@@ -91,7 +93,7 @@ For when a test suite is failing and you need many hands to fix isolated issues.
     {
       "model": "codex:gpt-5.3-codex:low",
       "prompt": ["config/prompts/executor.md", "config/prompts/fixer.md"],
-      "iterations": 5,
+      "max_cycle": 5,
       "count": 8,
       "can_plan": false
     }
@@ -109,27 +111,27 @@ For large features or multi-day efforts where entropy becomes the dominant failu
     {
       "model": "codex:gpt-5.3-codex:xhigh",
       "prompt": ["config/prompts/planner.md"],
-      "iterations": 5,
+      "max_cycle": 5,
       "count": 1
     },
     {
       "model": "claude:sonnet",
       "prompt": ["config/prompts/docs_architect.md"],
-      "iterations": 3,
+      "max_cycle": 3,
       "count": 1,
       "can_plan": false
     },
     {
       "model": "codex:gpt-5.3-codex:high",
       "prompt": ["config/prompts/worker.md"],
-      "iterations": 10,
+      "max_cycle": 10,
       "count": 2,
       "can_plan": false
     },
     {
       "model": "opencode:opencode/kimi-k2.5-free",
       "prompt": ["config/prompts/executor.md"],
-      "iterations": 15,
+      "max_cycle": 15,
       "count": 4,
       "can_plan": false
     }

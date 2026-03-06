@@ -83,9 +83,9 @@ This repo has a fleshed out version of the idea. The oompa loompas are organized
 ```json
 {
   "workers": [
-    {"model": "claude:opus", "prompt": ["config/prompts/planner.md"], "iterations": 5, "count": 1},
-    {"model": "codex:gpt-5.3-codex:medium", "prompt": ["config/prompts/executor.md"], "iterations": 10, "count": 2, "can_plan": false},
-    {"model": "opencode:opencode/kimi-k2.5-free", "prompt": ["config/prompts/executor.md"], "iterations": 10, "count": 1, "can_plan": false}
+    {"model": "claude:opus", "prompt": ["config/prompts/planner.md"], "max_cycle": 5, "count": 1},
+    {"model": "codex:gpt-5.3-codex:medium", "prompt": ["config/prompts/executor.md"], "max_cycle": 10, "count": 2, "can_plan": false},
+    {"model": "opencode:opencode/kimi-k2.5-free", "prompt": ["config/prompts/executor.md"], "max_cycle": 10, "count": 1, "can_plan": false}
   ]
 }
 ```
@@ -101,10 +101,12 @@ This spawns:
 |-------|----------|-------------|
 | `model` | yes | `harness:model` or `harness:model:reasoning` (e.g. `codex:gpt-5.3-codex:medium`, `claude:opus`, `opencode:opencode/kimi-k2.5-free`) |
 | `prompt` | no | String or array of paths — concatenated into one prompt |
-| `iterations` | no | Max iterations per worker (default: 10) |
+| `max_cycle` | no | Max worker cycles for JSON config runs (default: 10) |
 | `count` | no | Number of workers with this config (default: 1) |
 | `can_plan` | no | If `false`, worker waits for tasks before starting (default: `true`) |
 | `max_wait_for_tasks` | no | Max seconds a `can_plan: false` worker waits for queue work (default: `600`) |
+
+`oompa loop` still uses the CLI flag `--iterations`. JSON worker configs use `max_cycle`.
 
 #### Composable prompts
 
