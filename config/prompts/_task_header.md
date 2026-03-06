@@ -33,6 +33,6 @@ Always read/write queue files via `{{TASKS_ROOT}}/...` (not hard-coded local `ta
 
 - **`CLAIM(id, ...)`** — Claim one or more pending tasks. Batch related tasks together.
 - **`COMPLETE_AND_READY_FOR_MERGE`** — Your work is done and ready for review. Framework reviews, merges, and marks your claimed tasks complete.
-- **`NEEDS_FOLLOWUP`** — Last resort failure signal. Use only if you tried hard and still cannot produce a merge-ready artifact this turn. Explain the remaining work after the signal.
+- **`NEEDS_FOLLOWUP`** — Last resort continuation signal. Use only if you tried hard and still cannot produce a merge-ready artifact from the current context. Explain the remaining work after the signal. The framework will keep your claimed tasks and resume you with a sharper follow-up prompt. This is not success.
 
-One signal per output. Claim before working.
+One signal per output. Claim before working. Do not output `DONE`.

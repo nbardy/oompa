@@ -210,6 +210,12 @@
       (unclaim-task! task))
     (mapv :id to-recycle)))
 
+(defn recycle-all-current!
+  "Move every task from current/ back to pending/.
+   Returns vector of recycled task IDs."
+  []
+  (recycle-tasks! (current-task-ids)))
+
 (defn all-complete?
   "True if no pending or current tasks"
   []

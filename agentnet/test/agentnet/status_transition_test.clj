@@ -7,45 +7,74 @@
             [clojure.java.io :as io]
             [clojure.test :as t]))
 
-(defn- stubbed-worker-shell [run-agent-fn emit-log-fn & {:keys [can-plan iterations recycle-fn max-working-resumes]}]
+(defn- stubbed-worker-shell
+  [run-agent-fn emit-log-fn
+   & {:keys [can-plan iterations max-working-resumes max-needs-followups
+             task-status pending-tasks current-count current-task-ids
+             worktree-has-changes? review-loop-fn sync-fn merge-fn
+             recycle-tasks-fn]}]
   (with-redefs [tasks/ensure-dirs! (fn [] nil)
                 tasks/pending-count (fn [] 1)
-                tasks/current-count (fn [] 0)
-                tasks/current-task-ids (fn [] #{})
-                worker/create-iteration-worktree! (fn [_ _ _] {:dir ".wt" :branch "oompa/w0" :path "/tmp/wt"})
+                tasks/current-count (fn [] (or current-count 0))
+                tasks/current-task-ids (fn [] (or current-task-ids #{}))
+                tasks/recycle-tasks! (or recycle-tasks-fn (fn [ids] (vec (sort ids))))
+                worker/create-iteration-worktree! (fn [_ _ _ _]
+                                                   {:dir ".wt" :branch "oompa/w0" :path "/tmp/wt"})
                 worker/cleanup-worktree! (fn [& _] nil)
-                worker/build-context (fn [] {:task_status "Pending: 1, In Progress: 0, Complete: 0"
-                                             :pending_tasks "- task-001: Build thing"})
+                worker/backoff-sleep! (fn [& _] nil)
+                worker/build-context (fn []
+                                       {:task_status (or task-status "Pending: 1, In Progress: 0, Complete: 0")
+                                        :pending_tasks (or pending-tasks "- task-001: Build thing")})
                 worker/run-agent! run-agent-fn
                 worker/execute-claims! (fn [_]
                                          {:claimed ["task-001"]
                                           :failed []
                                           :resume-prompt "## Claim Results"})
-                worker/recycle-orphaned-tasks! (or recycle-fn (fn [& _] 0))
+                worker/worktree-has-changes? (if (fn? worktree-has-changes?)
+                                               worktree-has-changes?
+                                               (fn [_] (boolean worktree-has-changes?)))
+                worker/task-only-diff? (fn [_] false)
+                worker/review-loop! (or review-loop-fn (fn [& _] {:approved? true :attempts 0}))
+                worker/sync-worktree-to-main! (or sync-fn (fn [& _] :ok))
+                worker/merge-to-main! (or merge-fn (fn [& _] {:ok? true :completed-count 1}))
+                worker/recover-merge-failure! (fn [& _] {:ok? false :completed-count 0})
                 worker/emit-cycle-log! emit-log-fn]
-    (worker/run-worker! (cond-> {:id "w0"
-                                  :harness :codex
-                                  :model "gpt-5"
-                                  :iterations (or iterations 1)
-                                  :can-plan (if (nil? can-plan) true can-plan)
-                                  :max-working-resumes (or max-working-resumes 5)}
-                          true identity))))
+    (worker/run-worker! {:id "w0"
+                         :harness :codex
+                         :model "gpt-5"
+                         :iterations (or iterations 1)
+                         :can-plan (if (nil? can-plan) true can-plan)
+                         :max-working-resumes (or max-working-resumes 5)
+                         :max-needs-followups (or max-needs-followups 1)})))
+
+(defn- capture-log!
+  [logs]
+  (fn [& xs]
+    (swap! logs conj (last xs))))
 
 (t/deftest claim-signal-transitions-to-claimed-cycle
   (let [logs (atom [])
+        call-count (atom 0)
         result (stubbed-worker-shell
                  (fn [& _]
-                   {:output "CLAIM(task-001)"
-                    :exit 0
-                    :done? false
-                    :merge? false
-                    :claim-ids ["task-001"]
-                    :session-id "sid-1"})
-                 (fn [_ _ _ _ _ data]
-                   (swap! logs conj data)))]
+                   (swap! call-count inc)
+                   (case @call-count
+                     1 {:output "CLAIM(task-001)"
+                        :exit 0
+                        :done? false
+                        :merge? false
+                        :claim-ids ["task-001"]
+                        :session-id "sid-1"}
+                     {:output "COMPLETE_AND_READY_FOR_MERGE"
+                      :exit 0
+                      :done? false
+                      :merge? true
+                      :claim-ids nil
+                      :session-id "sid-1"}))
+                 (capture-log! logs))]
     (t/is (= :exhausted (:status result)))
     (t/is (= 1 (:claims result)))
-    (t/is (= 1 (count @logs)))
+    (t/is (= 2 (count @logs)))
     (t/is (= :claimed (:outcome (first @logs))))
     (t/is (= ["task-001"] (:claimed-task-ids (first @logs))))))
 
@@ -59,15 +88,123 @@
                     :merge? false
                     :claim-ids nil
                     :session-id "sid-2"})
-                 (fn [_ _ _ _ _ data]
-                   (swap! logs conj data))
-                 :can-plan true
+                 (capture-log! logs)
                  :iterations 3)]
     (t/is (= :error (:status result)))
     (t/is (= 1 (count @logs)))
     (t/is (= :error (:outcome (first @logs))))
     (t/is (re-find #"__DONE__ is not a valid executor signal"
                    (or (:error-snippet (first @logs)) "")))))
+
+(t/deftest needs-followup-resumes-same-cycle-and-keeps-claims
+  (let [logs (atom [])
+        prompts-seen (atom [])
+        call-count (atom 0)
+        result (stubbed-worker-shell
+                 (fn [_ _ _ _ _ & {:keys [resume-prompt-override]}]
+                   (swap! call-count inc)
+                   (swap! prompts-seen conj resume-prompt-override)
+                   (case @call-count
+                     1 {:output "CLAIM(task-001)"
+                        :exit 0
+                        :done? false
+                        :merge? false
+                        :claim-ids ["task-001"]
+                        :session-id "sid-followup"}
+                     2 {:output "NEEDS_FOLLOWUP\n\nNeed one sharper pass to finish the merge-ready diff."
+                        :exit 0
+                        :done? false
+                        :merge? false
+                        :needs-followup? true
+                        :claim-ids nil
+                        :session-id "sid-followup"}
+                     {:output "COMPLETE_AND_READY_FOR_MERGE"
+                      :exit 0
+                      :done? false
+                      :merge? true
+                      :claim-ids nil
+                      :session-id "sid-followup"}))
+                 (capture-log! logs)
+                 :iterations 1
+                 :worktree-has-changes? true)]
+    (t/is (= :exhausted (:status result)))
+    (t/is (= [:claimed :needs-followup :merged] (mapv :outcome @logs)))
+    (t/is (= ["task-001"] (:claimed-task-ids (last @logs))))
+    (t/is (nil? (nth @prompts-seen 0)))
+    (t/is (re-find #"Claim Results" (nth @prompts-seen 1)))
+    (t/is (string? (nth @prompts-seen 2)))
+    (t/is (re-find #"NEEDS_FOLLOWUP Follow-up" (nth @prompts-seen 2)))))
+
+(t/deftest terminal-no-changes-recycles-claims-from-earlier-attempt
+  (let [logs (atom [])
+        recycled (atom [])
+        call-count (atom 0)
+        result (stubbed-worker-shell
+                 (fn [& _]
+                   (swap! call-count inc)
+                   (case @call-count
+                     1 {:output "CLAIM(task-001)"
+                        :exit 0
+                        :done? false
+                        :merge? false
+                        :claim-ids ["task-001"]
+                        :session-id "sid-no-changes"}
+                     {:output "COMPLETE_AND_READY_FOR_MERGE"
+                      :exit 0
+                      :done? false
+                      :merge? true
+                      :claim-ids nil
+                      :session-id "sid-no-changes"}))
+                 (capture-log! logs)
+                 :iterations 1
+                 :worktree-has-changes? false
+                 :recycle-tasks-fn (fn [ids]
+                                     (let [ids (vec (sort ids))]
+                                       (swap! recycled conj ids)
+                                       ids)))]
+    (t/is (= :exhausted (:status result)))
+    (t/is (= [["task-001"]] @recycled))
+    (t/is (= :no-changes (:outcome (last @logs))))
+    (t/is (= ["task-001"] (:recycled-tasks (last @logs))))))
+
+(t/deftest exhausted-needs-followup-recycles-claims-and-stops
+  (let [logs (atom [])
+        recycled (atom [])
+        call-count (atom 0)
+        result (stubbed-worker-shell
+                 (fn [& _]
+                   (swap! call-count inc)
+                   (case @call-count
+                     1 {:output "CLAIM(task-001)"
+                        :exit 0
+                        :done? false
+                        :merge? false
+                        :claim-ids ["task-001"]
+                        :session-id "sid-followup-limit"}
+                     2 {:output "NEEDS_FOLLOWUP\n\nFirst follow-up."
+                        :exit 0
+                        :done? false
+                        :merge? false
+                        :needs-followup? true
+                        :claim-ids nil
+                        :session-id "sid-followup-limit"}
+                     {:output "NEEDS_FOLLOWUP\n\nStill blocked."
+                      :exit 0
+                      :done? false
+                      :merge? false
+                      :needs-followup? true
+                      :claim-ids nil
+                      :session-id "sid-followup-limit"}))
+                 (capture-log! logs)
+                 :iterations 3
+                 :max-needs-followups 1
+                 :recycle-tasks-fn (fn [ids]
+                                     (let [ids (vec (sort ids))]
+                                       (swap! recycled conj ids)
+                                       ids)))]
+    (t/is (= :error (:status result)))
+    (t/is (= [["task-001"]] @recycled))
+    (t/is (= :needs-followup (:outcome (last @logs))))))
 
 (t/deftest cycle-schema-includes-claimed-outcome
   (let [schema (json/parse-string (slurp (io/file "schemas/cycle.schema.json")) true)
@@ -92,11 +229,6 @@
     (t/is (contains? outcomes "needs-followup"))))
 
 (t/deftest working-resumes-emits-stuck-after-max
-  ;; With max-working-resumes=2, the worker should:
-  ;; iter 1: working (wr=1, under limit)
-  ;; iter 2: working (wr=2, at limit → nudge injected for next resume)
-  ;; iter 3: working (wr=3, > limit → stuck, session reset)
-  ;; iter 4: exhausted (iterations=4, fresh start, working again wr=1)
   (let [logs (atom [])
         result (stubbed-worker-shell
                  (fn [& _]
@@ -106,26 +238,21 @@
                     :merge? false
                     :claim-ids nil
                     :session-id "sid-stuck"})
-                 (fn [_ _ _ _ _ data]
-                   (swap! logs conj data))
-                 :iterations 4
+                 (capture-log! logs)
+                 :iterations 1
                  :max-working-resumes 2)]
     (t/is (= :exhausted (:status result)))
     (let [outcomes (mapv :outcome @logs)]
-      ;; 3 working + 1 stuck = 4 logs (iter 4 is working again after reset)
-      (t/is (= 4 (count outcomes)))
-      (t/is (= :working (nth outcomes 0)))  ;; wr=1
-      (t/is (= :working (nth outcomes 1)))  ;; wr=2, nudge queued
-      (t/is (= :stuck   (nth outcomes 2)))  ;; wr=3 > max, killed
-      (t/is (= :working (nth outcomes 3))))))  ;; fresh session, wr=1
+      (t/is (= 3 (count outcomes)))
+      (t/is (= :working (nth outcomes 0)))
+      (t/is (= :working (nth outcomes 1)))
+      (t/is (= :stuck (nth outcomes 2))))))
 
 (t/deftest nudge-prompt-injected-at-max-working-resumes
-  ;; Verify the nudge prompt is passed as resume-prompt-override when wr hits max.
-  ;; At wr=max, the nudge is queued for the NEXT run-agent! call.
   (let [prompts-seen (atom [])
         call-count (atom 0)]
     (stubbed-worker-shell
-      (fn [worker wt-path context session-id resume? & {:keys [resume-prompt-override]}]
+      (fn [_ _ _ _ _ & {:keys [resume-prompt-override]}]
         (swap! call-count inc)
         (swap! prompts-seen conj resume-prompt-override)
         {:output "still working"
@@ -135,18 +262,12 @@
          :claim-ids nil
          :session-id "sid-nudge"})
       (fn [& _] nil)
-      :iterations 4
+      :iterations 1
       :max-working-resumes 2)
-    ;; Call 1 (iter 1): fresh start, no override
-    ;; Call 2 (iter 2): resume, wr=1, no nudge yet
-    ;; Call 3 (iter 3): resume, wr=2 (at limit), nudge injected
-    ;; iter 3 returns working → wr=3 > max → stuck → session reset
-    ;; Call 4 (iter 4): fresh start again, no override
-    (t/is (= 4 @call-count))
-    (t/is (nil? (nth @prompts-seen 0)))      ;; fresh start
-    (t/is (nil? (nth @prompts-seen 1)))      ;; wr=1, under limit
-    (t/is (string? (nth @prompts-seen 2)))   ;; wr=2, nudge injected
-    (t/is (nil? (nth @prompts-seen 3)))))
+    (t/is (= 3 @call-count))
+    (t/is (nil? (nth @prompts-seen 0)))
+    (t/is (nil? (nth @prompts-seen 1)))
+    (t/is (string? (nth @prompts-seen 2)))))
 
 (defn run-tests! []
   (let [{:keys [fail error]} (t/run-tests 'agentnet.status-transition-test)]

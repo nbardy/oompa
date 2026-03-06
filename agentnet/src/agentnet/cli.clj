@@ -1215,6 +1215,26 @@
       (doseq [t (tasks/list-current)]
         (println (format "  - %s: %s" (:id t) (:summary t)))))))
 
+(defn cmd-requeue
+  "Move current/ tasks back to pending/.
+   With args, only requeue those task IDs. Without args, requeue all current tasks."
+  [opts args]
+  (tasks/ensure-dirs!)
+  (let [current-ids (->> (tasks/list-current) (map :id) set)
+        requested-ids (if (seq args) (set args) current-ids)
+        recyclable-ids (set (filter current-ids requested-ids))
+        recycled (if (seq args)
+                   (tasks/recycle-tasks! recyclable-ids)
+                   (tasks/recycle-all-current!))
+        missing (sort (remove recyclable-ids requested-ids))]
+    (if (seq recycled)
+      (println (format "Requeued %d task(s): %s"
+                       (count recycled)
+                       (str/join ", " recycled)))
+      (println "No current tasks were requeued."))
+    (when (seq missing)
+      (println (format "Not in current/: %s" (str/join ", " missing))))))
+
 (defn- find-latest-swarm-id
   "Find the most recent swarm ID from runs/ directory."
   []
@@ -1290,6 +1310,7 @@
   (println "  loop N           Run N iterations")
   (println "  swarm [file]     Run multiple worker configs from oompa.json (parallel)")
   (println "  tasks            Show task status (pending/current/complete)")
+  (println "  requeue [ids..]  Move current tasks back to pending")
   (println "  prompt \"...\"     Run ad-hoc prompt")
   (println "  status           Show running swarms")
   (println "  info             Show detailed summary of the last run")
@@ -1355,6 +1376,7 @@
    "loop" cmd-loop
    "swarm" cmd-swarm
    "tasks" cmd-tasks
+   "requeue" cmd-requeue
    "prompt" cmd-prompt
    "status" cmd-status
    "info" cmd-info
