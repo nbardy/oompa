@@ -269,7 +269,10 @@
                    {:exit -1 :out "" :err (.getMessage e)}))
 
         {:keys [output session-id warning raw-snippet]}
-        (harness/parse-output harness (:out result) session-id)]
+        (harness/parse-output harness (:out result) session-id)
+        stderr-snippet (let [stderr (some-> (:err result) str/trim)]
+                         (when (seq stderr)
+                           (subs stderr 0 (min 400 (count stderr)))))]
 
     {:output output
      :exit (:exit result)
@@ -279,7 +282,8 @@
      :claim-ids (agent/parse-claim-signal output)
      :session-id session-id
      :parse-warning warning
-     :raw-snippet raw-snippet}))
+     :raw-snippet raw-snippet
+     :stderr-snippet stderr-snippet}))
 
 (defn- run-reviewer!
   "Run reviewer on worktree changes.
@@ -1120,6 +1124,7 @@
                                                  "implementation"
                                                  (- (now-ms) agent-start-ms))
                       new-session-id (:session-id agent-result)
+                      stderr-snippet (:stderr-snippet agent-result)
                       mv-claimed-tasks (detect-claimed-tasks pre-current-ids)]
                   (cond
                     (not (zero? exit))
@@ -1128,6 +1133,10 @@
                           metrics (-> metrics (update :errors inc) (update :recycled + recycled))
                           error-msg (subs (or output "") 0 (min 200 (count (or output ""))))]
                       (println (format "[%s] Agent error (exit %d): %s" id exit error-msg))
+                      (when (seq stderr-snippet)
+                        (println (format "[%s] Agent stderr snippet: %s"
+                                         id
+                                         (snippet (str/replace stderr-snippet #"\s+" " ") 240))))
                       (emit-cycle-log! swarm-id id cycle attempt current-run cycle-start-ms new-session-id
                                        {:timing-ms cycle-timing
                                         :outcome :error
@@ -1288,6 +1297,10 @@
                         (println (format "[%s] Raw output snippet: %s"
                                          id
                                          (snippet (str/replace raw-snippet #"\s+" " ") 240))))
+                      (when (seq stderr-snippet)
+                        (println (format "[%s] Agent stderr snippet: %s"
+                                         id
+                                         (snippet (str/replace stderr-snippet #"\s+" " ") 240))))
                       (cond
                         (> wr max-wr)
                         (let [recycled (recycle-orphaned-tasks! id pre-current-ids)

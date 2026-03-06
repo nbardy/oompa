@@ -34,11 +34,9 @@
                     ([_] (base-tokens))
                     ([_ _] (base-tokens)))
                   harness/make-session-id (fn [_] "sid-1")
-                  harness/build-cmd (fn [_ opts]
-                                      (reset! captured-prompt (:prompt opts))
-                                      ["echo" "ok"])
-                  harness/process-stdin (fn [& _] :close)
-                  process/sh (fn [& _] {:exit 0 :out "WORKING" :err ""})
+                  harness/run-command! (fn [_ opts]
+                                         (reset! captured-prompt (:prompt opts))
+                                         {:exit 0 :out "WORKING" :err ""})
                   harness/parse-output (fn [_ out session-id]
                                          {:output out :session-id session-id})]
       (worker/run-agent! {:id "w0"
@@ -71,11 +69,9 @@
                     ([_] {:context_header "SHOULD_NOT_APPEAR"})
                     ([_ _] {:context_header "SHOULD_NOT_APPEAR"}))
                   harness/make-session-id (fn [_] "sid-2")
-                  harness/build-cmd (fn [_ opts]
-                                      (reset! captured-prompt (:prompt opts))
-                                      ["echo" "ok"])
-                  harness/process-stdin (fn [& _] :close)
-                  process/sh (fn [& _] {:exit 0 :out "WORKING" :err ""})
+                  harness/run-command! (fn [_ opts]
+                                         (reset! captured-prompt (:prompt opts))
+                                         {:exit 0 :out "WORKING" :err ""})
                   harness/parse-output (fn [_ out session-id]
                                          {:output out :session-id session-id})]
       (worker/run-agent! {:id "w0"
@@ -110,11 +106,9 @@
                     ([_] {:TASK_ROOT "../tasks" :TASKS_ROOT "../tasks"})
                     ([_ _] {:TASK_ROOT "../tasks" :TASKS_ROOT "../tasks"}))
                   harness/make-session-id (fn [_] "sid-3")
-                  harness/build-cmd (fn [_ opts]
-                                      (reset! captured-prompt (:prompt opts))
-                                      ["echo" "ok"])
-                  harness/process-stdin (fn [& _] :close)
-                  process/sh (fn [& _] {:exit 0 :out "WORKING" :err ""})
+                  harness/run-command! (fn [_ opts]
+                                         (reset! captured-prompt (:prompt opts))
+                                         {:exit 0 :out "WORKING" :err ""})
                   harness/parse-output (fn [_ out session-id]
                                          {:output out :session-id session-id})]
       (worker/run-agent! {:id "w0"
