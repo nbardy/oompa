@@ -491,16 +491,29 @@
   "Max resolver agent launches before giving up on sync or merge recovery."
   5)
 
+(defn- abort-any-merge!
+  "Ensure no merge is in progress. Tries --abort first, falls back to hard reset."
+  [dir]
+  (let [abort (process/sh ["git" "merge" "--abort"] {:dir dir :out :string :err :string})]
+    (when-not (zero? (:exit abort))
+      (process/sh ["git" "reset" "--hard" "HEAD"] {:dir dir}))))
+
 (defn- try-merge-main!
   "Try `git merge main` in a worktree. Returns {:ok? bool :error string}.
-   On conflict, aborts the merge to leave the worktree clean."
+   On failure, cleans up any merge state to leave the worktree clean."
   [wt-path]
+  ;; Guard: clean up leftover merge state from a crashed previous attempt
+  (when (.exists (io/file wt-path ".git"))
+    ;; Worktrees use .git as a file pointing to the real gitdir; MERGE_HEAD
+    ;; lives in the worktree's gitdir. Just attempt abort unconditionally —
+    ;; it's a no-op if no merge is in progress.
+    (process/sh ["git" "merge" "--abort"] {:dir wt-path}))
   (let [result (process/sh ["git" "merge" "main" "--no-edit"]
                            {:dir wt-path :out :string :err :string})]
     (if (zero? (:exit result))
       {:ok? true}
       (do
-        (process/sh ["git" "merge" "--abort"] {:dir wt-path})
+        (abort-any-merge! wt-path)
         {:ok? false
          :error (str (:out result) "\n" (:err result))}))))
 
@@ -869,11 +882,7 @@
           (println (format "[%s] MERGE FAILED: %s"
                            worker-id
                            (or (first-nonblank-line failure-text) "no output")))
-          (let [abort-result (process/sh ["git" "merge" "--abort"]
-                                         {:dir project-root :out :string :err :string})]
-            (when-not (zero? (:exit abort-result))
-              (process/sh ["git" "reset" "--hard" "HEAD"]
-                          {:dir project-root :out :string :err :string})))
+          (abort-any-merge! project-root)
           {:ok? false
            :reason :conflict
            :message (or (first-nonblank-line failure-text) "merge failed")})))))
