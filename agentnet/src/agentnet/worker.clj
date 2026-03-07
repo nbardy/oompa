@@ -519,17 +519,11 @@
                             "Your branch's commits (not on main):\n" branch-log "\n\n"
                             "Commits on main since you branched:\n" main-log "\n\n"
                             "Divergence scope:\n" diff-stat "\n\n"
-                            "YOUR JOB: Resolve all conflicts and make this branch cleanly mergeable into main.\n"
+                            "YOUR JOB: Make this branch cleanly mergeable into main.\n"
                             "Preserve the intent of YOUR branch's changes — do not drop your work.\n\n"
-                            "Steps:\n"
-                            "1. Run: git merge main --no-edit\n"
-                            "2. If conflicts, resolve them (check each conflicted file, pick the right combination)\n"
-                            "3. git add the resolved files and git commit\n"
-                            "4. Verify clean: git merge --no-commit --no-ff main (should succeed)\n"
-                            "5. If step 4 fails, go back to step 1\n\n"
-                            "DO NOT STOP until `git merge --no-commit --no-ff main` succeeds cleanly.\n"
-                            "You have full git access — rebase, cherry-pick, manual edits, whatever works.\n"
-                            "When fully resolved, output: MERGE_READY")
+                            "You have full git access — merge, rebase, cherry-pick, manual edits, whatever works.\n"
+                            "DO NOT STOP until your branch is clean against main.\n"
+                            "When done, output: MERGE_READY")
         abs-wt (.getAbsolutePath (io/file wt-path))
         result (try
                  (harness/run-command! (:harness worker)
