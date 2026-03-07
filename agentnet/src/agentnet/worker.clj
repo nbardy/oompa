@@ -344,7 +344,7 @@
   "Run reviewer on worktree changes.
    Uses custom review-prompts when configured, otherwise falls back to default.
    prev-feedback: vector of previous review outputs (for multi-round context).
-   Returns {:verdict :approved|:needs-changes|:rejected, :comments [...], :output string}"
+   Returns {:verdict :approved|:needs-changes, :comments [...], :output string}"
   [{:keys [id swarm-id reviewers]} worktree-path prev-feedback]
   (let [start-ms (System/currentTimeMillis)
         ;; Get actual diff content (not just stat) — truncate to 8000 chars for prompt budget
@@ -387,10 +387,9 @@
                                                 "\nYour verdict MUST be on its own line, exactly one of:\n"
                                                 "VERDICT: APPROVED\n"
                                                 "VERDICT: NEEDS_CHANGES\n\n"
-                                                "Do NOT use REJECTED. Always use NEEDS_CHANGES with specific, "
-                                                "actionable feedback explaining what must change and why. "
-                                                "The worker will attempt fixes based on your feedback.\n"
-                                                "After your verdict line, list every issue as a numbered item with "
+                                                "Pick APPROVED if the changes are correct and complete. "
+                                                "Pick NEEDS_CHANGES if there are specific issues to fix.\n"
+                                                "If you pick NEEDS_CHANGES, list every issue as a numbered item with "
                                                 "the file path and what needs to change.\n")
                                review-prompt (str "[oompa:" swarm-id* ":" id "] " review-body)
                                res (try

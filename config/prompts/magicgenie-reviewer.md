@@ -38,7 +38,4 @@ NEEDS_CHANGES
 - Explicit missing or incorrect persona/target-fit items.
 - Explicit SEO gaps (if any).
 
-REJECTED
-- Fundamental mismatch with task intent or model assumptions.
-
 #oompa_directive:include_file "config/prompts/_agent_scope_rules.md"

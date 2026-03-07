@@ -985,8 +985,15 @@
               {:harness harness :model model* :reasoning reasoning*}
               {:harness harness :model rest*}))
           {:harness harness :model rest*})
-        ;; Not a known harness prefix, treat as raw model on default harness.
-        {:harness :codex :model s}))
+        ;; Not a known harness prefix — check for trailing reasoning variant
+        ;; so bare "gpt-5.4:xhigh" parses as {:harness :codex :model "gpt-5.4" :reasoning "xhigh"}
+        (if-let [idx (str/last-index-of s ":")]
+          (let [model* (subs s 0 idx)
+                reasoning* (subs s (inc idx))]
+            (if (contains? reasoning-variants reasoning*)
+              {:harness :codex :model model* :reasoning reasoning*}
+              {:harness :codex :model s}))
+          {:harness :codex :model s})))
     {:harness :codex :model s}))
 
 (defn- parse-reviewer-entry
