@@ -745,7 +745,7 @@
    No mutable summary state — all state is derived from immutable cycle logs."
   [swarm-id worker-id cycle attempt run start-ms session-id
    {:keys [outcome claimed-task-ids recycled-tasks error-snippet review-rounds timing-ms
-           worktree-path signals]}]
+           worktree-path signals merge-sha]}]
   (let [duration-ms (- (now-ms) start-ms)
         timing-ms (or timing-ms (init-cycle-timing))
         harness-ms (max 0 (- duration-ms (cycle-llm-total-ms timing-ms)))
@@ -766,7 +766,8 @@
                :session-id session-id
                :timing-ms timing-ms}
         worktree-path (assoc :worktree-path worktree-path)
-        (seq signals)  (assoc :signals (vec signals))))
+        (seq signals)  (assoc :signals (vec signals))
+        merge-sha      (assoc :merge-sha merge-sha)))
     (let [terminal-outcomes #{:merged :merge-failed :rejected :sync-failed :no-changes
                               :executor-done :stuck :error :interrupted :needs-followup}]
       (if (and outcome (contains? terminal-outcomes outcome))
