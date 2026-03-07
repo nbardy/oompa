@@ -512,18 +512,24 @@
                      (str " (" reason-details ")"))))
   (let [{:keys [branch-log main-log diff-stat]} (collect-divergence-context wt-path)
         resolve-prompt (str "[oompa:" (or (:swarm-id worker) "unknown") ":" worker-id "] "
-                            "Your branch cannot currently be merged safely into main.\n\n"
+                            "We tried to merge your branch into main and it FAILED.\n\n"
                             (when-not (str/blank? reason-details)
-                              (str "Failure context from previous merge attempt:\n"
+                              (str "Failure context:\n"
                                    reason-details "\n\n"))
                             "Your branch's commits (not on main):\n" branch-log "\n\n"
                             "Commits on main since you branched:\n" main-log "\n\n"
                             "Divergence scope:\n" diff-stat "\n\n"
-                            "Make this branch cleanly mergeable into main. "
-                            "Preserve the intent of your branch's changes.\n"
-                            "You have full git access — rebase, cherry-pick, resolve conflicts, "
-                            "or clean up merge blockers.\n"
-                            "When done, verify with: git diff main --stat")
+                            "YOUR JOB: Resolve all conflicts and make this branch cleanly mergeable into main.\n"
+                            "Preserve the intent of YOUR branch's changes — do not drop your work.\n\n"
+                            "Steps:\n"
+                            "1. Run: git merge main --no-edit\n"
+                            "2. If conflicts, resolve them (check each conflicted file, pick the right combination)\n"
+                            "3. git add the resolved files and git commit\n"
+                            "4. Verify clean: git merge --no-commit --no-ff main (should succeed)\n"
+                            "5. If step 4 fails, go back to step 1\n\n"
+                            "DO NOT STOP until `git merge --no-commit --no-ff main` succeeds cleanly.\n"
+                            "You have full git access — rebase, cherry-pick, manual edits, whatever works.\n"
+                            "When fully resolved, output: MERGE_READY")
         abs-wt (.getAbsolutePath (io/file wt-path))
         result (try
                  (harness/run-command! (:harness worker)
@@ -553,12 +559,15 @@
       (process/sh ["git" "merge" "--abort"] {:dir wt-path}))
     clean?))
 
+(def ^:private max-sync-retries
+  "Max resolver attempts for sync-worktree-to-main! before giving up."
+  5)
+
 (defn- sync-worktree-to-main!
   "Sync worktree branch with main before merge-to-main!.
    Fast path: git merge main succeeds cleanly → :synced.
-   Conflict path: abort merge, give agent a clean worktree + divergence
-   context, let agent make the branch mergeable (rebase, cherry-pick,
-   manual resolution — agent's choice), verify with dry-run merge.
+   Conflict path: abort merge, launch resolver agent up to 5 times.
+   Each attempt gives the agent the failure context and asks it to resolve.
    Runs OUTSIDE the merge-lock so the agent doesn't block other workers.
    Returns :synced | :resolved | :failed."
   [worker wt-path worker-id]
@@ -567,13 +576,21 @@
     (if (zero? (:exit merge-result))
       (do (println (format "[%s] Worktree synced to main" worker-id))
           :synced)
-      ;; Conflict — abort merge to restore clean worktree state, then
-      ;; hand the problem to the agent with full divergence context.
-      (let [_ (process/sh ["git" "merge" "--abort"] {:dir wt-path})
-            failure-snippet (first-nonblank-line (str (:out merge-result) "\n" (:err merge-result)))]
-        (run-resolver-agent! worker wt-path worker-id
-                             (str "sync_worktree_to_main failed"
-                                  (when failure-snippet (str ": " failure-snippet))))))))
+      ;; Conflict — abort merge, then retry with resolver agent
+      (do
+        (process/sh ["git" "merge" "--abort"] {:dir wt-path})
+        (let [failure-snippet (first-nonblank-line (str (:out merge-result) "\n" (:err merge-result)))]
+          (loop [attempt 1]
+            (println (format "[%s] Sync resolver attempt %d/%d" worker-id attempt max-sync-retries))
+            (let [status (run-resolver-agent! worker wt-path worker-id
+                                              (str "sync_worktree_to_main failed (attempt " attempt "/" max-sync-retries ")"
+                                                   (when failure-snippet (str ": " failure-snippet))))]
+              (cond
+                (= :resolved status) :resolved
+                (>= attempt max-sync-retries)
+                (do (println (format "[%s] Sync failed after %d resolver attempts" worker-id max-sync-retries))
+                    :failed)
+                :else (recur (inc attempt))))))))))
 
 (defn- worktree-has-changes?
   "Check if worktree has committed OR uncommitted changes vs main.
@@ -915,22 +932,40 @@
            :reason failure-reason
            :message (or (first-nonblank-line failure-text) "merge failed")})))))
 
+(def ^:private max-merge-retries
+  "Max resolver attempts for recover-merge-failure! before giving up."
+  5)
+
 (defn- recover-merge-failure!
-  "On merge-to-main failure, launch resolver agent and retry merge once.
+  "On merge-to-main failure, launch resolver agent and retry merge up to 5 times.
    Must run outside merge-lock to avoid blocking other workers."
   [worker wt-path wt-id worker-id project-root review-rounds claimed-task-ids merge-result]
-  (let [reason (:reason merge-result)
-        msg (:message merge-result)
-        _ (println (format "[%s] Launching resolver after merge failure (%s): %s"
-                           worker-id (name (or reason :unknown)) (or msg "merge failed")))
-        resolve-status (run-resolver-agent! worker wt-path worker-id
-                                            (str "merge_to_main failed (" (name (or reason :unknown)) ")"
-                                                 (when msg (str ": " msg))))]
-    (if (= :failed resolve-status)
-      merge-result
-      (do
-        (println (format "[%s] Retrying merge after resolver" worker-id))
-        (merge-to-main! wt-path wt-id worker-id project-root review-rounds claimed-task-ids)))))
+  (loop [attempt 1
+         last-result merge-result]
+    (let [reason (:reason last-result)
+          msg (:message last-result)]
+      (println (format "[%s] Merge recovery attempt %d/%d (%s): %s"
+                       worker-id attempt max-merge-retries
+                       (name (or reason :unknown)) (or msg "merge failed")))
+      (let [resolve-status (run-resolver-agent! worker wt-path worker-id
+                                                (str "merge_to_main failed (attempt " attempt "/" max-merge-retries
+                                                     ", " (name (or reason :unknown)) ")"
+                                                     (when msg (str ": " msg))))]
+        (if (= :failed resolve-status)
+          (if (>= attempt max-merge-retries)
+            (do (println (format "[%s] Merge recovery failed after %d attempts" worker-id max-merge-retries))
+                last-result)
+            (recur (inc attempt) last-result))
+          ;; Resolver succeeded — retry the actual merge
+          (let [retry-result (merge-to-main! wt-path wt-id worker-id project-root review-rounds claimed-task-ids)]
+            (if (:ok? retry-result)
+              (do (println (format "[%s] Merge succeeded on recovery attempt %d" worker-id attempt))
+                  retry-result)
+              ;; Merge failed again (e.g. another worker merged in between) — retry if we have attempts left
+              (if (>= attempt max-merge-retries)
+                (do (println (format "[%s] Merge still failing after %d recovery attempts" worker-id max-merge-retries))
+                    retry-result)
+                (recur (inc attempt) retry-result)))))))))
 
 (defn- task-only-diff?
   "Check if all changes in worktree are task files only (no code changes).
