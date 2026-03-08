@@ -37,6 +37,23 @@
 ;; NDJSON Output Parsing (harness-specific, lives here not in agent-cli)
 ;; =============================================================================
 
+(defn- extract-session-id
+  "Best-effort session ID extraction from agent-cli output.
+   Prefer normalized `session.started`, but fall back to raw harness events that
+   the shared agent-cli path also understands (notably Gemini `init/session_id`)."
+  [events]
+  (or (some->> events
+               (keep #(when (= "session.started" (:type %))
+                        (:sessionId %)))
+               last)
+      (some->> events
+               (keep (fn [event]
+                       (or (:session_id event)
+                           (:sessionId event)
+                           (get-in event [:part :session_id])
+                           (get-in event [:part :sessionId]))))
+               last)))
+
 (defn- parse-unified-jsonl-output
   "Parse unified JSONL emitted by `agent-cli run`.
    Returns {:session-id string|nil, :text string|nil, :warning string|nil}."
@@ -50,10 +67,7 @@
                                 nil))))
                     doall)
         event-types (->> events (keep :type) distinct (take 8) vec)
-        session-id (some->> events
-                            (keep #(when (= "session.started" (:type %))
-                                     (:sessionId %)))
-                            last)
+        session-id (extract-session-id events)
         text (->> events
                   (keep #(when (= "text.delta" (:type %)) (:text %)))
                   (remove str/blank?)
@@ -115,7 +129,7 @@
 ;;   :output  - output format (:plain or :ndjson)
 
 (def ^:private gemini-behavior
-  {:stdin :close :session :implicit :output :ndjson})
+  {:stdin :close :session :extracted :output :ndjson})
 
 (def registry
   (merge
@@ -232,7 +246,7 @@
   "Generate initial session-id based on harness strategy.
    :uuid → random UUID string.
    :extracted → nil (will be parsed from output after first run).
-   :implicit → nil (harness manages sessions by cwd, e.g. gemini)."
+   :implicit → nil (harness manages sessions by cwd)."
   [harness-kw]
   (let [{:keys [session]} (get-config harness-kw)]
     (when (= session :uuid)
