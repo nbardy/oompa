@@ -333,6 +333,7 @@
      :exit (:exit result)
      :done? (agent/done-signal? output)
      :merge? (agent/merge-signal? output)
+     :merge-complete-sha (agent/parse-merge-complete-signal output)
      :needs-followup? (agent/needs-followup-signal? output)
      :claim-ids (agent/parse-claim-signal output)
      :session-id session-id
@@ -910,6 +911,76 @@
         (println (format "[%s] Re-synced, retrying merge" worker-id))
         (merge-to-main! wt-path wt-id worker-id project-root review-rounds claimed-task-ids)))))
 
+(def ^:private max-merge-agent-attempts 3)
+
+(defn- build-merge-prompt
+  "Prompt injected when resuming the original agent session to do the merge.
+   Agent must run git itself, resolve any conflicts, and signal MERGE_COMPLETE(sha)."
+  [wt-branch project-root]
+  (str "## Merge Authorization\n\n"
+       "Your work has been reviewed and approved. You are now authorized to merge to main.\n\n"
+       "Steps:\n"
+       "1. Commit any uncommitted changes in your worktree (git add -A && git commit -m 'wip')\n"
+       "2. In the project root (" project-root "), run:\n"
+       "   git checkout main && git merge " wt-branch " --no-edit\n"
+       "3. If there are merge conflicts: resolve them, then git add -A && git commit --no-edit\n"
+       "4. After the merge succeeds, get the commit SHA: git rev-parse --short HEAD\n"
+       "5. Signal MERGE_COMPLETE(sha) — e.g. MERGE_COMPLETE(a3f7d2c)\n\n"
+       "IMPORTANT: Only signal MERGE_COMPLETE after the merge is actually on main.\n"
+       "If you cannot resolve conflicts after trying hard, signal NEEDS_FOLLOWUP with details."))
+
+(defn- run-merge-agent!
+  "Resume the original worker session and instruct it to merge its branch to main.
+   Serialized via merge-lock so concurrent workers don't corrupt the git index.
+   Returns {:ok? bool :sha string|nil :message string}."
+  [worker wt-path wt-branch project-root session-id worker-id]
+  (locking merge-lock
+    (loop [attempt 1]
+      (println (format "[%s] Merge agent attempt %d/%d" worker-id attempt max-merge-agent-attempts))
+      (let [prompt (build-merge-prompt wt-branch project-root)
+            abs-wt (.getAbsolutePath (io/file wt-path))
+            result (try
+                     (harness/run-command! (:harness worker)
+                                           {:cwd abs-wt
+                                            :model (:model worker)
+                                            :reasoning (:reasoning worker)
+                                            :session-id session-id
+                                            :resume? true
+                                            :prompt prompt})
+                     (catch Exception e
+                       (println (format "[%s] Merge agent error: %s" worker-id (.getMessage e)))
+                       {:exit -1 :out "" :err (.getMessage e)}))
+            {:keys [output]} (harness/parse-output (:harness worker) (:out result) session-id)
+            sha (agent/parse-merge-complete-signal output)
+            gave-up? (agent/needs-followup-signal? output)]
+        (cond
+          sha
+          (do (println (format "[%s] Merged → %s" worker-id sha))
+              {:ok? true :sha sha :message (str "merged → " sha)})
+
+          gave-up?
+          (do (println (format "[%s] Merge agent gave up" worker-id))
+              {:ok? false :sha nil :message "agent signaled NEEDS_FOLLOWUP during merge"})
+
+          (>= attempt max-merge-agent-attempts)
+          (do (println (format "[%s] Merge agent did not signal MERGE_COMPLETE after %d attempts" worker-id max-merge-agent-attempts))
+              {:ok? false :sha nil :message "merge agent exhausted attempts without MERGE_COMPLETE"})
+
+          :else (recur (inc attempt)))))))
+
+(defn- complete-merge!
+  "After agent confirms merge, move tasks to complete and annotate them.
+   Returns completed task count."
+  [project-root worker-id review-rounds claimed-task-ids sha]
+  (let [completed (when (seq claimed-task-ids)
+                    (tasks/complete-by-ids! claimed-task-ids))
+        completed-count (count (or completed []))]
+    (when (seq completed)
+      (println (format "[%s] Completed %d task(s): %s"
+                       worker-id completed-count (str/join ", " completed))))
+    (annotate-completed-tasks! project-root worker-id review-rounds)
+    completed-count))
+
 (defn- task-only-diff?
   "Check if all changes in worktree are task files only (no code changes).
    Returns true if diff only touches files under tasks/ directory."
@@ -1221,83 +1292,50 @@
                     (if (worktree-has-changes? (:path wt-state))
                       (if (task-only-diff? (:path wt-state))
                         (let [all-claimed active-claimed-ids]
-                          (println (format "[%s] Task-only diff, auto-merging" id))
-                          (let [sync-status (sync-worktree-to-main! worker (:path wt-state) id)]
-                            (if (= :failed sync-status)
-                              (let [recycled (recycle-task-id-set! id all-claimed)
-                                    metrics (update metrics :recycled + (count recycled))]
-                                (println (format "[%s] Sync to main failed, skipping merge" id))
-                                (emit!
-                                                 {:timing-ms cycle-timing
-                                                  :outcome :sync-failed
-                                                  :claimed-task-ids (vec all-claimed)
-                                                  :recycled-tasks (seq recycled)})
-                                (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                                (recur (inc cycle) 1 (inc completed-runs) 0 metrics nil nil #{} nil 0 0 []))
-                              (let [merge-result (merge-to-main! (:path wt-state) (:branch wt-state) id project-root 0 all-claimed)
-                                    merge-result (if (:ok? merge-result)
-                                                   merge-result
-                                                   (recover-merge-failure! worker (:path wt-state) (:branch wt-state)
-                                                                           id project-root 0 all-claimed merge-result))
-                                    merged? (:ok? merge-result)
-                                    recycled (when-not merged?
-                                               (recycle-task-id-set! id all-claimed))
-                                    completed-count (or (:completed-count merge-result) 0)
-                                    metrics (cond-> metrics
-                                              merged? (update :merges inc)
-                                              (seq recycled) (update :recycled + (count recycled)))]
-                                (println (format "[%s] Cycle %d/%d complete" id cycle cycle-cap))
-                                (emit!
-                                                 {:timing-ms cycle-timing
-                                                  :outcome (if merged? :merged :merge-failed)
-                                                  :merge-sha (:merge-sha merge-result)
-                                                  :claimed-task-ids (vec all-claimed)
-                                                  :recycled-tasks (seq recycled)
-                                                  :review-rounds 0})
-                                (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                                (recur (inc cycle) 1 (inc completed-runs) 0 metrics nil nil #{} nil 0 0 [])))))
+                          (println (format "[%s] Task-only diff, auto-merging via agent" id))
+                          (let [merge-result (run-merge-agent! worker (:path wt-state) (:branch wt-state) project-root new-session-id id)
+                                merged? (:ok? merge-result)
+                                sha (:sha merge-result)
+                                _ (when merged? (complete-merge! project-root id 0 all-claimed sha))
+                                recycled (when-not merged? (recycle-task-id-set! id all-claimed))
+                                metrics (cond-> metrics
+                                          merged? (update :merges inc)
+                                          (seq recycled) (update :recycled + (count recycled)))]
+                            (println (format "[%s] Cycle %d/%d complete" id cycle cycle-cap))
+                            (emit!
+                                             {:timing-ms cycle-timing
+                                              :outcome (if merged? :merged :merge-failed)
+                                              :merge-sha sha
+                                              :claimed-task-ids (vec all-claimed)
+                                              :recycled-tasks (seq recycled)
+                                              :review-rounds 0})
+                            (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                            (recur (inc cycle) 1 (inc completed-runs) 0 metrics nil nil #{} nil 0 0 [])))
                               (let [{:keys [approved? attempts timing]} (review-loop! worker (:path wt-state) id cycle {:cycle-timing cycle-timing :session-id new-session-id})
                                     cycle-timing (or timing cycle-timing)
                                     metrics (-> metrics
                                               (update :review-rounds-total + (or attempts 0))
                                               (cond-> (not approved?) (update :rejections inc)))]
                           (if approved?
-                            (let [sync-status (sync-worktree-to-main! worker (:path wt-state) id)
-                                  all-claimed active-claimed-ids]
-                              (if (= :failed sync-status)
-                                (let [recycled (recycle-task-id-set! id all-claimed)
-                                      metrics (update metrics :recycled + (count recycled))]
-                                  (println (format "[%s] Sync to main failed after approval, skipping merge" id))
-                                  (emit!
-                                                   {:timing-ms cycle-timing
-                                                    :outcome :sync-failed
-                                                    :claimed-task-ids (vec all-claimed)
-                                                    :recycled-tasks (seq recycled)
-                                                    :review-rounds (or attempts 0)})
-                                  (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                                  (recur (inc cycle) 1 (inc completed-runs) 0 metrics nil nil #{} nil 0 0 []))
-                                (let [merge-result (merge-to-main! (:path wt-state) (:branch wt-state) id project-root (or attempts 0) all-claimed)
-                                      merge-result (if (:ok? merge-result)
-                                                     merge-result
-                                                     (recover-merge-failure! worker (:path wt-state) (:branch wt-state)
-                                                                             id project-root (or attempts 0) all-claimed merge-result))
-                                      merged? (:ok? merge-result)
-                                      recycled (when-not merged?
-                                                 (recycle-task-id-set! id all-claimed))
-                                      completed-count (or (:completed-count merge-result) 0)
-                                      metrics (cond-> metrics
-                                                merged? (update :merges inc)
-                                                (seq recycled) (update :recycled + (count recycled)))]
-                                  (println (format "[%s] Cycle %d/%d complete" id cycle cycle-cap))
-                                  (emit!
-                                                   {:timing-ms cycle-timing
-                                                    :outcome (if merged? :merged :merge-failed)
-                                                    :merge-sha (:merge-sha merge-result)
-                                                    :claimed-task-ids (vec all-claimed)
-                                                    :recycled-tasks (seq recycled)
-                                                    :review-rounds (or attempts 0)})
-                                  (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                                  (recur (inc cycle) 1 (inc completed-runs) 0 metrics nil nil #{} nil 0 0 []))))
+                            (let [all-claimed active-claimed-ids
+                                  merge-result (run-merge-agent! worker (:path wt-state) (:branch wt-state) project-root new-session-id id)
+                                  merged? (:ok? merge-result)
+                                  sha (:sha merge-result)
+                                  _ (when merged? (complete-merge! project-root id (or attempts 0) all-claimed sha))
+                                  recycled (when-not merged? (recycle-task-id-set! id all-claimed))
+                                  metrics (cond-> metrics
+                                            merged? (update :merges inc)
+                                            (seq recycled) (update :recycled + (count recycled)))]
+                              (println (format "[%s] Cycle %d/%d complete" id cycle cycle-cap))
+                              (emit!
+                                               {:timing-ms cycle-timing
+                                                :outcome (if merged? :merged :merge-failed)
+                                                :merge-sha sha
+                                                :claimed-task-ids (vec all-claimed)
+                                                :recycled-tasks (seq recycled)
+                                                :review-rounds (or attempts 0)})
+                              (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                              (recur (inc cycle) 1 (inc completed-runs) 0 metrics nil nil #{} nil 0 0 []))
                             (let [recycled (recycle-active-claims! id claimed-ids mv-claimed-tasks)
                                   metrics (update metrics :recycled + (count recycled))]
                               (println (format "[%s] Cycle %d/%d rejected" id cycle cycle-cap))

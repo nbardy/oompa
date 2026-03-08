@@ -277,6 +277,14 @@
   [output]
   (boolean (re-find #"NEEDS_FOLLOWUP" (or output ""))))
 
+(defn parse-merge-complete-signal
+  "Extract commit SHA from MERGE_COMPLETE(sha) signal.
+   Returns SHA string or nil if signal not present.
+   Format: MERGE_COMPLETE(abc1234)"
+  [output]
+  (when-let [match (re-find #"MERGE_COMPLETE\(([^)]+)\)" (or output ""))]
+    (str/trim (second match))))
+
 (defn parse-claim-signal
   "Extract task IDs from CLAIM(...) signal in output.
    Returns vector of task ID strings, or nil if no CLAIM signal found.
