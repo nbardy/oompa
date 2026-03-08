@@ -347,12 +347,16 @@
    Returns {:verdict :approved|:needs-changes, :comments [...], :output string}"
   [{:keys [id swarm-id reviewers]} worktree-path prev-feedback]
   (let [start-ms (System/currentTimeMillis)
-        ;; Get actual diff content (not just stat) — truncate to 8000 chars for prompt budget
-        diff-result (process/sh ["git" "diff" "main"]
+        ;; -U10 gives 10 lines of context (vs default 3) so reviewer sees more
+        ;; surrounding code without needing to shell out and read files.
+        ;; -W extends hunks to show the enclosing function for each change.
+        ;; 24000 char limit gives ~500-600 lines of diff — enough for most PRs
+        ;; to be reviewed without tool calls to read files.
+        diff-result (process/sh ["git" "diff" "-U10" "-W" "main"]
                                 {:dir worktree-path :out :string :err :string})
         diff-content (let [d (:out diff-result)]
-                       (if (> (count d) 8000)
-                         (str (subs d 0 8000) "\n... [diff truncated at 8000 chars]")
+                       (if (> (count d) 24000)
+                         (str (subs d 0 24000) "\n... [diff truncated at 24000 chars]")
                          d))
 
         swarm-id* (or swarm-id "unknown")
@@ -435,8 +439,10 @@
 (defn- run-fix!
   "Ask worker to fix issues based on reviewer feedback.
    all-feedback: vector of all reviewer outputs so far (accumulated across rounds).
-   Returns {:output string, :exit int}"
-  [{:keys [id swarm-id harness model]} worktree-path all-feedback]
+   session-id: when non-nil, resumes the worker's existing session so it retains
+   full context of the work it already did — avoids re-reading all changed files.
+   Returns {:output string, :exit int, :session-id string}"
+  [{:keys [id swarm-id harness model]} worktree-path all-feedback session-id]
   (let [start-ms (System/currentTimeMillis)
         swarm-id* (or swarm-id "unknown")
         feedback-text (if (> (count all-feedback) 1)
@@ -456,14 +462,19 @@
 
         result (try
                  (harness/run-command! harness
-                                       {:cwd abs-wt :model model :prompt fix-prompt})
+                                       (cond-> {:cwd abs-wt :model model :prompt fix-prompt}
+                                         ;; Resume existing session so the worker keeps
+                                         ;; full context of the code it already wrote.
+                                         session-id (assoc :session-id session-id
+                                                           :resume? true)))
                  (catch Exception e
                    {:exit -1 :out "" :err (.getMessage e)}))
-        parsed (harness/parse-output harness (:out result) nil)
+        parsed (harness/parse-output harness (:out result) session-id)
         duration-ms (- (System/currentTimeMillis) start-ms)]
 
     {:output (:output parsed)
      :exit (:exit result)
+     :session-id (:session-id parsed)
      :duration-ms duration-ms}))
 
 (defn- collect-divergence-context
@@ -926,8 +937,10 @@
    Accumulates feedback across rounds so reviewer doesn't raise new issues
    and fixer has full context of all prior feedback.
    Writes review logs to runs/{swarm-id}/reviews/ for post-mortem analysis.
+   session-id: the worker's proposer session — passed to run-fix! so it resumes
+   the same conversation instead of starting from scratch.
    Returns {:approved? bool, :attempts int}"
-  [worker wt-path worker-id iteration & [cycle-timing]]
+  [worker wt-path worker-id iteration & [{:keys [cycle-timing session-id]}]]
   (if (empty? (:reviewers worker))
     ;; No reviewer configured, auto-approve
     {:approved? true :attempts 0 :timing (or cycle-timing (init-cycle-timing))}
@@ -935,6 +948,7 @@
     ;; Run review loop with accumulated feedback
     (loop [attempt 1
            prev-feedback []
+           fix-session-id session-id
            timing (or cycle-timing (init-cycle-timing))]
       (println (format "[%s] Review attempt %d/%d" worker-id attempt max-review-retries))
       (let [{:keys [verdict output duration-ms]} (run-reviewer! worker wt-path prev-feedback)
@@ -967,12 +981,13 @@
                 {:approved? false :attempts attempt :timing timing})
               (do
                 (println (format "[%s] Reviewer requested changes, fixing..." worker-id))
-                (let [{:keys [duration-ms]} (run-fix! worker wt-path all-feedback)
+                ;; Resume the worker's session so it keeps context of its own code
+                (let [{:keys [duration-ms session-id]} (run-fix! worker wt-path all-feedback fix-session-id)
                       timing (add-llm-call timing
                                            :review-fixes-ms
                                            (str "fix_" attempt)
                                            (or duration-ms 0))]
-                   (recur (inc attempt) all-feedback timing))))))))))
+                   (recur (inc attempt) all-feedback (or session-id fix-session-id) timing))))))))))
 
 ;; =============================================================================
 ;; Worker Loop
@@ -1241,7 +1256,7 @@
                                                   :review-rounds 0})
                                 (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                                 (recur (inc cycle) 1 (inc completed-runs) 0 metrics nil nil #{} nil 0 0 [])))))
-                              (let [{:keys [approved? attempts timing]} (review-loop! worker (:path wt-state) id cycle cycle-timing)
+                              (let [{:keys [approved? attempts timing]} (review-loop! worker (:path wt-state) id cycle {:cycle-timing cycle-timing :session-id new-session-id})
                                     cycle-timing (or timing cycle-timing)
                                     metrics (-> metrics
                                               (update :review-rounds-total + (or attempts 0))
