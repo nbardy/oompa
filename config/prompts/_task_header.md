@@ -29,23 +29,10 @@ Always read/write queue files via `{{TASKS_ROOT}}/...` (not hard-coded local `ta
 - The framework performs final `git add -A` + `git commit`; you do not need to create the commit manually.
 - If your deliverable is task creation, ensure those `.edn` files are present in `{{TASKS_ROOT}}/pending/` so other workers can claim them.
 
-### Merge flow
-
-After review approval, the framework resumes your session and asks you to merge your branch to main:
-
-1. Commit any uncommitted changes: `git add -A && git commit -m 'wip'`
-2. From the project root: `git checkout main && git merge <your-branch> --no-edit`
-3. Resolve any conflicts, then: `git add -A && git commit --no-edit`
-4. Get the SHA: `git rev-parse --short HEAD`
-5. Signal: `MERGE_COMPLETE(sha)` — e.g. `MERGE_COMPLETE(a3f7d2c)`
-
-Only signal `MERGE_COMPLETE` after the merge commit is on main. If conflicts are truly unresolvable, signal `NEEDS_FOLLOWUP` with details.
-
 ### Signals
 
 - **`CLAIM(id, ...)`** — Claim one or more pending tasks. Batch related tasks together.
-- **`COMPLETE_AND_READY_FOR_MERGE`** — Your work is done and ready for review. Framework reviews, then resumes you with merge instructions.
-- **`MERGE_COMPLETE(sha)`** — Merge is on main. Replace `sha` with the actual commit SHA (e.g. `MERGE_COMPLETE(a3f7d2c)`).
-- **`NEEDS_FOLLOWUP`** — Last resort continuation signal. Use only if you tried hard and still cannot produce a merge-ready artifact from the current context. Explain the remaining work after the signal. The framework will keep your claimed tasks and resume you with a sharper follow-up prompt. This is not success.
+- **`COMPLETE_AND_READY_FOR_MERGE`** — Your work is done and ready for review. The framework handles the merge flow after approval.
+- **`NEEDS_FOLLOWUP`** — Last resort continuation signal. Use only if you tried hard and still cannot produce a merge-ready artifact from the current context. Explain the remaining work after the signal.
 
-One signal per output. Claim before working. Do not output `DONE`.
+One signal per output. Claim before working.
