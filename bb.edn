@@ -29,6 +29,9 @@
   check {:doc "Check agent backend availability"
          :task (shell "./agentnet.bb" "check")}
 
+  lint-tasks {:doc "Validate and fix EDN files in tasks queue"
+              :task (shell "./agentnet.bb" "lint-tasks")}
+
   lint-notes {:doc "Validate agent notes front-matter"
               :task (shell "./agentnet.bb" "lint-notes")}
 

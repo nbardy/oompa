@@ -387,6 +387,34 @@
 ;; CLI commands
 ;; -----------------------------------------------------------------------------
 
+
+(defn lint-tasks! []
+  (let [dirs ["tasks/pending" "tasks/current"]
+        fixed (atom 0)
+        errors (atom 0)]
+    (doseq [dir dirs]
+      (let [d (io/file dir)]
+        (when (.exists d)
+          (doseq [f (.listFiles d)]
+            (when (and (.isFile f) (str/ends-with? (.getName f) ".edn"))
+              (let [content (slurp f)]
+                (if (str/includes? content "\\`")
+                  (let [fixed-content (str/replace content #"\\`" "`")]
+                    (spit f fixed-content)
+                    (println (format "[FIXED] Invalid escape in: %s" (.getName f)))
+                    (swap! fixed inc)
+                    (swap! errors inc))
+                  (try
+                    (edn/read-string content)
+                    (catch Exception e
+                      (println (format "[ERROR] Cannot parse %s: %s" (.getName f) (.getMessage e)))
+                      (swap! errors inc))))))))))
+    (if (zero? @errors)
+      (println "Tasks OK.")
+      (do
+        (println (format "\nLint complete. Found %d errors, auto-fixed %d." @errors @fixed))
+        (System/exit 1)))))
+
 (defn lint-notes! []
   (let [dirs ["ready_for_review" "notes_FROM_CTO" "scratch" "proposed_tasks"]
         notes-list (mapcat notes/list-notes dirs)
@@ -417,6 +445,7 @@
     "  run            Run the orchestrator once"
     "  prompt         Run once with an ad-hoc natural-language prompt"
     "  lint-notes     Validate front matter"
+    "  lint-tasks     Validate and fix EDN tasks"
     "  context        Print ACH context block"
     "  status         Summarize latest run"
     "Options:"
@@ -481,6 +510,7 @@
                   (System/exit 1))
               (run! opts))
       "prompt" (prompt! (str/join " " args) opts)
+      "lint-tasks" (lint-tasks!)
       "lint-notes" (lint-notes!)
       "context" (context!)
       "status" (status!)
