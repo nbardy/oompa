@@ -119,7 +119,7 @@ Agents communicate with the framework through text signals in their stdout:
 
 ## Task State Machine
 
-Tasks are `.edn` files that move through directories:
+Tasks are `.json` files that move through directories:
 
 ```
 pending/          unclaimed, available for any worker
@@ -182,7 +182,7 @@ project-root/
 │   └── prompts/                        role prompt files (.md)
 │
 ├── tasks/                              shared task state (on main, checked in)
-│   ├── pending/                        unclaimed .edn files
+│   ├── pending/                        unclaimed .json files
 │   ├── current/                        claimed by workers
 │   └── complete/                       merged + annotated
 │

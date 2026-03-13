@@ -1,20 +1,20 @@
 (ns agentnet.tasks
   "Folder-based task management.
 
-   Tasks live in tasks/{pending,current,complete}/*.edn
+   Tasks live in tasks/{pending,current,complete}/*.json
 
    Workers:
-   - Claim tasks: mv pending/foo.edn → current/foo.edn
-   - Complete tasks: mv current/foo.edn → complete/foo.edn
-   - Create tasks: write new .edn to pending/
+   - Claim tasks: mv pending/foo.json → current/foo.json
+   - Complete tasks: mv current/foo.json → complete/foo.json
+   - Create tasks: write new .json to pending/
 
    Task format:
-   {:id \"task-001\"
-    :summary \"Add authentication\"
-    :description \"Implement JWT auth...\"
-    :files [\"src/auth.py\"]
-    :acceptance [\"Login works\" \"Tests pass\"]}"
-  (:require [clojure.edn :as edn]
+   {\"id\": \"task-001\",
+    \"summary\": \"Add authentication\",
+    \"description\": \"Implement JWT auth...\",
+    \"files\": [\"src/auth.py\"],
+    \"acceptance\": [\"Login works\", \"Tests pass\"]}"
+  (:require [cheshire.core :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]))
 
@@ -38,24 +38,23 @@
 ;; =============================================================================
 
 (defn- read-task-file
-  "Read a single task .edn file"
+  "Read a single task .json file"
   [^java.io.File f]
   (when (.exists f)
     (try
-      (with-open [r (java.io.PushbackReader. (io/reader f))]
-        (let [task (edn/read {:eof nil} r)]
-          (assoc task :_file (.getPath f))))
+      (let [task (json/parse-string (slurp f) true)]
+        (assoc task :_file (.getPath f)))
       (catch Exception e
         (println (format "[warn] Failed to read task %s: %s" (.getName f) (.getMessage e)))
         nil))))
 
 (defn- list-task-files
-  "List all .edn files in a directory"
+  "List all .json files in a directory"
   [dir]
   (let [d (io/file dir)]
     (when (.exists d)
       (->> (.listFiles d)
-           (filter #(str/ends-with? (.getName %) ".edn"))
+           (filter #(str/ends-with? (.getName %) ".json"))
            (sort-by #(.getName %))))))
 
 (defn list-pending
@@ -166,7 +165,7 @@
   [task]
   (let [id (or (:id task) (generate-task-id))
         safe-id (str/replace id #"[^a-zA-Z0-9-_]" "-")]
-    (str safe-id ".edn")))
+    (str safe-id ".json")))
 
 (defn create-task!
   "Create a new task in pending/. Returns the task with :_file set."
@@ -176,7 +175,7 @@
         task (assoc task :id task-id)
         filename (task->filename task)
         path (io/file PENDING_DIR filename)]
-    (spit path (pr-str task))
+    (spit path (str (json/generate-string task {:pretty true}) "\n"))
     (assoc task :_file (.getPath path))))
 
 (defn create-tasks!
@@ -238,15 +237,14 @@
 ;; Migration from old format
 ;; =============================================================================
 
-(defn migrate-from-tasks-edn!
-  "Migrate from config/tasks.edn to folder structure"
+(defn migrate-from-tasks-json!
+  "Migrate from config/tasks.json to folder structure"
   []
-  (let [old-file (io/file "config/tasks.edn")]
+  (let [old-file (io/file "config/tasks.json")]
     (when (.exists old-file)
-      (println "Migrating from config/tasks.edn...")
+      (println "Migrating from config/tasks.json...")
       (ensure-dirs!)
-      (let [tasks (with-open [r (java.io.PushbackReader. (io/reader old-file))]
-                    (edn/read {:eof nil} r))]
+      (let [tasks (json/parse-string (slurp old-file) true)]
         (doseq [task tasks]
           (create-task! task))
         (println (format "Migrated %d tasks to tasks/pending/" (count tasks)))))))

@@ -12,7 +12,7 @@ The Philosophy's Intelligence-to-Ambiguity Ratio maps directly to three worker p
 ### The Planner (High Ambiguity → Burn Tokens)
 
 - **Model:** Large, high-reasoning (e.g., `claude:opus`, `codex:gpt-5.3-codex:xhigh`).
-- **Role:** The Planner does **not** write code. It reads the initial `spec.md`, explores the codebase, and breaks the work down into atomic, highly detailed `.edn` files in `tasks/pending/`. This is the Slow Squeeze—spending massive tokens upfront to produce a dense, mathematically sound plan. **Crucially, the Planner must format tickets according to the rules in [`EDN_TICKETS.md`](./EDN_TICKETS.md) to prevent complex escape characters (like LaTeX math) from crashing the Clojure parser.**
+- **Role:** The Planner does **not** write code. It reads the initial `spec.md`, explores the codebase, and breaks the work down into atomic, highly detailed `.json` files in `tasks/pending/`. This is the Slow Squeeze—spending massive tokens upfront to produce a dense, mathematically sound plan. **Crucially, the Planner must format tickets according to the rules in [`JSON_TICKETS.md`](./JSON_TICKETS.md) so the swarm can parse and diff them cleanly.**
 - **Config:** `can_plan: true`, low `max_cycle` (e.g., 3–5), single instance (`count: 1`).
 - **Prompt:** `config/prompts/planner.md`
 
@@ -81,7 +81,7 @@ For taking a vague user spec and turning it into a massive PR. This pattern impl
 }
 ```
 
-The single `xhigh` planner spends its time writing perfect `.edn` specs. The two `high` workers tackle tricky structural changes. The four free workers churn through boilerplate, UI components, and unit tests simultaneously. The `opus` reviewer acts as the final gatekeeper.
+The single `xhigh` planner spends its time writing perfect `.json` specs. The two `high` workers tackle tricky structural changes. The four free workers churn through boilerplate, UI components, and unit tests simultaneously. The `opus` reviewer acts as the final gatekeeper.
 
 ### Pattern: The "Bug Swarm" (Distributed Fixing)
 
@@ -149,18 +149,20 @@ For large features or multi-day efforts where entropy becomes the dominant failu
 A bad task forces a Simple Executor to invent. A good task forces them to *type*.
 
 **Bad:**
-```edn
-{:id "task-1" :description "Build the auth system"}
+```json
+{"id": "task-1", "description": "Build the auth system"}
 ```
 The Simple Executor will panic, hallucinate an architecture, and fail the review.
 
 **Good:**
-```edn
-{:id "task-1"
- :summary "Implement JWT Auth Middleware"
- :description "Create src/auth.ts. Export an Express middleware function verifyToken. Read the Authorization header, strip the Bearer prefix, verify using process.env.JWT_SECRET. If missing/invalid, return 401 JSON: {error: 'unauthorized'}."
- :files ["src/auth.ts", "tests/auth.test.ts"]
- :acceptance ["Middleware throws 401 on missing header" "Valid token adds req.user"]}
+```json
+{
+  "id": "task-1",
+  "summary": "Implement JWT Auth Middleware",
+  "description": "Create src/auth.ts. Export an Express middleware function verifyToken. Read the Authorization header, strip the Bearer prefix, verify using process.env.JWT_SECRET. If missing or invalid, return 401 JSON.",
+  "files": ["src/auth.ts", "tests/auth.test.ts"],
+  "acceptance": ["Middleware throws 401 on missing header", "Valid token adds req.user"]
+}
 ```
 
 The executor knows exactly what file to touch, what the logic is, and what tests to write. This is the Intelligence-to-Ambiguity Ratio in action: the Planner burned the tokens to eradicate ambiguity, so the executor can slam it out in one iteration.
@@ -182,7 +184,7 @@ Without this, every missing dependency becomes a traffic jam. With it, the swarm
 ## 5. Best Practices
 
 1. **Always use `can_plan: false` for executors.** If you forget, every worker will try to become a manager, leading to race conditions where 5 workers try to write conflicting task files simultaneously.
-2. **Use `config/prompts/executor.md` for simple models.** This prompt disables task creation and forces them to focus on claiming existing `.edn` files.
+2. **Use `config/prompts/executor.md` for simple models.** This prompt disables task creation and forces them to focus on claiming existing `.json` files.
 3. **Set appropriate `max_wait_for_tasks`.** If your Planner uses a very slow model, executors might time out waiting for the first task. Set `"max_wait_for_tasks": 1200` (20 min) on executors for large codebases.
 4. **Leverage custom prompt includes.** If the project has strict styling rules, create `prompts/style_guide.md` and append it to the `prompt` array for ALL workers. Don't rely on them finding it themselves.
 5. **Tag-based routing over permission silos.** Give all agents full context access. Control what they work on by tagging tasks (`#eng-task`, `#meta-task`, `#design-task`), not by limiting their intelligence.

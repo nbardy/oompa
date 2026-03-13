@@ -662,7 +662,7 @@
                 :targets ["src" "tests" "docs"]
                 :priority 1}]
       ;; Write to temporary tasks file
-      (spit "config/tasks.edn" (pr-str [task]))
+      (spit "config/tasks.json" (str (json/generate-string [task] {:pretty true}) "\n"))
       ;; Run
       (orchestrator/run-once! opts))))
 
@@ -915,9 +915,9 @@
 (defn cmd-worktrees
   "List worktree status"
   [opts args]
-  (let [state-file (io/file ".workers/state.edn")]
+  (let [state-file (io/file ".workers/state.json")]
     (if (.exists state-file)
-      (let [pool (read-string (slurp state-file))
+      (let [pool (json/parse-string (slurp state-file) true)
             pool' (worktree/list-worktrees pool)]
         (println "Worktrees:")
         (doseq [{:keys [id path status current-task]} pool']
@@ -932,10 +932,10 @@
 (defn cmd-cleanup
   "Remove all worktrees (legacy pool + swarm iteration worktrees)."
   [opts args]
-  (let [state-file (io/file ".workers/state.edn")]
+  (let [state-file (io/file ".workers/state.json")]
     (println "Removing worktrees...")
     (if (.exists state-file)
-      (let [pool (read-string (slurp state-file))]
+      (let [pool (json/parse-string (slurp state-file) true)]
         (worktree/cleanup-pool! pool))
       (println "No legacy pool worktrees to clean up."))
     (let [{:keys [dirs-removed branches-removed]} (cleanup-iteration-worktrees!)]
@@ -1358,7 +1358,7 @@
   "Dump core architecture and design documents"
   [opts args]
   (let [docs-dir "docs"
-        core-docs ["SWARM_PHILOSOPHY.md" "SWARM_GUIDE.md" "EDN_TICKETS.md" "SYSTEMS_DESIGN.md" "OOMPA.md"]
+        core-docs ["SWARM_PHILOSOPHY.md" "SWARM_GUIDE.md" "JSON_TICKETS.md" "SYSTEMS_DESIGN.md" "OOMPA.md"]
         package-dir (or (System/getenv "OOMPA_PACKAGE_ROOT") ".")
         doc-paths (map #(str package-dir "/" docs-dir "/" %) core-docs)]
     (println "# Oompa Loompas Core Documentation")

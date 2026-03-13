@@ -27,7 +27,7 @@ Always read/write queue files via `{{TASKS_ROOT}}/...` (not hard-coded local `ta
 
 - Before `COMPLETE_AND_READY_FOR_MERGE`, run `git status --short` and ensure your intended deliverable is in tracked files.
 - The framework performs final `git add -A` + `git commit`; you do not need to create the commit manually.
-- If your deliverable is task creation, ensure those `.edn` files are present in `{{TASKS_ROOT}}/pending/` so other workers can claim them.
+- If your deliverable is task creation, ensure those `.json` files are present in `{{TASKS_ROOT}}/pending/` so other workers can claim them.
 
 ### Signals
 

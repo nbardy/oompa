@@ -48,7 +48,7 @@ This repo has a fleshed out version of the idea. The oompa loompas are organized
 ┌─────────────────────────────────────────────────────────────────────┐
 │                         SELF-DIRECTED WORKERS                        │
 │                                                                      │
-│   tasks/pending/*.edn ──→ Worker claims ──→ tasks/current/*.edn     │
+│   tasks/pending/*.json ──→ Worker claims ──→ tasks/current/*.json   │
 │      ▲                         │                                     │
 │      │                         ▼                                     │
 │      │                    Execute in worktree                        │
@@ -147,25 +147,27 @@ Workers self-organize via the filesystem. Tasks live at the project root and are
 
 ```
 tasks/
-├── pending/*.edn     # unclaimed tasks
-├── current/*.edn     # in progress
-└── complete/*.edn    # done
+├── pending/*.json    # unclaimed tasks
+├── current/*.json    # in progress
+└── complete/*.json   # done
 ```
 
 From inside a worktree, workers reach tasks via `../tasks/`:
 - **See tasks**: `ls ../tasks/pending/`
-- **Claim**: `mv ../tasks/pending/task.edn ../tasks/current/`
-- **Complete**: `mv ../tasks/current/task.edn ../tasks/complete/`
-- **Create**: write new `.edn` to `../tasks/pending/`
+- **Claim**: `mv ../tasks/pending/task.json ../tasks/current/`
+- **Complete**: `mv ../tasks/current/task.json ../tasks/complete/`
+- **Create**: write new `.json` to `../tasks/pending/`
 
 Task file format:
-```edn
-{:id "task-001"
- :summary "Add user authentication"
- :description "Implement JWT-based auth for the API"
- :difficulty :medium
- :files ["src/auth.py" "tests/test_auth.py"]
- :acceptance ["Login endpoint returns token" "Tests pass"]}
+```json
+{
+  "id": "task-001",
+  "summary": "Add user authentication",
+  "description": "Implement JWT-based auth for the API",
+  "difficulty": "medium",
+  "files": ["src/auth.py", "tests/test_auth.py"],
+  "acceptance": ["Login endpoint returns token", "Tests pass"]
+}
 ```
 
 ### Bundled Prompts

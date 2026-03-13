@@ -14,12 +14,12 @@
    Design:
      - Worktrees live in .workers/ directory
      - Each worktree has its own branch: work/<worktree-id>
-     - State tracked in .workers/state.edn
+     - State tracked in .workers/state.json
      - All git operations are idempotent"
   (:require [agentnet.schema :as schema]
             [babashka.process :as process]
+            [cheshire.core :as json]
             [clojure.java.io :as io]
-            [clojure.edn :as edn]
             [clojure.string :as str]))
 
 ;; =============================================================================
@@ -49,7 +49,7 @@
 ;; =============================================================================
 
 (def ^:const WORKERS_DIR ".workers")
-(def ^:const STATE_FILE ".workers/state.edn")
+(def ^:const STATE_FILE ".workers/state.json")
 (def ^:const BRANCH_PREFIX "work/")
 
 ;; =============================================================================
@@ -117,13 +117,13 @@
 
 (defn- save-state! [pool]
   (ensure-workers-dir!)
-  (spit STATE_FILE (pr-str pool))
+  (spit STATE_FILE (str (json/generate-string pool {:pretty true}) "\n"))
   pool)
 
 (defn- load-state []
   (let [f (io/file STATE_FILE)]
     (when (.exists f)
-      (edn/read-string (slurp f)))))
+      (json/parse-string (slurp f) true))))
 
 ;; =============================================================================
 ;; Worktree CRUD

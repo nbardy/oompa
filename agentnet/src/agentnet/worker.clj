@@ -19,6 +19,7 @@
             [agentnet.worktree :as worktree]
             [agentnet.runs :as runs]
             [babashka.process :as process]
+            [cheshire.core :as json]
             [clojure.java.io :as io]
             [clojure.set]
             [clojure.pprint :refer [print-table]]
@@ -829,15 +830,18 @@
         complete-dir (io/file project-root "tasks" "complete")]
     (when (.exists complete-dir)
       (doseq [f (.listFiles complete-dir)]
-        (when (str/ends-with? (.getName f) ".edn")
+        (when (str/ends-with? (.getName f) ".json")
           (try
-            (let [task (read-string (slurp f))]
+            (let [task (json/parse-string (slurp f) true)]
               (when-not (:completed-by task)
-                (spit f (pr-str (assoc task
-                                       :completed-by worker-id
-                                       :completed-at (str (java.time.Instant/now))
-                                       :review-rounds (or review-rounds 0)
-                                       :merged-commit (or commit-hash "unknown"))))))
+                (spit f (str (json/generate-string
+                              (assoc task
+                                     :completed-by worker-id
+                                     :completed-at (str (java.time.Instant/now))
+                                     :review-rounds (or review-rounds 0)
+                                     :merged-commit (or commit-hash "unknown"))
+                              {:pretty true})
+                             "\n"))))
             (catch Exception e
               (println (format "[%s] Failed to annotate task %s: %s"
                                worker-id (.getName f) (.getMessage e))))))))))
@@ -1531,7 +1535,7 @@
 ;; =============================================================================
 ;; Planner — first-class config concept, NOT a worker
 ;; =============================================================================
-;; The planner creates task EDN files in tasks/pending/.
+;; The planner creates task JSON files in tasks/pending/.
 ;; It runs in the project root (no worktree), has no review/merge cycle,
 ;; and respects max_pending backpressure to avoid flooding the queue.
 
@@ -1560,7 +1564,7 @@
                                     (str/join "\n\n")))
                              "\n\nTask Status: " (:task_status context) "\n"
                              "Pending: " (:pending_tasks context) "\n\n"
-                             "Create tasks in tasks/pending/ as .edn files.\n"
+                             "Create tasks in tasks/pending/ as .json files.\n"
                              "Maximum " (- max-pending pending-before) " new tasks.\n"
                              "Signal __DONE__ when finished planning.")
             swarm-id* (or swarm-id "unknown")

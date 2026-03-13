@@ -27,7 +27,6 @@
             [agentnet.review :as review]
             [agentnet.merge :as merge]
             [clojure.core.async :as async]
-            [clojure.edn :as edn]
             [clojure.java.io :as io]
             [cheshire.core :as json]))
 
@@ -51,8 +50,8 @@
 ;; Constants
 ;; =============================================================================
 
-(def ^:const TASKS_PATH "config/tasks.edn")
-(def ^:const POLICY_PATH "config/policy.edn")
+(def ^:const TASKS_PATH "config/tasks.json")
+(def ^:const POLICY_PATH "config/policy.json")
 (def ^:const RUNS_DIR "runs")
 
 ;; =============================================================================
@@ -62,17 +61,16 @@
 (defn- now-ms []
   (System/currentTimeMillis))
 
-(defn- read-edn [path]
+(defn- read-json [path]
   (let [f (io/file path)]
     (when (.exists f)
-      (with-open [r (java.io.PushbackReader. (io/reader f))]
-        (edn/read {:eof nil} r)))))
+      (json/parse-string (slurp f) true))))
 
 (defn- load-tasks []
-  (or (read-edn TASKS_PATH) []))
+  (or (read-json TASKS_PATH) []))
 
 (defn- load-policy []
-  (or (read-edn POLICY_PATH)
+  (or (read-json POLICY_PATH)
       {:allow ["src/**" "tests/**"]
        :deny ["secrets/**" "**/*.pem"]
        :limits {:max-lines-added 800
