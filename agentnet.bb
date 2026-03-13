@@ -13,24 +13,32 @@
 ;; Paths & basic helpers
 ;; -----------------------------------------------------------------------------
 
-(def tasks-path "config/tasks.edn")
-(def policy-path "config/policy.edn")
+(def tasks-path "config/tasks.json")
+(def policy-path "config/policy.json")
 (def prompts-dir "config/prompts")
 (def runs-dir "runs")
 
 (defn now-ms [] (System/currentTimeMillis))
 
-(defn read-edn [path]
+
+(defn read-task-file [path]
   (let [f (io/file path)]
     (when (.exists f)
-      (with-open [r (java.io.PushbackReader. (io/reader f))]
-        (edn/read {:eof nil} r)))))
+      (try
+        (if (str/ends-with? path ".json")
+          (json/parse-string (slurp f) true)
+          (with-open [r (java.io.PushbackReader. (io/reader f))]
+            (edn/read {:eof nil} r)))
+        (catch Exception e
+          (println (str "[ERROR] Failed to read " path ": " (.getMessage e)))
+          nil)))))
+
 
 (defn load-tasks []
-  (or (read-edn tasks-path) []))
+  (or (read-task-file tasks-path) []))
 
 (defn load-policy []
-  (or (read-edn policy-path)
+  (or (read-task-file policy-path)
       {:allow ["src/**" "scripts/**" "docs/**" "config/**"]
        :deny []
        :max-lines-added nil
@@ -396,19 +404,13 @@
       (let [d (io/file dir)]
         (when (.exists d)
           (doseq [f (.listFiles d)]
-            (when (and (.isFile f) (str/ends-with? (.getName f) ".edn"))
+            (when (and (.isFile f) (str/ends-with? (.getName f) ".json"))
               (let [content (slurp f)]
-                (if (str/includes? content "\\`")
-                  (let [fixed-content (str/replace content #"\\`" "`")]
-                    (spit f fixed-content)
-                    (println (format "[FIXED] Invalid escape in: %s" (.getName f)))
-                    (swap! fixed inc)
-                    (swap! errors inc))
-                  (try
-                    (edn/read-string content)
+                (try
+                    (json/parse-string content true)
                     (catch Exception e
                       (println (format "[ERROR] Cannot parse %s: %s" (.getName f) (.getMessage e)))
-                      (swap! errors inc))))))))))
+                      (swap! errors inc)))))))))))
     (if (zero? @errors)
       (println "Tasks OK.")
       (do
