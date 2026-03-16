@@ -2,7 +2,7 @@
   "workers": [
     {
       "model": "codex:gpt-5.3-codex-spark",
-      "iterations": 1,
+      "max_cycle": 1,
       "count": 1
     }
   ]

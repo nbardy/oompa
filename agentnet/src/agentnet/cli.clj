@@ -595,7 +595,7 @@
                                  :swarm-id swarm-id
                                  :harness harness
                                  :model (:model opts)
-                                 :iterations 1}))
+                                 :max-cycles 1}))
                             (range count))))
                       specs)]
         (println (format "Running once with mixed workers (swarm %s):" swarm-id))
@@ -636,7 +636,7 @@
                                  :swarm-id swarm-id
                                  :harness harness
                                  :model (:model opts)
-                                 :iterations iterations}))
+                                 :max-cycles iterations}))
                             (range count))))
                       specs)]
         (println (format "Starting %d iterations with mixed workers (swarm %s):" iterations swarm-id))
@@ -665,29 +665,6 @@
       (spit "config/tasks.json" (str (json/generate-string [task] {:pretty true}) "\n"))
       ;; Run
       (orchestrator/run-once! opts))))
-
-(defn cmd-status
-  "Show running swarms."
-  [opts args]
-  (let [run-ids (runs/list-runs)]
-    (if (seq run-ids)
-      (let [running (for [id run-ids
-                          :let [started (runs/read-started id)
-                                stopped (runs/read-stopped id)
-                                pid (:pid started)]
-                          :when (and started (not stopped) pid (pid-alive? pid))]
-                      {:id id 
-                       :pid pid 
-                       :workers (count (:workers started))
-                       :work-count (count (runs/list-cycles id))})]
-        (if (seq running)
-          (do
-            (println (format "Running Swarms: %d" (count running)))
-            (doseq [r running]
-              (println (format "  Swarm: %s | PID: %s | Workers: %d | Work Count: %d" 
-                               (:id r) (:pid r) (:workers r) (:work-count r)))))
-          (println "No running swarms.")))
-      (println "No swarms found."))))
 
 (defn cmd-info
   "Show detailed information of a swarm run — reads event-sourced runs/{swarm-id}/ data."
@@ -783,11 +760,11 @@
 (defn- worker-runtime
   "Best-effort worker runtime classification for view output."
   [worker latest-cycle worker-cycles run-state*]
-  (let [run-max (or (:runs worker) (:iterations worker) 0)
-        runs-done (count (filter #(terminal-run-outcomes (:outcome %)) worker-cycles))
+  (let [cycle-cap (or (:max-cycles worker) 0)
+        cycles-done (count (filter #(terminal-run-outcomes (:outcome %)) worker-cycles))
         outcome (or (:outcome latest-cycle) "-")]
     (cond
-      (>= runs-done run-max) "completed"
+      (>= cycles-done cycle-cap) "completed"
       (str/starts-with? run-state* "stopped/") "stopped"
       (= run-state* "stale") "stale"
       (nil? latest-cycle) "starting"
@@ -817,6 +794,62 @@
      :claimed (count (set claimed-all))
      :completed (count completed-ids)}))
 
+(defn cmd-status
+  "Show all running swarms and last 10 historical runs with config info."
+  [opts args]
+  (letfn [(config-summary [started]
+            (let [cfg (or (:config-file started) "?")
+                  worker-models (->> (:workers started)
+                                     (map model-label)
+                                     frequencies
+                                     (map (fn [[m n]] (if (> n 1) (format "%dx %s" n m) m)))
+                                     (str/join ", "))
+                  planner (when-let [p (:planner started)]
+                            (str (:harness p) ":" (:model p)))]
+              (str cfg " | workers: [" worker-models "]"
+                   (when planner (str " | planner: " planner)))))
+          (run-entry [run-id]
+            (let [started (runs/read-started run-id)
+                  stopped (runs/read-stopped run-id)
+                  cycles (or (runs/list-cycles run-id) [])
+                  state* (run-state started stopped)
+                  metrics (run-metrics cycles)]
+              {:id run-id
+               :state state*
+               :pid (or (:pid started) "-")
+               :workers (count (or (:workers started) []))
+               :cycles (count cycles)
+               :merged (:merged metrics)
+               :failed (:failed metrics)
+               :started-at (or (:started-at started) "-")
+               :config-summary (when started (config-summary started))}))
+          (print-run [r]
+            (println (format "  %s | %-16s | %d workers | %d cycles | %d merged | %d failed"
+                             (:id r) (:state r) (:workers r) (:cycles r) (:merged r) (:failed r)))
+            (when (:config-summary r)
+              (println (format "    config: %s" (:config-summary r))))
+            (println (format "    started: %s" (:started-at r))))]
+    (let [run-ids (or (runs/list-runs) [])]
+      (if-not (seq run-ids)
+        (println "No swarms found.")
+        (let [all-entries (mapv run-entry run-ids)
+              running (filter #(= "running" (:state %)) all-entries)
+              dead (remove #(= "running" (:state %)) all-entries)
+              history (take 10 dead)]
+          ;; Running swarms
+          (println (format "=== Running Swarms (%d) ===" (count running)))
+          (if (seq running)
+            (doseq [r running] (print-run r))
+            (println "  (none)"))
+          (println)
+          ;; History
+          (println (format "=== Recent History (last %d) ===" (count history)))
+          (if (seq history)
+            (doseq [r history] (print-run r))
+            (println "  (none)"))
+          (when (> (count dead) 10)
+            (println (format "\n  ... %d more. Use `oompa list --all` for full history." (- (count dead) 10)))))))))
+
 (defn- cmd-view-one
   [swarm-id]
   (if-let [started (runs/read-started swarm-id)]
@@ -842,20 +875,19 @@
       (println (format "Reviews: %d" (count reviews)))
       (println)
       (println "Workers:")
-      (println "ID  | Runtime   | Runs   | Cycles  | Last Outcome   | Claimed | Model")
-      (println "----+-----------+--------+---------+----------------+---------+------------------------------")
+      (println "ID  | Runtime   | Cycles     | Last Outcome   | Claimed | Model")
+      (println "----+-----------+------------+----------------+---------+------------------------------")
       (doseq [w (sort-by :id workers)]
         (let [wid (:id w)
               latest (get latest-by-worker wid)
               worker-cycles (or (get cycles-by-worker wid) [])
-              run-max (or (:runs w) (:iterations w) 0)
-              runs-done (count (filter #(terminal-run-outcomes (:outcome %)) worker-cycles))
-              cycles-done (or (:cycle latest) 0)
+              cycle-cap (or (:max-cycles w) 0)
+              cycles-done (count (filter #(terminal-run-outcomes (:outcome %)) worker-cycles))
               runtime (worker-runtime w latest worker-cycles run-state*)
               outcome (or (:outcome latest) "-")
               claimed (count (or (:claimed-task-ids latest) []))]
-          (println (format "%-3s | %-9s | %4d/%-3d | %7d | %-14s | %-7d | %s"
-                           wid runtime runs-done run-max cycles-done outcome claimed (model-label w))))))
+          (println (format "%-3s | %-9s | %4d/%-5d | %-14s | %-7d | %s"
+                           wid runtime cycles-done cycle-cap outcome claimed (model-label w))))))
     (do
       (println (format "Swarm not found: %s" swarm-id))
       (System/exit 1))))
@@ -883,10 +915,10 @@
                 active-count (if (= state* "running")
                                (count (filter (fn [w]
                                                 (let [wid (:id w)
-                                                      run-max (or (:runs w) (:iterations w) 0)
-                                                      runs-done (count (filter #(terminal-run-outcomes (:outcome %))
-                                                                               (or (get cycles-by-worker wid) [])))]
-                                                  (< runs-done run-max)))
+                                                      cycle-cap (or (:max-cycles w) 0)
+                                                      cycles-done (count (filter #(terminal-run-outcomes (:outcome %))
+                                                                                 (or (get cycles-by-worker wid) [])))]
+                                                  (< cycles-done cycle-cap)))
                                               workers))
                                0)]
             (println (format "%-8s | %-16s | %-6s | %7d | %6d | %6d | %6d | %6d | %4d | %s"
@@ -1136,14 +1168,13 @@
                            :harness harness
                            :model model
                            :reasoning reasoning
-                           :runs (or (:runs wc) 10)
                            :max-cycles (:max_cycle wc)
-                           :iterations (:max_cycle wc)
                            :prompts (:prompt wc)
                            :can-plan (:can_plan wc)
                            :wait-between (:wait_between wc)
                            :max-wait-for-tasks (:max_wait_for_tasks wc)
                            :max-working-resumes (:max_working_resumes wc)
+                           :max-resumes (:max_resumes wc)
                            :reviewers all-reviewers})))
                     expanded-workers)]
 
@@ -1167,13 +1198,13 @@
       (println (format "  Workers: %d total" (count workers)))
       (doseq [[idx wc] (map-indexed vector worker-configs)]
         (let [{:keys [harness model reasoning]} (parse-model-string (:model wc))]
-          (println (format "    - %dx %s:%s%s (%d runs, %d cycle cap%s)"
+          (println (format "    - %dx %s:%s%s (max_cycle=%d, max_resumes=%d%s)"
                            (or (:count wc) 1)
                            (name harness)
                            model
                            (if reasoning (str ":" reasoning) "")
-                           (or (:runs wc) 10)
                            (:max_cycle wc)
+                           (or (:max_resumes wc) 7)
                            (if (:prompt wc) (str ", " (:prompt wc)) "")))))
       (println)
 

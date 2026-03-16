@@ -9,7 +9,7 @@
 
 (defn- stubbed-worker-shell
   [run-agent-fn emit-log-fn
-   & {:keys [can-plan iterations max-working-resumes max-needs-followups
+   & {:keys [can-plan max-cycles max-working-resumes max-needs-followups
              task-status pending-tasks current-count current-task-ids
              worktree-has-changes? review-loop-fn sync-fn merge-fn
              recycle-tasks-fn]}]
@@ -37,12 +37,14 @@
                 worker/review-loop! (or review-loop-fn (fn [& _] {:approved? true :attempts 0}))
                 worker/sync-worktree-to-main! (or sync-fn (fn [& _] :ok))
                 worker/merge-to-main! (or merge-fn (fn [& _] {:ok? true :completed-count 1}))
+                worker/run-merge-agent! (or merge-fn (fn [& _] {:ok? true :sha "abc123"}))
                 worker/recover-merge-failure! (fn [& _] {:ok? false :completed-count 0})
+                worker/complete-merge! (fn [& _] nil)
                 worker/emit-cycle-log! emit-log-fn]
     (worker/run-worker! {:id "w0"
                          :harness :codex
                          :model "gpt-5"
-                         :iterations (or iterations 1)
+                         :max-cycles (or max-cycles 1)
                          :can-plan (if (nil? can-plan) true can-plan)
                          :max-working-resumes (or max-working-resumes 5)
                          :max-needs-followups (or max-needs-followups 1)})))
@@ -72,7 +74,7 @@
                       :claim-ids nil
                       :session-id "sid-1"}))
                  (capture-log! logs))]
-    (t/is (= :exhausted (:status result)))
+    (t/is (= :completed (:status result)))
     (t/is (= 1 (:claims result)))
     (t/is (= 2 (count @logs)))
     (t/is (= :claimed (:outcome (first @logs))))
@@ -89,7 +91,7 @@
                     :claim-ids nil
                     :session-id "sid-2"})
                  (capture-log! logs)
-                 :iterations 3)]
+                 :max-cycles 3)]
     (t/is (= :error (:status result)))
     (t/is (= 1 (count @logs)))
     (t/is (= :error (:outcome (first @logs))))
@@ -125,9 +127,9 @@
                       :claim-ids nil
                       :session-id "sid-followup"}))
                  (capture-log! logs)
-                 :iterations 1
+                 :max-cycles 1
                  :worktree-has-changes? true)]
-    (t/is (= :exhausted (:status result)))
+    (t/is (= :completed (:status result)))
     (t/is (= [:claimed :needs-followup :merged] (mapv :outcome @logs)))
     (t/is (= ["task-001"] (:claimed-task-ids (last @logs))))
     (t/is (nil? (nth @prompts-seen 0)))
@@ -156,13 +158,13 @@
                       :claim-ids nil
                       :session-id "sid-no-changes"}))
                  (capture-log! logs)
-                 :iterations 1
+                 :max-cycles 1
                  :worktree-has-changes? false
                  :recycle-tasks-fn (fn [ids]
                                      (let [ids (vec (sort ids))]
                                        (swap! recycled conj ids)
                                        ids)))]
-    (t/is (= :exhausted (:status result)))
+    (t/is (= :completed (:status result)))
     (t/is (= [["task-001"]] @recycled))
     (t/is (= :no-changes (:outcome (last @logs))))
     (t/is (= ["task-001"] (:recycled-tasks (last @logs))))))
@@ -196,7 +198,7 @@
                       :claim-ids nil
                       :session-id "sid-followup-limit"}))
                  (capture-log! logs)
-                 :iterations 3
+                 :max-cycles 3
                  :max-needs-followups 1
                  :recycle-tasks-fn (fn [ids]
                                      (let [ids (vec (sort ids))]
@@ -239,9 +241,9 @@
                     :claim-ids nil
                     :session-id "sid-stuck"})
                  (capture-log! logs)
-                 :iterations 1
+                 :max-cycles 1
                  :max-working-resumes 2)]
-    (t/is (= :exhausted (:status result)))
+    (t/is (= :completed (:status result)))
     (let [outcomes (mapv :outcome @logs)]
       (t/is (= 3 (count outcomes)))
       (t/is (= :working (nth outcomes 0)))
@@ -262,7 +264,7 @@
          :claim-ids nil
          :session-id "sid-nudge"})
       (fn [& _] nil)
-      :iterations 1
+      :max-cycles 1
       :max-working-resumes 2)
     (t/is (= 3 @call-count))
     (t/is (nil? (nth @prompts-seen 0)))

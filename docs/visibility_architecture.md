@@ -202,7 +202,7 @@ Records what was configured and how to check liveness.
       "id": "w0",
       "harness": "claude",
       "model": "opus",
-      "iterations": 30,
+      "max-cycles": 30,
       "can-plan": true,
       "prompts": ["oompa/prompts/base.md", "oompa/prompts/architect.md"]
     }
@@ -313,7 +313,7 @@ Compare cycle count against configured max from `started.json`.
 
 ```bash
 # Configured max for w0
-jq '.workers[] | select(.id=="w0") | .iterations' runs/{id}/started.json
+jq '.workers[] | select(.id=="w0") | ."max-cycles"' runs/{id}/started.json
 
 # Actual cycles completed
 ls runs/{id}/cycles/w0-c*.json | wc -l

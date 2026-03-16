@@ -14,7 +14,7 @@
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["id", "harness", "model", "iterations", "can-plan", "prompts"],
+        "required": ["id", "harness", "model", "max-cycles", "can-plan", "prompts"],
         "properties": {
           "id": { "type": "string" },
           "harness": {
@@ -25,7 +25,8 @@
           },
           "model": { "type": "string" },
           "reasoning": { "type": ["string", "null"] },
-          "iterations": { "type": "integer", "minimum": 1 },
+          "max-cycles": { "type": "integer", "minimum": 1, "description": "Max completed cycles (terminal outcomes) before worker stops" },
+          "max-resumes": { "type": "integer", "minimum": 1, "description": "Max attempts/resumes within a single cycle (default 7)" },
           "can-plan": { "type": "boolean" },
           "prompts": { "type": "array", "items": { "type": "string" } }
         },
