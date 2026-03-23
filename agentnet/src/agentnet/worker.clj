@@ -332,6 +332,7 @@
      :exit (:exit result)
      :done? (agent/done-signal? output)
      :merge? (agent/merge-signal? output)
+     :merge-notes (agent/parse-merge-notes output)
      :merge-complete-sha (agent/parse-merge-complete-signal output)
      :needs-followup? (agent/needs-followup-signal? output)
      :claim-ids (agent/parse-claim-signal output)
@@ -821,8 +822,8 @@
 (defn- annotate-completed-tasks!
   "After a successful merge (called under merge-lock), annotate any tasks in
    complete/ that lack metadata. Adds :completed-by, :completed-at,
-   :review-rounds, :merged-commit."
-  [project-root worker-id review-rounds]
+   :review-rounds, :merged-commit, and optional :notes."
+  [project-root worker-id review-rounds & {:keys [merge-notes]}]
   (let [commit-hash (get-head-hash project-root)
         complete-dir (io/file project-root "tasks" "complete")]
     (when (.exists complete-dir)
@@ -832,11 +833,12 @@
             (let [task (json/parse-string (slurp f) true)]
               (when-not (:completed-by task)
                 (spit f (str (json/generate-string
-                              (assoc task
-                                     :completed-by worker-id
-                                     :completed-at (str (java.time.Instant/now))
-                                     :review-rounds (or review-rounds 0)
-                                     :merged-commit (or commit-hash "unknown"))
+                              (cond-> (assoc task
+                                             :completed-by worker-id
+                                             :completed-at (str (java.time.Instant/now))
+                                             :review-rounds (or review-rounds 0)
+                                             :merged-commit (or commit-hash "unknown"))
+                                merge-notes (assoc :notes merge-notes))
                               {:pretty true})
                              "\n"))))
             (catch Exception e
@@ -849,12 +851,16 @@
    tasks current→complete and annotates metadata. Returns
    {:ok? bool :reason keyword :message string}.
    claimed-task-ids: set of task IDs this worker claimed (framework owns completion)."
-  [wt-path wt-id worker-id project-root review-rounds claimed-task-ids]
+  [wt-path wt-id worker-id project-root review-rounds claimed-task-ids
+   & {:keys [merge-notes]}]
   (locking merge-lock
     (println (format "[%s] Merging changes to main" worker-id))
-    (let [;; Commit in worktree if needed (no-op if already committed)
+    (let [commit-msg (if merge-notes
+                       (str "Work from " wt-id "\n\n" merge-notes)
+                       (str "Work from " wt-id))
+          ;; Commit in worktree if needed (no-op if already committed)
           _ (process/sh ["git" "add" "-A"] {:dir wt-path})
-          _ (process/sh ["git" "commit" "-m" (str "Work from " wt-id)]
+          _ (process/sh ["git" "commit" "-m" commit-msg]
                         {:dir wt-path})
           ;; Checkout main and merge (in project root, not worktree)
           checkout-result (process/sh ["git" "checkout" "main"]
@@ -882,7 +888,7 @@
           (when (seq completed)
             (println (format "[%s] Completed %d task(s): %s"
                              worker-id completed-count (str/join ", " completed))))
-          (annotate-completed-tasks! project-root worker-id review-rounds)
+          (annotate-completed-tasks! project-root worker-id review-rounds :merge-notes merge-notes)
           {:ok? true
            :reason :merged
            :message (str "merged → " (or merge-sha "unknown"))
@@ -972,14 +978,15 @@
 (defn- complete-merge!
   "After agent confirms merge, move tasks to complete and annotate them.
    Returns completed task count."
-  [project-root worker-id review-rounds claimed-task-ids sha]
+  [project-root worker-id review-rounds claimed-task-ids sha
+   & {:keys [merge-notes]}]
   (let [completed (when (seq claimed-task-ids)
                     (tasks/complete-by-ids! claimed-task-ids))
         completed-count (count (or completed []))]
     (when (seq completed)
       (println (format "[%s] Completed %d task(s): %s"
                        worker-id completed-count (str/join ", " completed))))
-    (annotate-completed-tasks! project-root worker-id review-rounds)
+    (annotate-completed-tasks! project-root worker-id review-rounds :merge-notes merge-notes)
     completed-count))
 
 (defn- task-only-diff?
@@ -1226,7 +1233,7 @@
                                          (inc completed) cycle-cap attempt resume-cap))
                       context (build-context)
                       agent-start-ms (now-ms)
-                      {:keys [output exit done? merge? needs-followup? claim-ids parse-warning raw-snippet] :as agent-result}
+                      {:keys [output exit done? merge? merge-notes needs-followup? claim-ids parse-warning raw-snippet] :as agent-result}
                       (run-agent! worker (:path wt-state) context session-id resume?
                                   :resume-prompt-override claim-resume-prompt)
                       cycle-timing (add-llm-call cycle-timing
@@ -1296,7 +1303,7 @@
                           (let [merge-result (run-merge-agent! worker (:path wt-state) (:branch wt-state) project-root new-session-id id)
                                 merged? (:ok? merge-result)
                                 sha (:sha merge-result)
-                                _ (when merged? (complete-merge! project-root id 0 all-claimed sha))
+                                _ (when merged? (complete-merge! project-root id 0 all-claimed sha :merge-notes merge-notes))
                                 recycled (when-not merged? (recycle-task-id-set! id all-claimed))
                                 metrics (cond-> metrics
                                           merged? (update :merges inc)
@@ -1321,7 +1328,7 @@
                                   merge-result (run-merge-agent! worker (:path wt-state) (:branch wt-state) project-root new-session-id id)
                                   merged? (:ok? merge-result)
                                   sha (:sha merge-result)
-                                  _ (when merged? (complete-merge! project-root id (or attempts 0) all-claimed sha))
+                                  _ (when merged? (complete-merge! project-root id (or attempts 0) all-claimed sha :merge-notes merge-notes))
                                   recycled (when-not merged? (recycle-task-id-set! id all-claimed))
                                   metrics (cond-> metrics
                                             merged? (update :merges inc)
@@ -1347,14 +1354,22 @@
                                                 :review-rounds (or attempts 0)})
                               (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                               (recur (inc cycle) 1 (inc completed) 0 metrics nil nil #{} nil 0 0 [])))))
-                      (let [recycled (recycle-active-claims! id claimed-ids mv-claimed-tasks)
-                            metrics (update metrics :recycled + (count recycled))]
-                        (println (format "[%s] Merge signaled but no changes, skipping" id))
+                      ;; Worker signaled merge with no code diff. If they claimed
+                      ;; tasks, they verified the work is already done — complete them.
+                      ;; (Tasks live outside the worktree at ../tasks/, so mv is
+                      ;; invisible to git diff. Framework must own this transition.)
+                      (let [completed-ids (when (seq active-claimed-ids)
+                                            (tasks/complete-by-ids! (vec active-claimed-ids)))]
+                        (when (seq completed-ids)
+                          (println (format "[%s] No-diff merge: completing %d verified task(s): %s"
+                                           id (count completed-ids) (str/join ", " completed-ids)))
+                          (annotate-completed-tasks! project-root id 0 :merge-notes merge-notes))
+                        (when-not (seq completed-ids)
+                          (println (format "[%s] Merge signaled but no changes, skipping" id)))
                         (emit!
                                          {:timing-ms cycle-timing
                                           :outcome :no-changes
-                                          :claimed-task-ids (vec active-claimed-ids)
-                                          :recycled-tasks (seq recycled)})
+                                          :claimed-task-ids (vec active-claimed-ids)})
                         (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                         (recur (inc cycle) 1 (inc completed) 0 metrics nil nil #{} nil 0 0 [])))
 

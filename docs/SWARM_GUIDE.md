@@ -181,7 +181,87 @@ This also applies to specs. If a task references a design decision that hasn't b
 Without this, every missing dependency becomes a traffic jam. With it, the swarm operates as a flat, asynchronous field where agents flow around blockers instead of queuing behind them.
 
 
-## 5. Best Practices
+## 5. Anti-Pattern: The Planning Stampede
+
+The single most destructive swarm failure mode. Multiple workers with `can_plan: true` and a planning-oriented prompt will independently scan the codebase, identify the same gaps, and generate duplicate tasks — then execute them in parallel, producing conflicting implementations that stomp on each other.
+
+**What it looks like:**
+- 94 tasks self-generated when the planner only created 4
+- The same minigame implemented 5 times by different workers
+- Workers inventing work that nobody asked for
+- 49 merges that advance only 3 features
+
+**Why it happens:** `can_plan: true` + a prompt that says "identify what's missing and create tasks" = every worker becomes an independent planner. Soft coordination mechanisms (shared markdown files like `claimed_specs.md`) don't survive race conditions. By the time worker B checks the claim list, worker A has already created tasks and started executing.
+
+**The rules:**
+
+1. **One planner, one plan.** Use the dedicated `"planner"` config (runs once, synchronously, before workers start). Set `max_pending` high enough to cover the full scope. The planner burns tokens upfront to create the complete task batch — that's the Slow Squeeze.
+
+2. **`can_plan: true` ≠ "be a planner."** Workers with `can_plan: true` should get the **executor** prompt, not the planner prompt. `can_plan` means "you can refill the queue if it empties" — scoped to breaking down a task you're already working on, not scanning the codebase for new work.
+
+3. **Never give multiple workers the same planning prompt.** If two workers both have "identify unimplemented features and create tasks," they will identify the same features and create duplicate tasks. The planner is a singleton by design.
+
+4. **If you need continuous planning, use one lead + many executors.** Set `count: 1` on the lead worker. It plans sequentially while executors consume in parallel. This is the Divergence → Convergence pipeline from the Philosophy.
+
+**The safe config pattern for "implement everything":**
+
+```json
+{
+  "planner": {
+    "model": "large-model",
+    "prompt": ["prompts/planner.md"],
+    "max_pending": 60
+  },
+  "workers": [
+    {
+      "_role": "lead",
+      "model": "large-model",
+      "prompt": ["prompts/executor.md"],
+      "max_cycle": 15,
+      "count": 1,
+      "can_plan": true
+    },
+    {
+      "_role": "executor",
+      "model": "fast-model",
+      "prompt": ["prompts/executor.md"],
+      "max_cycle": 30,
+      "count": 8,
+      "can_plan": false
+    }
+  ]
+}
+```
+
+The planner creates the full batch. The single lead can create follow-up tasks if the queue empties. The 8 executors grind. Nobody duplicates work.
+
+
+## 6. Anti-Pattern: The Stale Task Loop
+
+Workers claim a task, investigate, find the work is already done (e.g. a bug was already fixed upstream), signal `COMPLETE_AND_READY_FOR_MERGE` — but there's no code diff. The framework recycles the task back to pending. The next worker picks it up. Repeat forever.
+
+**Why it happens:** Tasks live at `../tasks/` outside the worktree, so `git diff` can't see task file moves. The framework checks `worktree-has-changes?` before allowing a merge, and "no changes" means "recycle."
+
+**The fix (framework-level, shipped):** When a worker has claimed tasks and signals merge with no diff, the framework completes those tasks instead of recycling them. The worker verified the work — that's the deliverable.
+
+**Prevention:** Use `COMPLETE_AND_READY_FOR_MERGE(reason)` to leave provenance on why a task was completed without a diff. The notes are written into the task's JSON metadata.
+
+
+## 7. Plans in Git
+
+The planner runs in the project root (not a worktree) and automatically commits task files after creating them (`git add tasks/pending/ && git commit`). This only works if `tasks/` is **not** gitignored.
+
+**Un-ignore `tasks/` in your project's `.gitignore`.** This gives you:
+- **Provenance:** `git log` shows exactly what was planned, when, and what the queue looked like
+- **Cleanup audit:** The planner can delete stale/duplicate pending tasks and commit that cleanup
+- **Post-mortem:** After a swarm, `git log -- tasks/` shows the full lifecycle of every task
+
+Workers still interact with tasks via the framework (filesystem `mv` for claim/complete transitions). Worker worktrees can't see `../tasks/` in their git tree — that's by design. The framework owns runtime state; git owns the historical record.
+
+**Planner cleanup duty:** The planner prompt should include a "Step 0" that audits and cleans the queue before creating new tasks. Compare `tasks/pending/` against `tasks/complete/` and `git log` to remove duplicates and stale tasks. This prevents the Planning Stampede from compounding across swarm runs.
+
+
+## 8. Best Practices
 
 1. **Always use `can_plan: false` for executors.** If you forget, every worker will try to become a manager, leading to race conditions where 5 workers try to write conflicting task files simultaneously.
 2. **Use `config/prompts/executor.md` for simple models.** This prompt disables task creation and forces them to focus on claiming existing `.json` files.
@@ -189,3 +269,5 @@ Without this, every missing dependency becomes a traffic jam. With it, the swarm
 4. **Leverage custom prompt includes.** If the project has strict styling rules, create `prompts/style_guide.md` and append it to the `prompt` array for ALL workers. Don't rely on them finding it themselves.
 5. **Tag-based routing over permission silos.** Give all agents full context access. Control what they work on by tagging tasks (`#eng-task`, `#meta-task`, `#design-task`), not by limiting their intelligence.
 6. **Add a Docs Architect for any swarm over an hour.** Shared reality drifts the moment a swarm starts. Without a dedicated agent cleaning the specs, your executors will build against stale assumptions.
+7. **Size `max_pending` to the full scope.** If you have 20 features to implement at 3 tasks each, set `max_pending: 60`. Starving the queue forces workers into planning mode, which causes the Planning Stampede.
+8. **Post-swarm audit.** After a run, check `tasks/complete/` for duplicate titles. If the same feature appears 3+ times, your planner prompt is too open-ended or you have too many planners.

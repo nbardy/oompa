@@ -272,6 +272,14 @@
   [output]
   (boolean (re-find #"COMPLETE_AND_READY_FOR_MERGE" (or output ""))))
 
+(defn parse-merge-notes
+  "Extract optional notes from COMPLETE_AND_READY_FOR_MERGE(notes) signal.
+   Returns notes string or nil if bare signal (no parens).
+   Format: COMPLETE_AND_READY_FOR_MERGE(task already fixed in b23b864)"
+  [output]
+  (when-let [match (re-find #"COMPLETE_AND_READY_FOR_MERGE\(([^)]+)\)" (or output ""))]
+    (str/trim (second match))))
+
 (defn needs-followup-signal?
   "Check if output contains NEEDS_FOLLOWUP signal"
   [output]
