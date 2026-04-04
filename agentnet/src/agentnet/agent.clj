@@ -13,7 +13,8 @@
    Supported Backends:
      :codex  - OpenAI Codex CLI (codex exec)
      :claude - Anthropic Claude CLI (claude -p)
-     :opencode - opencode CLI (opencode run)"
+     :opencode - opencode CLI (opencode run)
+     :cursor - Cursor agent CLI (cursor agent)"
   (:require [agentnet.schema :as schema]
             [babashka.process :as process]
             [clojure.java.io :as io]
@@ -98,6 +99,14 @@
   [agent-type]
   (and (keyword? agent-type)
        (re-matches #"^gemini\\d+$" (name agent-type))))
+
+(defmethod build-command :cursor
+  [_ {:keys [model session-id]} prompt _cwd]
+  ;; cursor agent --print --output-format stream-json --stream-partial-output [--resume <id>] [--model <m>] <prompt>
+  (cond-> ["cursor" "agent" "--print" "--output-format" "stream-json" "--stream-partial-output"]
+    session-id (into ["--resume" session-id])
+    model      (into ["--model" model])
+    true       (conj prompt)))
 
 (defmethod build-command :gemini
   [_ {:keys [model]} prompt cwd]
@@ -440,6 +449,7 @@
               (= :codex agent-type) ["codex" "--version"]
               (= :claude agent-type) ["claude" "--version"]
               (= :opencode agent-type) ["opencode" "--version"]
+              (= :cursor agent-type) ["cursor" "--version"]
               (= :gemini agent-type) ["gemini" "--version"]
               (gemini-alias? agent-type) [(name agent-type) "--version"]
               :else ["echo" "unknown"])]

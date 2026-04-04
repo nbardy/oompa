@@ -5,7 +5,7 @@
    CLI flag syntax is owned by agent-cli (shared with claude-web-view).
    This module owns: stdin behavior, session strategy, output parsing.
 
-   Harness = Codex | Claude | Opencode | Gemini
+   Harness = Codex | Claude | Opencode | Gemini | Cursor
    δ(harness) → config map → agent-cli JSON → command vector"
   (:require [babashka.process :as process]
             [cheshire.core :as json]
@@ -136,6 +136,7 @@
    {:codex    {:stdin :close   :session :uuid      :output :plain}
     :claude   {:stdin :prompt  :session :uuid      :output :plain}
     :opencode {:stdin :close   :session :extracted  :output :ndjson}
+    :cursor   {:stdin :close   :session :extracted  :output :ndjson}
     :gemini   gemini-behavior}
    {:gemini1 gemini-behavior
     :gemini2 gemini-behavior

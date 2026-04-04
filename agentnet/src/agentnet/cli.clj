@@ -326,7 +326,7 @@
           probe-prompt "[_HIDE_TEST_] say ok"
           stdin-val (harness/process-stdin harness-kw probe-prompt)
           proc (process/process cmd {:out :string :err :string :in stdin-val})
-          result (deref proc 30000 :timeout)]
+          result (deref proc 60000 :timeout)]
       (if (= result :timeout)
         (do (.destroyForcibly (:proc proc)) false)
         (zero? (:exit result))))
