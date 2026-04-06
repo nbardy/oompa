@@ -936,7 +936,7 @@
        "IMPORTANT: Only signal MERGE_COMPLETE after the merge is actually on main.\n"
        "If you cannot resolve conflicts after trying hard, signal NEEDS_FOLLOWUP with details."))
 
-(defn- run-merge-agent!
+(defn run-merge-agent!
   "Resume the original worker session and instruct it to merge its branch to main.
    Serialized via merge-lock so concurrent workers don't corrupt the git index.
    Returns {:ok? bool :sha string|nil :message string}."
@@ -1011,7 +1011,7 @@
            (remove str/blank?)
            vec))))
 
-(defn- review-loop!
+(defn review-loop!
   "Run review loop: reviewer checks → if issues, fix & retry → back to reviewer.
    Accumulates feedback across rounds so reviewer doesn't raise new issues
    and fixer has full context of all prior feedback.

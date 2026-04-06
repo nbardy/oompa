@@ -1358,6 +1358,7 @@
   (println "  stop [swarm-id]  Stop swarm gracefully (finish current cycle)")
   (println "  kill [swarm-id]  Kill swarm immediately (SIGKILL)")
   (println "  cleanup          Remove all worktrees")
+  (println "  salvage [id]     Resume dead workers from a swarm (tries session resume, falls back to fresh)")
   (println "  context          Print context block")
   (println "  check            Check agent backends")
   (println "  help             Show this help")
@@ -1406,6 +1407,353 @@
           (println (str "Could not read " path ": " (.getMessage e))))))))
 
 ;; =============================================================================
+;; Salvage — resume dead/errored workers from a previous swarm
+;; =============================================================================
+
+(defn- parse-worktree-name
+  "Parse .w{swarm-token}-{worker-id}-i{iteration} into components.
+   Returns {:swarm-token :worker-id :iteration} or nil."
+  [dir-name]
+  (when-let [[_ swarm-token worker-id iteration]
+             (re-matches #"\.?\.?ws?([a-f0-9]+)-(w\d+)-i(\d+)" dir-name)]
+    {:swarm-token swarm-token
+     :worker-id worker-id
+     :iteration (Integer/parseInt iteration)}))
+
+(defn- find-salvageable-branches
+  "Find oompa/* branches that have commits ahead of main.
+   Returns seq of {:branch :worker-id :swarm-token :ahead-count}."
+  []
+  (let [br-result (process/sh ["git" "branch" "--list" "oompa/*"] {:out :string})
+        branches (when (zero? (:exit br-result))
+                   (->> (str/split-lines (:out br-result))
+                        (map str/trim)
+                        (remove str/blank?)
+                        (remove #(= % "*"))))]
+    (->> branches
+         (keep (fn [branch]
+                 (let [ahead (process/sh ["git" "rev-list" "--count" (str "main.." branch)]
+                                         {:out :string :err :string})
+                       count (try (Integer/parseInt (str/trim (:out ahead)))
+                                  (catch Exception _ 0))
+                       ;; Parse branch name: oompa/s{swarm-token}-{worker-id}-i{iteration}
+                       parts (when-let [[_ swarm-token worker-id iteration]
+                                        (re-matches #"oompa/s([a-f0-9]+)-(w\d+)-i(\d+)" branch)]
+                               {:swarm-token swarm-token
+                                :worker-id worker-id
+                                :iteration (Integer/parseInt iteration)})]
+                   (when (and parts (pos? count))
+                     (assoc parts :branch branch :ahead-count count)))))
+         vec)))
+
+(defn- find-salvageable-worktrees
+  "Find surviving worktree directories with changes.
+   Returns seq of {:dir :branch :worker-id :swarm-token :has-changes?}."
+  []
+  (let [ls-result (process/sh ["find" "." "-maxdepth" "1" "-type" "d" "-name" ".w*-i*"]
+                              {:out :string})
+        dirs (when (zero? (:exit ls-result))
+               (->> (str/split-lines (:out ls-result))
+                    (remove str/blank?)))]
+    (->> dirs
+         (keep (fn [dir]
+                 (let [parts (parse-worktree-name dir)
+                       branch (worktree-branch-name dir)
+                       has-changes? (or (dirty-worktree? dir)
+                                        (let [ahead (process/sh ["git" "-C" dir "rev-list" "--count" "main..HEAD"]
+                                                                {:out :string :err :string})
+                                              cnt (try (Integer/parseInt (str/trim (:out ahead)))
+                                                       (catch Exception _ 0))]
+                                          (pos? cnt)))]
+                   (when parts
+                     (assoc parts :dir dir :branch branch :has-changes? has-changes?)))))
+         vec)))
+
+(defn- last-cycle-for-worker
+  "Find the last cycle log for a worker in a swarm. Returns parsed JSON or nil."
+  [swarm-id worker-id]
+  (let [cycles (runs/list-cycles swarm-id)]
+    (->> cycles
+         (filter #(= (:worker-id %) worker-id))
+         (sort-by :cycle)
+         last)))
+
+(defn- reviews-for-worker-cycle
+  "Get all review logs for a specific worker cycle, sorted by round."
+  [swarm-id worker-id cycle]
+  (let [reviews (runs/list-reviews swarm-id)]
+    (->> reviews
+         (filter #(and (= (:worker-id %) worker-id)
+                       (= (:cycle %) cycle)))
+         (sort-by :round)
+         vec)))
+
+(defn- build-salvage-prompt
+  "Build a prompt for a fresh session that inherits partial work context.
+   Includes: the diff, review history, and instructions to finish + merge."
+  [wt-path branch review-history worker-prompts]
+  (let [diff-result (process/sh ["git" "diff" "-U5" "main"]
+                                {:dir wt-path :out :string :err :string})
+        diff (let [d (:out diff-result)]
+               (if (> (count d) 24000)
+                 (str (subs d 0 24000) "\n...[diff truncated at 24000 chars]")
+                 d))
+        log-result (process/sh ["git" "log" "--oneline" "main..HEAD"]
+                               {:dir wt-path :out :string :err :string})
+        commit-log (:out log-result)
+
+        ;; Load worker prompt files for role context
+        prompt-context (when (seq worker-prompts)
+                         (->> worker-prompts
+                              (keep (fn [p]
+                                      (try (slurp p)
+                                           (catch Exception _ nil))))
+                              (str/join "\n\n")))
+
+        ;; Format review history
+        review-text (when (seq review-history)
+                      (str "## Previous Review Feedback\n\n"
+                           (->> review-history
+                                (map (fn [{:keys [round verdict output]}]
+                                       (str "### Round " round " — " (or verdict "unknown") "\n"
+                                            (or output "(no output)") "\n")))
+                                (str/join "\n"))))]
+    (str "# Salvage: Resume Interrupted Work\n\n"
+         "You are picking up work from a previous agent session that was interrupted.\n"
+         "The work is partially done — there are already commits on this branch.\n\n"
+         (when prompt-context
+           (str "## Your Role\n\n" prompt-context "\n\n"))
+         "## Branch: " branch "\n\n"
+         "## Commits on branch:\n```\n" (or commit-log "(none)") "\n```\n\n"
+         "## Current diff vs main:\n```\n" diff "\n```\n\n"
+         (or review-text "")
+         "\n\n## Instructions\n\n"
+         "1. Read the existing changes carefully.\n"
+         "2. If there are review issues noted above, fix them.\n"
+         "3. If the work looks incomplete, finish it.\n"
+         "4. Run tests: `npm test` (fast, 3-4s). Do NOT run `npx vitest run`.\n"
+         "5. When ready, signal COMPLETE_AND_READY_FOR_MERGE.\n")))
+
+(defn- try-session-resume
+  "Attempt to resume a Claude session. Returns {:ok? bool :session-id string}."
+  [harness-kw session-id wt-path model]
+  (try
+    (let [probe-prompt (str "[salvage] Confirm you can see this session. "
+                            "Reply with 'SESSION_ALIVE' if you have context from prior work.")
+          abs-wt (.getAbsolutePath (io/file wt-path))
+          result (harness/run-command! harness-kw
+                                       {:cwd abs-wt
+                                        :model model
+                                        :session-id session-id
+                                        :resume? true
+                                        :prompt probe-prompt})
+          {:keys [output]} (harness/parse-output harness-kw (:out result) session-id)]
+      (if (and (zero? (:exit result))
+               (not (str/blank? output))
+               ;; Session is alive if it didn't error out
+               (not (re-find #"(?i)error|not found|invalid session" (or output ""))))
+        {:ok? true :session-id session-id}
+        {:ok? false :reason "Session responded but may lack context"}))
+    (catch Exception e
+      {:ok? false :reason (.getMessage e)})))
+
+(defn- salvage-worker!
+  "Salvage a single dead worker: try resume, fall back to fresh session,
+   then run review + merge. Returns {:outcome :details}."
+  [salvage-info swarm-config]
+  (let [{:keys [branch worker-id swarm-token]} salvage-info
+        swarm-id (str swarm-token)
+        ;; Try worktree dir first, create one from branch if needed
+        wt-path (or (:dir salvage-info)
+                    (let [wt-dir (format ".wsalvage-%s-%s" swarm-token worker-id)
+                          _ (process/sh ["git" "worktree" "remove" wt-dir "--force"])
+                          result (process/sh ["git" "worktree" "add" wt-dir branch]
+                                             {:out :string :err :string})]
+                      (when (zero? (:exit result))
+                        wt-dir)))
+        _ (when-not wt-path
+            (println (format "[salvage:%s] Cannot create worktree for %s" worker-id branch))
+            (throw (ex-info "Cannot create worktree" {:branch branch})))
+
+        ;; Load cycle + review context
+        last-cycle (last-cycle-for-worker swarm-id worker-id)
+        cycle-num (or (:cycle last-cycle) 1)
+        session-id (:session-id last-cycle)
+        review-history (reviews-for-worker-cycle swarm-id worker-id cycle-num)
+        {:keys [harness model prompts reviewers]} swarm-config
+
+        ;; Step 1: Try session resume
+        resumed? (when session-id
+                   (println (format "[salvage:%s] Trying session resume %s..."
+                                    worker-id (subs session-id 0 (min 8 (count session-id)))))
+                   (let [{:keys [ok? reason]} (try-session-resume harness session-id wt-path model)]
+                     (if ok?
+                       (println (format "[salvage:%s] Session alive!" worker-id))
+                       (println (format "[salvage:%s] Session gone: %s" worker-id (or reason "unknown"))))
+                     ok?))
+
+        ;; Step 2: If resume failed, start fresh session with context
+        active-session-id
+        (if resumed?
+          ;; Resume the existing session — ask it to finish and signal merge
+          (let [prompt (str "[salvage:" worker-id "] Your previous session was interrupted. "
+                            "Please review your current changes, fix any outstanding issues, "
+                            "run `npm test`, and signal COMPLETE_AND_READY_FOR_MERGE when ready.")
+                abs-wt (.getAbsolutePath (io/file wt-path))
+                result (harness/run-command! harness
+                                             {:cwd abs-wt :model model
+                                              :session-id session-id :resume? true
+                                              :prompt prompt})
+                {:keys [session-id]} (harness/parse-output harness (:out result) session-id)]
+            session-id)
+
+          ;; Fresh session with full context
+          (let [prompt (build-salvage-prompt wt-path branch review-history prompts)
+                abs-wt (.getAbsolutePath (io/file wt-path))
+                fresh-session-id (harness/make-session-id harness)
+                result (harness/run-command! harness
+                                             {:cwd abs-wt :model model
+                                              :session-id fresh-session-id :resume? false
+                                              :prompt prompt})
+                {:keys [session-id]} (harness/parse-output harness (:out result) fresh-session-id)]
+            session-id))
+
+        ;; Step 3: Review loop
+        worker-config (worker/create-worker
+                        {:id worker-id
+                         :swarm-id swarm-id
+                         :harness harness
+                         :model model
+                         :prompts prompts
+                         :reviewers reviewers})
+        review-result (worker/review-loop! worker-config wt-path worker-id 1
+                                           [{:session-id active-session-id}])]
+
+    (if (:approved? review-result)
+      ;; Step 4: Merge
+      (let [project-root (.getCanonicalPath (io/file "."))
+            merge-result (worker/run-merge-agent! worker-config wt-path branch
+                                                   project-root active-session-id worker-id)]
+        (if (:ok? merge-result)
+          (do
+            (println (format "[salvage:%s] Merged → %s" worker-id (:sha merge-result)))
+            ;; Complete claimed tasks
+            (when-let [task-ids (seq (:claimed-task-ids last-cycle))]
+              (let [completed (tasks/complete-by-ids! (set task-ids))]
+                (println (format "[salvage:%s] Completed %d task(s)" worker-id (count completed)))))
+            {:outcome :merged :sha (:sha merge-result)})
+          (do
+            (println (format "[salvage:%s] Merge failed: %s" worker-id (:message merge-result)))
+            {:outcome :merge-failed :details (:message merge-result)})))
+      (do
+        (println (format "[salvage:%s] Review rejected after %d rounds"
+                         worker-id (:attempts review-result)))
+        {:outcome :rejected :attempts (:attempts review-result)}))))
+
+(defn cmd-salvage
+  "Salvage dead/errored workers from a previous swarm.
+   Discovers surviving worktrees and branches with unmerged changes,
+   tries to resume their Claude sessions, falls back to fresh sessions
+   with the partial diff + review history as context."
+  [opts args]
+  (let [;; Find target swarm — from args or latest
+        target-swarm-id (or (first args) (find-latest-swarm-id))
+        _ (when-not target-swarm-id
+            (println "No swarm runs found. Nothing to salvage.")
+            (System/exit 0))
+
+        ;; Read swarm config to reconstruct worker settings
+        started (runs/read-started target-swarm-id)
+        _ (when-not started
+            (println (format "No started.json found for swarm %s" target-swarm-id))
+            (System/exit 1))
+
+        ;; Extract harness/model/prompts from first worker config
+        ;; (salvage workers all use the same config)
+        first-worker-config (first (:workers started))
+        harness-kw (keyword (:harness first-worker-config))
+        model (:model first-worker-config)
+        prompts (or (:prompts first-worker-config) [])
+
+        ;; Build reviewer configs from started.json
+        reviewer-config (:reviewer started)
+        reviewers (if reviewer-config
+                    [(-> (parse-model-string (str (name (keyword (:harness reviewer-config)))
+                                                  ":" (:model reviewer-config)))
+                         (assoc :prompts (or (:prompts reviewer-config) [])))]
+                    [])
+
+        swarm-config {:harness harness-kw :model model :prompts prompts :reviewers reviewers}
+
+        ;; Discover salvageable work
+        worktrees (find-salvageable-worktrees)
+        branches (find-salvageable-branches)
+        ;; Filter to target swarm
+        swarm-token (subs target-swarm-id 0 (min 8 (count target-swarm-id)))
+        wt-candidates (->> worktrees
+                           (filter #(= (:swarm-token %) swarm-token))
+                           (filter :has-changes?))
+        br-candidates (->> branches
+                           (filter #(= (:swarm-token %) swarm-token))
+                           ;; Exclude branches that already have a worktree
+                           (remove (fn [b] (some #(= (:worker-id %) (:worker-id b)) wt-candidates))))]
+
+    (println (format "Salvage scan for swarm %s:" target-swarm-id))
+    (println (format "  Config: %s:%s" (name harness-kw) model))
+    (println (format "  Worktrees with changes: %d" (count wt-candidates)))
+    (println (format "  Orphan branches with commits: %d" (count br-candidates)))
+    (println)
+
+    (let [all-candidates (concat wt-candidates br-candidates)]
+      (if (empty? all-candidates)
+        (do
+          (println "Nothing to salvage — all work was already merged or branches are at main.")
+          (println)
+          ;; Show cycle summary for context
+          (let [cycles (runs/list-cycles target-swarm-id)
+                by-outcome (group-by :outcome cycles)]
+            (println "Cycle summary:")
+            (doseq [[outcome cs] (sort-by key by-outcome)]
+              (println (format "  %s: %d" outcome (count cs))))))
+
+        (do
+          (println "Salvageable workers:")
+          (doseq [c all-candidates]
+            (let [last-cycle (last-cycle-for-worker swarm-token (:worker-id c))
+                  reviews (when last-cycle
+                            (reviews-for-worker-cycle swarm-token (:worker-id c) (:cycle last-cycle)))]
+              (println (format "  %s: branch=%s ahead=%s session=%s reviews=%d last-outcome=%s"
+                               (:worker-id c)
+                               (or (:branch c) "?")
+                               (or (:ahead-count c) "?")
+                               (if-let [sid (:session-id last-cycle)]
+                                 (subs sid 0 (min 8 (count sid)))
+                                 "none")
+                               (count reviews)
+                               (or (:outcome last-cycle) "unknown")))))
+          (println)
+          (println (format "Launching salvage for %d worker(s)..." (count all-candidates)))
+          (println)
+
+          ;; Run salvage workers in parallel
+          (let [futures (doall
+                          (map (fn [candidate]
+                                 (future
+                                   (try
+                                     (salvage-worker! candidate swarm-config)
+                                     (catch Exception e
+                                       (println (format "[salvage:%s] ERROR: %s"
+                                                        (:worker-id candidate) (.getMessage e)))
+                                       {:outcome :error :details (.getMessage e)}))))
+                               all-candidates))
+                results (mapv deref futures)
+                merged (count (filter #(= (:outcome %) :merged) results))
+                failed (count (filter #(not= (:outcome %) :merged) results))]
+            (println)
+            (println (format "Salvage complete: %d merged, %d failed/rejected" merged failed))
+            results))))))
+
+;; =============================================================================
 ;; Main Entry Point
 ;; =============================================================================
 
@@ -1424,6 +1772,7 @@
    "kill" cmd-kill
    "worktrees" cmd-worktrees
    "cleanup" cmd-cleanup
+   "salvage" cmd-salvage
    "context" cmd-context
    "check" cmd-check
    "help" cmd-help
