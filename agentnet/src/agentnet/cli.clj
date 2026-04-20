@@ -1052,6 +1052,56 @@
     :else
     nil))
 
+(defn- review-enabled?
+  "Review is enabled unless config explicitly sets needs_review to false."
+  [config]
+  (not= false (:needs_review config)))
+
+(defn- parse-reviewers-config
+  "Parse reviewer config from either a top-level or worker config map.
+   Returns [] when no reviewer is configured or review is disabled for that scope."
+  [config]
+  (if-not (review-enabled? config)
+    []
+    (cond
+      (:reviewers config)
+      (->> (:reviewers config)
+           (map parse-reviewer-entry)
+           (remove nil?)
+           vec)
+
+      (:review_models config)
+      (->> (:review_models config)
+           (map parse-reviewer-entry)
+           (remove nil?)
+           vec)
+
+      (:reviewer config)
+      (->> [(:reviewer config)]
+           (map parse-reviewer-entry)
+           (remove nil?)
+           vec)
+
+      (:review_model config)
+      (->> [(:review_model config)]
+           (map parse-reviewer-entry)
+           (remove nil?)
+           vec)
+
+      :else [])))
+
+(defn- resolve-worker-reviewers
+  "Resolve final reviewer list for a worker.
+   Worker-level needs_review=false suppresses all review, including inherited
+   top-level reviewers."
+  [worker-config generic-reviewers]
+  (if-not (review-enabled? worker-config)
+    []
+    (->> (concat (parse-reviewers-config worker-config) generic-reviewers)
+         (map #(select-keys % [:harness :model :reasoning :prompts]))
+         distinct
+         vec)))
+
 (defn cmd-swarm
   "Run multiple worker configs from oompa.json in parallel"
   [opts args]
@@ -1070,26 +1120,7 @@
 
     (let [config (json/parse-string (slurp f) true)
           ;; Parse reviewer config — supports legacy + new formats.
-          generic-reviewers (cond
-                              (:review_models config)
-                              (->> (:review_models config)
-                                   (map parse-reviewer-entry)
-                                   (remove nil?)
-                                   vec)
-
-                              (:review_model config)
-                              (->> [(:review_model config)]
-                                   (map parse-reviewer-entry)
-                                   (remove nil?)
-                                   vec)
-
-                              (:reviewer config)
-                              (->> [(:reviewer config)]
-                                   (map parse-reviewer-entry)
-                                   (remove nil?)
-                                   vec)
-
-                              :else [])
+          generic-reviewers (parse-reviewers-config config)
 
           ;; Parse planner config — optional dedicated planner
           ;; Runs in project root, no worktree/review/merge, respects max_pending backpressure
@@ -1127,41 +1158,7 @@
           workers (map-indexed
                     (fn [idx wc]
                       (let [{:keys [harness model reasoning]} (parse-model-string (:model wc))
-                            ;; Support per-worker reviewer override (legacy + new):
-                            ;; - review_model: "harness:model"
-                            ;; - review_models: ["harness:model", ...]
-                            ;; - reviewer: {model, prompt}
-                            ;; - reviewers: [string|map, ...]
-                            worker-reviewers (cond
-                                               (:reviewers wc)
-                                               (->> (:reviewers wc)
-                                                    (map parse-reviewer-entry)
-                                                    (remove nil?)
-                                                    vec)
-
-                                               (:review_models wc)
-                                               (->> (:review_models wc)
-                                                    (map parse-reviewer-entry)
-                                                    (remove nil?)
-                                                    vec)
-
-                                               (:reviewer wc)
-                                               (->> [(:reviewer wc)]
-                                                    (map parse-reviewer-entry)
-                                                    (remove nil?)
-                                                    vec)
-
-                                               (:review_model wc)
-                                               (->> [(:review_model wc)]
-                                                    (map parse-reviewer-entry)
-                                                    (remove nil?)
-                                                    vec)
-
-                                               :else [])
-                            all-reviewers (->> (concat worker-reviewers generic-reviewers)
-                                               (map #(select-keys % [:harness :model :reasoning :prompts]))
-                                               (distinct)
-                                               (vec))]
+                            all-reviewers (resolve-worker-reviewers wc generic-reviewers)]
                         (worker/create-worker
                           {:id (str "w" idx)
                            :swarm-id swarm-id

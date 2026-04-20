@@ -104,9 +104,12 @@ This spawns:
 | `max_cycle` | no | Max worker cycles for JSON config runs (default: 10) |
 | `count` | no | Number of workers with this config (default: 1) |
 | `can_plan` | no | If `false`, worker waits for tasks before starting (default: `true`) |
+| `needs_review` | no | If `false`, skip review for this worker even if top-level reviewers are configured (default: `true`) |
 | `max_wait_for_tasks` | no | Max seconds a `can_plan: false` worker waits for queue work (default: `600`) |
 
 `oompa loop` still uses the CLI flag `--iterations`. JSON worker configs use `max_cycle`.
+
+Top-level reviewer config also respects `needs_review`. Setting `"needs_review": false` at the top level disables only the generic reviewer block; setting it on a worker disables review for that worker entirely, including inherited top-level reviewers.
 
 #### Composable prompts
 

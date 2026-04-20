@@ -4,6 +4,8 @@ This guide translates the [Oompa Swarm Philosophy](./oompa_philosophy.md) into c
 
 For JSON worker configs, use `max_cycle`. The CLI `loop` command still uses `--iterations`.
 
+Review is enabled by default whenever reviewers are configured. Set `"needs_review": false` on a worker to disable review for that worker, even if top-level reviewers are configured. Set `"needs_review": false` at the top level to disable only the generic reviewer block.
+
 
 ## 1. Worker Profiles
 
