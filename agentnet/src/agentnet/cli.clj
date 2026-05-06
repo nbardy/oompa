@@ -1165,6 +1165,8 @@
                            :harness harness
                            :model model
                            :reasoning reasoning
+                           :role (or (:_role wc) (:role wc))
+                           :can-claim-gpu (:can_claim_gpu wc)
                            :max-cycles (:max_cycle wc)
                            :prompts (:prompt wc)
                            :can-plan (:can_plan wc)

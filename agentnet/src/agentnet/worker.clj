@@ -120,11 +120,14 @@
    :max-resumes hard cap on total attempts (resumes) within a single cycle (default 7)."
   [{:keys [id swarm-id harness model max-cycles prompts can-plan reasoning
            reviewers wait-between
-           max-working-resumes max-needs-followups max-wait-for-tasks max-resumes]}]
+           max-working-resumes max-needs-followups max-wait-for-tasks max-resumes
+           role can-claim-gpu]}]
   {:id id
    :swarm-id swarm-id
    :harness (or harness :codex)
    :model model
+   :role role
+   :can-claim-gpu (boolean can-claim-gpu)
    :max-cycles (or max-cycles 10)
    :prompts (cond
               (vector? prompts) prompts
@@ -177,24 +180,67 @@
      :task_status (format "Pending: %d, In Progress: %d, Complete: %d"
                           (count pending) (count current) (count complete))}))
 
+(defn- worker-role
+  [worker]
+  (some-> (:role worker) str))
+
+(defn- task-role-hint
+  [task]
+  (some-> (:role_hint task) str))
+
+(defn- gpu-heavy-task?
+  [task]
+  (true? (:gpu_heavy task)))
+
+(defn- worker-can-claim-gpu?
+  [worker]
+  (true? (:can-claim-gpu worker)))
+
+(defn- task-claim-denial
+  "Return nil if worker may claim task, or a reason map if the claim is invalid.
+
+   Role hints are advisory to agents, but the framework must enforce them during
+   file moves. Otherwise idle CTO/scientist workers can steal role-scoped GPU
+   follow-ups before the correct engineer claims them."
+  [worker task]
+  (let [role (worker-role worker)
+        hint (task-role-hint task)]
+    (cond
+      (and role hint (not= role hint))
+      {:reason "role-mismatch" :worker-role role :task-role-hint hint}
+
+      (and (gpu-heavy-task? task)
+           (or (false? (:can-claim-gpu worker))
+               (and role (not (worker-can-claim-gpu? worker)))))
+      {:reason "gpu-restricted" :worker-role role}
+
+      :else nil)))
+
 
 (defn- execute-claims!
   "Execute CLAIM signal: attempt to claim each task ID from pending/.
    Returns {:claimed [ids], :failed [ids], :resume-prompt string}."
-  [claim-ids]
-  (let [results (tasks/claim-by-ids! claim-ids)
+  [worker claim-ids]
+  (let [results (tasks/claim-by-ids! claim-ids {:claim-denial-fn #(task-claim-denial worker %)})
         claimed (filterv #(= :claimed (:status %)) results)
         failed (filterv #(not= :claimed (:status %)) results)
         claimed-ids (mapv :id claimed)
-        failed-ids (mapv :id failed)
+        failed-labels (mapv (fn [{:keys [id status reason worker-role task-role-hint]}]
+                              (str id
+                                   " (" (name status)
+                                   (when reason (str ":" reason))
+                                   (when task-role-hint (str ", task-role=" task-role-hint))
+                                   (when worker-role (str ", worker-role=" worker-role))
+                                   ")"))
+                            failed)
         context (build-context)
         prompt (str "## Claim Results\n"
                     (if (seq claimed-ids)
                       (str "Claimed: " (str/join ", " claimed-ids) "\n")
                       "No tasks were successfully claimed.\n")
-                    (when (seq failed-ids)
-                      (str "Already taken or not found: "
-                           (str/join ", " failed-ids) "\n"))
+                    (when (seq failed-labels)
+                      (str "Rejected, already taken, or not found: "
+                           (str/join ", " failed-labels) "\n"))
                     "\nTask Status: " (:task_status context) "\n"
                     "Remaining Pending:\n"
                     (if (str/blank? (:pending_tasks context))
@@ -205,7 +251,7 @@
                       "Work on your claimed tasks. Signal COMPLETE_AND_READY_FOR_MERGE when done."
                       "No claims succeeded. CLAIM different tasks. If you cannot finish a mergeable artifact after trying hard, signal NEEDS_FOLLOWUP with a short explanation."))]
     {:claimed claimed-ids
-     :failed failed-ids
+     :failed (mapv :id failed)
      :resume-prompt prompt}))
 
 (defn- active-claimed-task-ids
@@ -1289,7 +1335,7 @@
 
                     (and (seq claim-ids) (not merge?) (not done?))
                     (let [_ (println (format "[%s] CLAIM signal: %s" id (str/join ", " claim-ids)))
-                          {:keys [claimed resume-prompt]} (execute-claims! claim-ids)
+                          {:keys [claimed resume-prompt]} (execute-claims! worker claim-ids)
                           new-claimed-ids (into active-claimed-ids claimed)
                           metrics (update metrics :claims + (count claimed))]
                       (println (format "[%s] Claimed %d/%d tasks" id (count claimed) (count claim-ids)))

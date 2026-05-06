@@ -27,7 +27,7 @@
                                        {:task_status (or task-status "Pending: 1, In Progress: 0, Complete: 0")
                                         :pending_tasks (or pending-tasks "- task-001: Build thing")})
                 worker/run-agent! run-agent-fn
-                worker/execute-claims! (fn [_]
+                worker/execute-claims! (fn [& _]
                                          {:claimed ["task-001"]
                                           :failed []
                                           :resume-prompt "## Claim Results"})
@@ -141,6 +141,29 @@
 (t/deftest shared-current-diff-does-not-create-foreign-claims
   (with-redefs [tasks/current-task-ids (fn [] #{"task-001" "task-foreign"})]
     (t/is (= #{} (#'worker/detect-claimed-tasks #{"task-001"})))))
+
+(t/deftest role-hinted-tasks-reject-wrong-worker-role
+  (let [worker {:role "chief_scientist_cto" :can-claim-gpu false}
+        task {:id "wave-gpu"
+              :role_hint "engineer_source_of_truth_gpu"
+              :gpu_heavy true}
+        denial (#'worker/task-claim-denial worker task)]
+    (t/is (= "role-mismatch" (:reason denial)))
+    (t/is (= "chief_scientist_cto" (:worker-role denial)))
+    (t/is (= "engineer_source_of_truth_gpu" (:task-role-hint denial)))))
+
+(t/deftest gpu-heavy-tasks-require-explicit-gpu-claim-capability
+  (t/is (= "gpu-restricted"
+           (:reason (#'worker/task-claim-denial
+                      {:role "engineer_renderer_visuals" :can-claim-gpu false}
+                      {:id "wave-gpu"
+                       :role_hint "engineer_renderer_visuals"
+                       :gpu_heavy true}))))
+  (t/is (nil? (#'worker/task-claim-denial
+                {:role "engineer_source_of_truth_gpu" :can-claim-gpu true}
+                {:id "wave-gpu"
+                 :role_hint "engineer_source_of_truth_gpu"
+                 :gpu_heavy true}))))
 
 (t/deftest terminal-no-changes-completes-claims-from-earlier-attempt
   (let [logs (atom [])

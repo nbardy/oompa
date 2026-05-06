@@ -124,22 +124,36 @@
 
 (defn claim-by-id!
   "Claim a pending task by its :id string. Atomically moves pending → current.
-   Returns {:status :claimed|:already-taken|:not-found, :id id}."
-  [task-id]
-  (let [match (first (filter #(= (:id %) task-id) (list-pending)))]
-    (if match
-      (if (claim-task! match)
-        {:status :claimed :id task-id}
-        {:status :already-taken :id task-id})
-      ;; Not in pending — check if already in current (raced)
-      (if (some #(= (:id %) task-id) (list-current))
-        {:status :already-taken :id task-id}
-        {:status :not-found :id task-id}))))
+   Options:
+   - :claim-denial-fn receives the pending task and returns nil when the claim
+     is allowed, or a map/keyword/string describing why it must be rejected.
+
+   Returns {:status :claimed|:already-taken|:not-found|:not-claimable, :id id}."
+  ([task-id]
+   (claim-by-id! task-id nil))
+  ([task-id {:keys [claim-denial-fn]}]
+   (let [match (first (filter #(= (:id %) task-id) (list-pending)))]
+     (if match
+       (if-let [denial (when claim-denial-fn (claim-denial-fn match))]
+         (merge {:status :not-claimable :id task-id}
+                (cond
+                  (map? denial) denial
+                  (keyword? denial) {:reason (name denial)}
+                  :else {:reason (str denial)}))
+         (if (claim-task! match)
+           {:status :claimed :id task-id}
+           {:status :already-taken :id task-id}))
+       ;; Not in pending — check if already in current (raced)
+       (if (some #(= (:id %) task-id) (list-current))
+         {:status :already-taken :id task-id}
+         {:status :not-found :id task-id})))))
 
 (defn claim-by-ids!
   "Claim multiple tasks by ID. Returns vector of result maps."
-  [task-ids]
-  (mapv claim-by-id! task-ids))
+  ([task-ids]
+   (claim-by-ids! task-ids nil))
+  ([task-ids opts]
+   (mapv #(claim-by-id! % opts) task-ids)))
 
 (defn complete-by-ids!
   "Move tasks from current → complete by ID. Framework-owned completion.
