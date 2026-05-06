@@ -267,6 +267,26 @@
     (t/is (= :no-changes (:outcome (last @logs))))
     (t/is (= ["task-001"] (:claimed-task-ids (last @logs))))))
 
+(t/deftest no-diff-merge-without-claims-stops-worker
+  (let [logs (atom [])
+        call-count (atom 0)
+        result (stubbed-worker-shell
+                 (fn [& _]
+                   (swap! call-count inc)
+                   {:output "COMPLETE_AND_READY_FOR_MERGE"
+                    :exit 0
+                    :done? false
+                    :merge? true
+                    :claim-ids nil
+                    :session-id "sid-idle-merge"})
+                 (capture-log! logs)
+                 :max-cycles 3
+                 :worktree-has-changes? false)]
+    (t/is (= :completed (:status result)))
+    (t/is (= 1 @call-count))
+    (t/is (= :no-claim (:outcome (last @logs))))
+    (t/is (= [] (:claimed-task-ids (last @logs))))))
+
 (t/deftest exhausted-needs-followup-recycles-claims-and-stops
   (let [logs (atom [])
         recycled (atom [])

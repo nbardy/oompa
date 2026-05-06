@@ -1447,20 +1447,26 @@
                       ;; tasks, they verified the work is already done — complete them.
                       ;; (Tasks live outside the worktree at ../tasks/, so mv is
                       ;; invisible to git diff. Framework must own this transition.)
-                      (let [completed-ids (when (seq active-claimed-ids)
-                                            (tasks/complete-by-ids! (vec active-claimed-ids)))]
-                        (when (seq completed-ids)
-                          (println (format "[%s] No-diff merge: completing %d verified task(s): %s"
-                                           id (count completed-ids) (str/join ", " completed-ids)))
-                          (annotate-completed-tasks! project-root id 0 :merge-notes merge-notes))
-                        (when-not (seq completed-ids)
-                          (println (format "[%s] Merge signaled but no changes, skipping" id)))
-                        (emit!
-                                         {:timing-ms cycle-timing
-                                          :outcome :no-changes
-                                          :claimed-task-ids (vec active-claimed-ids)})
-                        (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                        (recur (inc cycle) 1 (inc completed) 0 metrics nil nil #{} nil 0 0 [])))
+                      (if-not (seq active-claimed-ids)
+                        (do
+                          (println (format "[%s] Merge signaled with no changes and no claimed tasks; stopping worker" id))
+                          (emit!
+                                           {:timing-ms cycle-timing
+                                            :outcome :no-claim
+                                            :claimed-task-ids []})
+                          (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                          (finish :completed))
+                        (let [completed-ids (tasks/complete-by-ids! (vec active-claimed-ids))]
+                          (when (seq completed-ids)
+                            (println (format "[%s] No-diff merge: completing %d verified task(s): %s"
+                                             id (count completed-ids) (str/join ", " completed-ids)))
+                            (annotate-completed-tasks! project-root id 0 :merge-notes merge-notes))
+                          (emit!
+                                           {:timing-ms cycle-timing
+                                            :outcome :no-changes
+                                            :claimed-task-ids (vec active-claimed-ids)})
+                          (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                          (recur (inc cycle) 1 (inc completed) 0 metrics nil nil #{} nil 0 0 []))))
                       )
 
                     done?
