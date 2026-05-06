@@ -11,7 +11,7 @@
   [run-agent-fn emit-log-fn
    & {:keys [can-plan max-cycles max-working-resumes max-needs-followups
              task-status pending-tasks current-count current-task-ids
-             worktree-has-changes? review-loop-fn sync-fn merge-fn
+             worktree-has-changes? review-loop-fn sync-fn merge-fn execute-claims-fn
              recycle-tasks-fn complete-by-ids-fn]}]
   (with-redefs [tasks/ensure-dirs! (fn [] nil)
                 tasks/pending-count (fn [] 1)
@@ -27,10 +27,11 @@
                                        {:task_status (or task-status "Pending: 1, In Progress: 0, Complete: 0")
                                         :pending_tasks (or pending-tasks "- task-001: Build thing")})
                 worker/run-agent! run-agent-fn
-                worker/execute-claims! (fn [& _]
-                                         {:claimed ["task-001"]
-                                          :failed []
-                                          :resume-prompt "## Claim Results"})
+                worker/execute-claims! (or execute-claims-fn
+                                            (fn [& _]
+                                              {:claimed ["task-001"]
+                                               :failed []
+                                               :resume-prompt "## Claim Results"}))
                 worker/worktree-has-changes? (if (fn? worktree-has-changes?)
                                                worktree-has-changes?
                                                (fn [_] (boolean worktree-has-changes?)))
@@ -80,6 +81,32 @@
     (t/is (= 2 (count @logs)))
     (t/is (= :claimed (:outcome (first @logs))))
     (t/is (= ["task-001"] (:claimed-task-ids (first @logs))))))
+
+(t/deftest unsuccessful-claim-ends-cycle-without-resume
+  (let [logs (atom [])
+        prompts-seen (atom [])
+        call-count (atom 0)
+        result (stubbed-worker-shell
+                 (fn [_ _ _ _ _ & {:keys [resume-prompt-override]}]
+                   (swap! call-count inc)
+                   (swap! prompts-seen conj resume-prompt-override)
+                   {:output "CLAIM(task-wrong-role)"
+                    :exit 0
+                    :done? false
+                    :merge? false
+                    :claim-ids ["task-wrong-role"]
+                    :session-id "sid-no-claim"})
+                 (capture-log! logs)
+                 :max-cycles 1
+                 :execute-claims-fn (fn [& _]
+                                      {:claimed []
+                                       :failed ["task-wrong-role"]
+                                       :resume-prompt "## Claim Results"}))]
+    (t/is (= :completed (:status result)))
+    (t/is (= 1 @call-count))
+    (t/is (= [nil] @prompts-seen))
+    (t/is (= [:no-claim] (mapv :outcome @logs)))
+    (t/is (= [] (:claimed-task-ids (first @logs))))))
 
 (t/deftest executor-done-signal-stops-worker-as-error
   (let [logs (atom [])
@@ -283,6 +310,11 @@
   (let [schema (json/parse-string (slurp (io/file "schemas/cycle.schema.json")) true)
         outcomes (set (get-in schema [:properties :outcome :enum]))]
     (t/is (contains? outcomes "claimed"))))
+
+(t/deftest cycle-schema-includes-no-claim-outcome
+  (let [schema (json/parse-string (slurp (io/file "schemas/cycle.schema.json")) true)
+        outcomes (set (get-in schema [:properties :outcome :enum]))]
+    (t/is (contains? outcomes "no-claim"))))
 
 (t/deftest cycle-schema-covers-merge-sync-failed-outcomes
   (let [schema (json/parse-string (slurp (io/file "schemas/cycle.schema.json")) true)

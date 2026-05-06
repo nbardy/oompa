@@ -864,6 +864,7 @@
         (seq signals)  (assoc :signals (vec signals))
         merge-sha      (assoc :merge-sha merge-sha)))
     (let [terminal-outcomes #{:merged :merge-failed :rejected :sync-failed :no-changes
+                              :no-claim
                               :executor-done :stuck :error :interrupted :needs-followup}]
       (if (and outcome (contains? terminal-outcomes outcome))
         (do
@@ -1363,9 +1364,15 @@
                       (println (format "[%s] Claimed %d/%d tasks" id (count claimed) (count claim-ids)))
                       (emit!
                                        {:timing-ms cycle-timing
-                                        :outcome :claimed :claimed-task-ids (vec claimed)})
-                      (recur cycle (inc attempt) completed 0 metrics new-session-id wt-state
-                             new-claimed-ids resume-prompt 0 0 signals))
+                                        :outcome (if (seq claimed) :claimed :no-claim)
+                                        :claimed-task-ids (vec claimed)})
+                      (if (seq claimed)
+                        (recur cycle (inc attempt) completed 0 metrics new-session-id wt-state
+                               new-claimed-ids resume-prompt 0 0 signals)
+                        (do
+                          (println (format "[%s] No claims succeeded; ending cycle without resuming unowned work" id))
+                          (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                          (recur (inc cycle) 1 (inc completed) 0 metrics nil nil #{} nil 0 0 []))))
 
                     merge?
                     (if (and (worktree-has-changes? (:path wt-state))
