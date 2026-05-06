@@ -196,6 +196,20 @@
   [worker]
   (true? (:can-claim-gpu worker)))
 
+(defn- task-dependencies
+  [task]
+  (->> (or (:depends_on task) (:dependsOn task) [])
+       (map str)
+       (remove str/blank?)
+       vec))
+
+(defn- completed-task-ids
+  []
+  (->> (tasks/list-complete)
+       (map :id)
+       (remove nil?)
+       set))
+
 (defn- task-claim-denial
   "Return nil if worker may claim task, or a reason map if the claim is invalid.
 
@@ -204,8 +218,15 @@
    follow-ups before the correct engineer claims them."
   [worker task]
   (let [role (worker-role worker)
-        hint (task-role-hint task)]
+        hint (task-role-hint task)
+        deps (task-dependencies task)
+        complete (delay (completed-task-ids))
+        missing-deps (when (seq deps)
+                       (vec (remove @complete deps)))]
     (cond
+      (seq missing-deps)
+      {:reason "dependency-missing" :missing-dependencies (str/join "," missing-deps)}
+
       (and role hint (not= role hint))
       {:reason "role-mismatch" :worker-role role :task-role-hint hint}
 
@@ -225,10 +246,11 @@
         claimed (filterv #(= :claimed (:status %)) results)
         failed (filterv #(not= :claimed (:status %)) results)
         claimed-ids (mapv :id claimed)
-        failed-labels (mapv (fn [{:keys [id status reason worker-role task-role-hint]}]
+        failed-labels (mapv (fn [{:keys [id status reason worker-role task-role-hint missing-dependencies]}]
                               (str id
                                    " (" (name status)
                                    (when reason (str ":" reason))
+                                   (when missing-dependencies (str ", missing=" missing-dependencies))
                                    (when task-role-hint (str ", task-role=" task-role-hint))
                                    (when worker-role (str ", worker-role=" worker-role))
                                    ")"))

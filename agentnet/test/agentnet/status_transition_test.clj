@@ -165,6 +165,27 @@
                  :role_hint "engineer_source_of_truth_gpu"
                  :gpu_heavy true}))))
 
+(t/deftest task-dependencies-must-be-complete-before-claim
+  (with-redefs [tasks/list-complete (fn [] [{:id "wave-004-root-projection-audit-shape"}])]
+    (let [denial (#'worker/task-claim-denial
+                   {:role "engineer_source_of_truth_gpu" :can-claim-gpu true}
+                   {:id "wave-gpu"
+                    :role_hint "engineer_source_of_truth_gpu"
+                    :gpu_heavy true
+                    :depends_on ["wave-004-root-projection-audit-shape"
+                                 "wave-005-hard-row-source-signatures"]})]
+      (t/is (= "dependency-missing" (:reason denial)))
+      (t/is (= "wave-005-hard-row-source-signatures" (:missing-dependencies denial)))))
+  (with-redefs [tasks/list-complete (fn [] [{:id "wave-004-root-projection-audit-shape"}
+                                            {:id "wave-005-hard-row-source-signatures"}])]
+    (t/is (nil? (#'worker/task-claim-denial
+                  {:role "engineer_source_of_truth_gpu" :can-claim-gpu true}
+                  {:id "wave-gpu"
+                   :role_hint "engineer_source_of_truth_gpu"
+                   :gpu_heavy true
+                   :depends_on ["wave-004-root-projection-audit-shape"
+                                "wave-005-hard-row-source-signatures"]})))))
+
 (t/deftest merge-with-changes-requires-claimed-task
   (let [logs (atom [])
         merge-called? (atom false)
