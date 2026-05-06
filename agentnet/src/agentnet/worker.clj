@@ -1346,7 +1346,17 @@
                              new-claimed-ids resume-prompt 0 0 signals))
 
                     merge?
-                    (if (worktree-has-changes? (:path wt-state))
+                    (if (and (worktree-has-changes? (:path wt-state))
+                             (not (seq active-claimed-ids)))
+                      (do
+                        (println (format "[%s] Merge signaled with changes but no claimed tasks; leaving worktree for salvage and stopping worker" id))
+                        (emit!
+                                         {:timing-ms cycle-timing
+                                          :outcome :error
+                                          :claimed-task-ids []
+                                          :error-snippet "merge signaled with changes but no claimed tasks"})
+                        (finish :error))
+                      (if (worktree-has-changes? (:path wt-state))
                       (if (task-only-diff? (:path wt-state))
                         (let [all-claimed active-claimed-ids]
                           (println (format "[%s] Task-only diff, auto-merging via agent" id))
@@ -1422,6 +1432,7 @@
                                           :claimed-task-ids (vec active-claimed-ids)})
                         (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                         (recur (inc cycle) 1 (inc completed) 0 metrics nil nil #{} nil 0 0 [])))
+                      )
 
                     done?
                     (let [recycled (recycle-active-claims! id claimed-ids mv-claimed-tasks)

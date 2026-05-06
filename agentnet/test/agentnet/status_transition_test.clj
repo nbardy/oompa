@@ -165,6 +165,28 @@
                  :role_hint "engineer_source_of_truth_gpu"
                  :gpu_heavy true}))))
 
+(t/deftest merge-with-changes-requires-claimed-task
+  (let [logs (atom [])
+        merge-called? (atom false)
+        result (stubbed-worker-shell
+                 (fn [& _]
+                   {:output "COMPLETE_AND_READY_FOR_MERGE"
+                    :exit 0
+                    :done? false
+                    :merge? true
+                    :claim-ids nil
+                    :session-id "sid-unclaimed-merge"})
+                 (capture-log! logs)
+                 :max-cycles 3
+                 :worktree-has-changes? true
+                 :merge-fn (fn [& _]
+                             (reset! merge-called? true)
+                             {:ok? true :sha "bad"}))]
+    (t/is (= :error (:status result)))
+    (t/is (false? @merge-called?))
+    (t/is (= :error (:outcome (last @logs))))
+    (t/is (re-find #"no claimed tasks" (or (:error-snippet (last @logs)) "")))))
+
 (t/deftest terminal-no-changes-completes-claims-from-earlier-attempt
   (let [logs (atom [])
         completed (atom [])
