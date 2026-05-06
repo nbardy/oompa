@@ -603,11 +603,15 @@
     {:dir wt-dir :branch wt-branch :path wt-path}))
 
 (defn- detect-claimed-tasks
-  "Diff current/ task IDs before and after agent ran.
-   Returns set of task IDs this worker claimed during iteration."
-  [pre-current-ids]
-  (let [post-ids (tasks/current-task-ids)]
-    (clojure.set/difference post-ids pre-current-ids)))
+  "Do not infer ownership from shared current/ diffs.
+
+   Multiple workers run concurrently, so another worker can move a task from
+   pending/ to current/ while this worker is inside an LLM call. Treating that
+   shared-state diff as this worker's claim lets one merge complete unrelated
+   workers' tasks. The framework records ownership only from explicit CLAIM
+   results returned by execute-claims!."
+  [_pre-current-ids]
+  #{})
 
 (defn- now-ms
   []

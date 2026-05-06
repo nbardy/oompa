@@ -12,12 +12,13 @@
    & {:keys [can-plan max-cycles max-working-resumes max-needs-followups
              task-status pending-tasks current-count current-task-ids
              worktree-has-changes? review-loop-fn sync-fn merge-fn
-             recycle-tasks-fn]}]
+             recycle-tasks-fn complete-by-ids-fn]}]
   (with-redefs [tasks/ensure-dirs! (fn [] nil)
                 tasks/pending-count (fn [] 1)
                 tasks/current-count (fn [] (or current-count 0))
                 tasks/current-task-ids (fn [] (or current-task-ids #{}))
                 tasks/recycle-tasks! (or recycle-tasks-fn (fn [ids] (vec (sort ids))))
+                tasks/complete-by-ids! (or complete-by-ids-fn (fn [ids] (vec (sort ids))))
                 worker/create-iteration-worktree! (fn [_ _ _ _]
                                                    {:dir ".wt" :branch "oompa/w0" :path "/tmp/wt"})
                 worker/cleanup-worktree! (fn [& _] nil)
@@ -137,9 +138,13 @@
     (t/is (string? (nth @prompts-seen 2)))
     (t/is (re-find #"NEEDS_FOLLOWUP Follow-up" (nth @prompts-seen 2)))))
 
-(t/deftest terminal-no-changes-recycles-claims-from-earlier-attempt
+(t/deftest shared-current-diff-does-not-create-foreign-claims
+  (with-redefs [tasks/current-task-ids (fn [] #{"task-001" "task-foreign"})]
+    (t/is (= #{} (#'worker/detect-claimed-tasks #{"task-001"})))))
+
+(t/deftest terminal-no-changes-completes-claims-from-earlier-attempt
   (let [logs (atom [])
-        recycled (atom [])
+        completed (atom [])
         call-count (atom 0)
         result (stubbed-worker-shell
                  (fn [& _]
@@ -160,14 +165,14 @@
                  (capture-log! logs)
                  :max-cycles 1
                  :worktree-has-changes? false
-                 :recycle-tasks-fn (fn [ids]
-                                     (let [ids (vec (sort ids))]
-                                       (swap! recycled conj ids)
-                                       ids)))]
+                 :complete-by-ids-fn (fn [ids]
+                                        (let [ids (vec (sort ids))]
+                                          (swap! completed conj ids)
+                                          ids)))]
     (t/is (= :completed (:status result)))
-    (t/is (= [["task-001"]] @recycled))
+    (t/is (= [["task-001"]] @completed))
     (t/is (= :no-changes (:outcome (last @logs))))
-    (t/is (= ["task-001"] (:recycled-tasks (last @logs))))))
+    (t/is (= ["task-001"] (:claimed-task-ids (last @logs))))))
 
 (t/deftest exhausted-needs-followup-recycles-claims-and-stops
   (let [logs (atom [])
