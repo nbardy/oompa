@@ -1174,6 +1174,7 @@
                            :max-wait-for-tasks (:max_wait_for_tasks wc)
                            :max-working-resumes (:max_working_resumes wc)
                            :max-resumes (:max_resumes wc)
+                           :auto-merge-paths (:auto_merge_paths wc)
                            :reviewers all-reviewers})))
                     expanded-workers)]
 

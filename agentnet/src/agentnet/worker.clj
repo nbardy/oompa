@@ -117,11 +117,14 @@
    :max-wait-for-tasks max seconds a non-planner waits for tasks before giving up (default 600).
    :max-working-resumes max consecutive working resumes before nudge+kill (default 5).
    :max-needs-followups max NEEDS_FOLLOWUP continuations in one cycle (default 1).
-   :max-resumes hard cap on total attempts (resumes) within a single cycle (default 7)."
+   :max-resumes hard cap on total attempts (resumes) within a single cycle (default 7).
+   :auto-merge-paths vector of path prefixes whose diffs auto-merge without a claim
+     (default [\"tasks/\"]). Set e.g. [\"tasks/\" \"agent_notes/\"] to let a scientist
+     role auto-merge note files alongside task JSONs."
   [{:keys [id swarm-id harness model max-cycles prompts can-plan reasoning
            reviewers wait-between
            max-working-resumes max-needs-followups max-wait-for-tasks max-resumes
-           role can-claim-gpu]}]
+           role can-claim-gpu auto-merge-paths]}]
   {:id id
    :swarm-id swarm-id
    :harness (or harness :codex)
@@ -144,6 +147,7 @@
    :max-working-resumes (or max-working-resumes default-max-working-resumes)
    :max-needs-followups (or max-needs-followups default-max-needs-followups)
    :max-resumes (or max-resumes default-max-resumes)
+   :auto-merge-paths (if (seq auto-merge-paths) (vec auto-merge-paths) ["tasks/"])
    :completed 0
    :status :idle})
 
@@ -1062,17 +1066,23 @@
     (annotate-completed-tasks! project-root worker-id review-rounds :merge-notes merge-notes)
     completed-count))
 
-(defn- task-only-diff?
-  "Check if all changes in worktree are task files only (no code changes).
-   Returns true if diff only touches files under tasks/ directory."
-  [wt-path]
-  (let [result (process/sh ["git" "diff" "main" "--name-only"]
+(defn- auto-mergeable-diff?
+  "Check if every changed file is under one of the worker's auto-merge path
+   prefixes (default [\"tasks/\"]). When true, the worker's diff auto-merges
+   via merge-agent without requiring a task claim.
+
+   Set :auto-merge-paths on a worker config to widen this — e.g. a scientist
+   role with [\"tasks/\" \"agent_notes/\"] can write a note alongside its task
+   JSONs and have both auto-merge."
+  [wt-path paths]
+  (let [prefixes (if (seq paths) (vec paths) ["tasks/"])
+        result (process/sh ["git" "diff" "main" "--name-only"]
                            {:dir wt-path :out :string :err :string})
         files (when (zero? (:exit result))
                 (->> (str/split-lines (:out result))
                      (remove str/blank?)))]
     (and (seq files)
-         (every? #(str/starts-with? % "tasks/") files))))
+         (every? (fn [f] (some #(str/starts-with? f %) prefixes)) files))))
 
 (defn- diff-file-names
   "Get list of changed file names vs main."
@@ -1376,7 +1386,9 @@
 
                     merge?
                     (if (and (worktree-has-changes? (:path wt-state))
-                             (not (seq active-claimed-ids)))
+                             (not (seq active-claimed-ids))
+                             (not (auto-mergeable-diff? (:path wt-state)
+                                                        (:auto-merge-paths worker))))
                       (do
                         (println (format "[%s] Merge signaled with changes but no claimed tasks; leaving worktree for salvage and stopping worker" id))
                         (emit!
@@ -1386,9 +1398,11 @@
                                           :error-snippet "merge signaled with changes but no claimed tasks"})
                         (finish :error))
                       (if (worktree-has-changes? (:path wt-state))
-                      (if (task-only-diff? (:path wt-state))
+                      (if (auto-mergeable-diff? (:path wt-state) (:auto-merge-paths worker))
                         (let [all-claimed active-claimed-ids]
-                          (println (format "[%s] Task-only diff, auto-merging via agent" id))
+                          (println (format "[%s] Auto-mergeable diff (under %s), auto-merging via agent"
+                                           id
+                                           (str/join ", " (or (:auto-merge-paths worker) ["tasks/"]))))
                           (let [merge-result (run-merge-agent! worker (:path wt-state) (:branch wt-state) project-root new-session-id id)
                                 merged? (:ok? merge-result)
                                 sha (:sha merge-result)
