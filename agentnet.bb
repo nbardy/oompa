@@ -1,5 +1,9 @@
 #!/usr/bin/env bb
 
+;; LEGACY entry point. The canonical entry point is swarm.bb -> agentnet.cli/-main
+;; (used by README and bin/oompa.js). The two are intentionally NOT merged.
+;; lint-tasks / lint-notes currently live only here.
+
 (ns agentnet
   (:require [babashka.process :as process]
             [cheshire.core :as json]

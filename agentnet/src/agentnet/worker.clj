@@ -9,7 +9,9 @@
    5. If approved → merge to main, complete task
    6. If rejected → fix & retry → back to reviewer
    7. Can create new tasks in pending/
-   8. Exit on __DONE__ signal
+   8. Reject __DONE__ — it is a planner-only signal; a worker that emits it is
+      treated as an error outcome (workers signal CLAIM(...) /
+      COMPLETE_AND_READY_FOR_MERGE / NEEDS_FOLLOWUP, never __DONE__).
 
    No separate orchestrator - workers self-organize."
   (:require [agentnet.tasks :as tasks]
@@ -49,11 +51,84 @@
   (.format (java.time.format.DateTimeFormatter/ofPattern "yyyy-MM-dd HH:mm:ss")
            (java.time.LocalDateTime/now)))
 
-(defn- load-prompt
-  "Load a prompt file. Tries path as-is first, then from package root."
+(defn- resolve-prompt-path
+  "Resolve a config/prompts-relative path to an existing file path.
+   Tries the path as-is first (resolves relative to the worker's cwd, i.e. the
+   git worktree it runs in), then falls back to <package-root>/<path>.
+   Returns the resolved path string or nil if neither exists.
+
+   This is the single base-path computation shared by every prompt load —
+   load-prompt and load-framework-prompt both route through it so that
+   _task_header.md, role prompts, and the _framework/*.md behavioral prompts all
+   resolve identically from inside a worktree."
   [path]
-  (or (agent/load-custom-prompt path)
-      (agent/load-custom-prompt (str package-root "/" path))))
+  (let [as-is (io/file path)
+        from-root (io/file (str package-root "/" path))]
+    (cond
+      (.exists as-is) path
+      (.exists from-root) (str package-root "/" path)
+      :else nil)))
+
+(defn- load-prompt
+  "Load a prompt file (with include-directive expansion), resolving its path
+   through resolve-prompt-path so it shares the exact base-path computation
+   (cwd, then package-root) every prompt load uses — see resolve-prompt-path."
+  [path]
+  (when-let [resolved (resolve-prompt-path path)]
+    (agent/load-custom-prompt resolved)))
+
+(defn- load-framework-prompt
+  "Load a behavioral framework prompt from config/prompts/_framework/<name>.md and
+   apply the standard {token} substitution.
+
+   Resolves the file through resolve-prompt-path — the SAME base-path
+   computation load-prompt uses for _task_header.md. Workers run inside git
+   worktrees, not the repo root, so the package-root fallback is what makes
+   these files resolve at runtime — a wrong base path would crash at runtime,
+   not in unit tests.
+
+   Reads the resolved file raw (no include expansion). agent/load-custom-prompt
+   runs the content through expand-includes, which str/split-lines + str/join's
+   the text and therefore STRIPS the trailing newline; these prompts are
+   extracted byte-for-byte from inline string literals that did keep their
+   trailing newline (notably reviewer.md), so a raw read is required to preserve
+   that agent-facing text exactly. Framework prompts use no include directives.
+
+   Throws (no silent fallback) if the framework file cannot be resolved; an
+   unreadable framework prompt is a packaging error, not a recoverable state."
+  [name tokens]
+  (let [path (str "config/prompts/_framework/" name)
+        resolved (resolve-prompt-path path)]
+    (when (nil? resolved)
+      (throw (ex-info (str "Framework prompt not found: " path)
+                      {:name name :path path :package-root package-root})))
+    (agent/tokenize (slurp resolved) tokens)))
+
+(defn- tag-prompt
+  "Prefix a prompt with its run-identity tag: \"[oompa:<swarm-id>:<id>] \".
+   <swarm-id> defaults to \"unknown\" when absent. This tag is run IDENTITY
+   (used to attribute agent-cli output back to a swarm/worker), NOT behavioral
+   prompt text — it stays in code and is not a _framework template."
+  [swarm-id id prompt]
+  (str "[oompa:" (or swarm-id "unknown") ":" id "] " prompt))
+
+(defn- turn-drive
+  "Compute the per-turn drive keyword for harness/run-command!.
+   First turn / no session → create (nil drive). Otherwise → :resume.
+
+   Guard: a harness may advertise {:drive :goal} in the registry, but goal drive
+   is a STUB pending the codex `/goal` exec runtime (codex exec runs one turn
+   then shuts down; there is no external poll/resume loop). We do NOT half-build
+   a goal loop here: a resuming turn always follows :resume semantics, and when
+   the harness advertised :goal we note that once so logs explain the fallback.
+
+   Returns :resume when resuming, nil when creating. Callers also keep passing
+   the legacy :resume? boolean; run-command! accepts both and drops neither key."
+  [worker-id harness resume?]
+  (when resume?
+    (when (= :goal (:drive (harness/get-config harness)))
+      (println (format "[%s] goal drive pending codex runtime; defaulting to resume semantics" worker-id)))
+    :resume))
 
 (defn- snippet
   [s limit]
@@ -102,9 +177,10 @@
         (str/replace "{TASK_ROOT}" task-root)
         (str/replace "{TASKS_ROOT}" task-root))))
 
-(def ^:private default-max-working-resumes 5)
-(def ^:private default-max-needs-followups 1)
 (def ^:private default-max-wait-for-tasks 600)
+;; The single per-cycle attempt (resume) budget. CLAIM, working, and
+;; NEEDS_FOLLOWUP continuations all count against it. The wrap-up nudge fires
+;; once on the penultimate attempt (one attempt left), then the cycle stops.
 (def ^:private default-max-resumes 7)
 
 (defn create-worker
@@ -115,15 +191,15 @@
    :review-prompts paths to reviewer prompt files (loaded and concatenated for review).
    :wait-between seconds to sleep between cycles (nil or 0 = no wait).
    :max-wait-for-tasks max seconds a non-planner waits for tasks before giving up (default 600).
-   :max-working-resumes max consecutive working resumes before nudge+kill (default 5).
-   :max-needs-followups max NEEDS_FOLLOWUP continuations in one cycle (default 1).
-   :max-resumes hard cap on total attempts (resumes) within a single cycle (default 7).
+   :max-resumes the single per-cycle attempt (resume) budget (default 7). CLAIM,
+     working, and NEEDS_FOLLOWUP continuations all count against it; the wrap-up
+     nudge fires once on the penultimate attempt, then the cycle stops.
    :auto-merge-paths vector of path prefixes whose diffs auto-merge without a claim
      (default [\"tasks/\"]). Set e.g. [\"tasks/\" \"agent_notes/\"] to let a scientist
      role auto-merge note files alongside task JSONs."
   [{:keys [id swarm-id harness model max-cycles prompts can-plan reasoning
            reviewers wait-between
-           max-working-resumes max-needs-followups max-wait-for-tasks max-resumes
+           max-wait-for-tasks max-resumes
            role can-claim-gpu auto-merge-paths]}]
   {:id id
    :swarm-id swarm-id
@@ -144,8 +220,6 @@
                            v
                            default-max-wait-for-tasks))
    :reviewers reviewers
-   :max-working-resumes (or max-working-resumes default-max-working-resumes)
-   :max-needs-followups (or max-needs-followups default-max-needs-followups)
    :max-resumes (or max-resumes default-max-resumes)
    :auto-merge-paths (if (seq auto-merge-paths) (vec auto-merge-paths) ["tasks/"])
    :completed 0
@@ -157,19 +231,13 @@
 
 (def ^:private max-review-retries 3)
 
-;; Nudge prompt injected when a worker hits max-working-resumes consecutive
-;; "working" outcomes without signaling. Gives the agent one final chance to
-;; produce something mergeable before the session is killed.
-(def ^:private nudge-prompt
-  (str "You have been working for a long time without signaling completion.\n"
-       "You MUST take one of these actions NOW:\n\n"
-       "1. If you have meaningful changes: commit them and signal COMPLETE_AND_READY_FOR_MERGE\n"
-       "2. If scope is too large: create follow-up tasks in tasks/pending/ for remaining work,\n"
-       "   commit what you have (even partial notes/design docs), and signal COMPLETE_AND_READY_FOR_MERGE\n"
-       "3. If you truly cannot produce a merge-ready artifact this turn, signal NEEDS_FOLLOWUP\n"
-       "   and explain the remaining work. The framework will keep your claimed tasks and give you\n"
-       "   one targeted follow-up prompt. This is not success.\n\n"
-       "Do NOT continue working without producing a signal."))
+;; Nudge prompt injected on the penultimate resume attempt (one attempt left).
+;; Gives the agent one final chance to produce something mergeable before the
+;; per-cycle attempt budget (max-resumes) stops the cycle. Behavioral text lives
+;; in config/prompts/_framework/nudge.md; loaded fresh so roles can edit it live.
+(defn- nudge-prompt
+  []
+  (load-framework-prompt "nudge.md" {}))
 
 (defn- build-context
   "Build context for agent prompts"
@@ -260,22 +328,25 @@
                                    ")"))
                             failed)
         context (build-context)
-        prompt (str "## Claim Results\n"
-                    (if (seq claimed-ids)
-                      (str "Claimed: " (str/join ", " claimed-ids) "\n")
-                      "No tasks were successfully claimed.\n")
-                    (when (seq failed-labels)
+        claimed-line (if (seq claimed-ids)
+                       (str "Claimed: " (str/join ", " claimed-ids) "\n")
+                       "No tasks were successfully claimed.\n")
+        failed-line (if (seq failed-labels)
                       (str "Rejected, already taken, or not found: "
-                           (str/join ", " failed-labels) "\n"))
-                    "\nTask Status: " (:task_status context) "\n"
-                    "Remaining Pending:\n"
-                    (if (str/blank? (:pending_tasks context))
-                      "(none)"
-                      (:pending_tasks context))
-                    "\n\n"
-                    (if (seq claimed-ids)
-                      "Work on your claimed tasks. Signal COMPLETE_AND_READY_FOR_MERGE when done."
-                      "No claims succeeded. CLAIM different tasks. If you cannot finish a mergeable artifact after trying hard, signal NEEDS_FOLLOWUP with a short explanation."))]
+                           (str/join ", " failed-labels) "\n")
+                      "")
+        pending-block (if (str/blank? (:pending_tasks context))
+                        "(none)"
+                        (:pending_tasks context))
+        outcome-line (if (seq claimed-ids)
+                       "Work on your claimed tasks. Signal COMPLETE_AND_READY_FOR_MERGE when done."
+                       "No claims succeeded. CLAIM different tasks. If you cannot finish a mergeable artifact after trying hard, signal NEEDS_FOLLOWUP with a short explanation.")
+        prompt (load-framework-prompt "claim_results.md"
+                                      {:claimed_line claimed-line
+                                       :failed_line failed-line
+                                       :task_status (:task_status context)
+                                       :pending_block pending-block
+                                       :outcome_line outcome-line})]
     {:claimed claimed-ids
      :failed (mapv :id failed)
      :resume-prompt prompt}))
@@ -311,26 +382,25 @@
   (let [context (build-context)
         explanation (some-> output
                             (str/replace #"(?is)^\s*NEEDS_FOLLOWUP\b[\s:.-]*" "")
-                            str/trim)]
-    (str "## NEEDS_FOLLOWUP Follow-up\n\n"
-         (if (seq claimed-ids)
-           (str "You still own these claimed tasks: "
-                (str/join ", " (sort claimed-ids))
-                "\n\n")
-           "You do not currently own any claimed tasks.\n\n")
-         "Continue the SAME cycle and finish a merge-ready artifact.\n"
-         "Do not output NEEDS_FOLLOWUP again unless you are still blocked after this follow-up.\n"
-         "Prefer the smallest useful diff. If scope is too large, create concrete follow-up tasks in the pending queue and still ship the artifact you have.\n\n"
-         (when (seq explanation)
-           (str "Your previous explanation:\n"
-                explanation
-                "\n\n"))
-         "Task Status: " (:task_status context) "\n"
-         "Remaining Pending:\n"
-         (if (str/blank? (:pending_tasks context))
-           "(none)"
-           (:pending_tasks context))
-         "\n\nWhen ready, signal COMPLETE_AND_READY_FOR_MERGE.")))
+                            str/trim)
+        ownership-line (if (seq claimed-ids)
+                         (str "You still own these claimed tasks: "
+                              (str/join ", " (sort claimed-ids))
+                              "\n\n")
+                         "You do not currently own any claimed tasks.\n\n")
+        explanation-block (if (seq explanation)
+                            (str "Your previous explanation:\n"
+                                 explanation
+                                 "\n\n")
+                            "")
+        pending-block (if (str/blank? (:pending_tasks context))
+                        "(none)"
+                        (:pending_tasks context))]
+    (load-framework-prompt "needs_followup.md"
+                           {:ownership_line ownership-line
+                            :explanation_block explanation-block
+                            :task_status (:task_status context)
+                            :pending_block pending-block})))
 
 (defn- run-agent!
   "Run agent with prompt, return {:output :done? :merge? :claim-ids :exit :session-id}.
@@ -355,9 +425,9 @@
 
                  ;; Standard resume — lighter (agent already has full context)
                  resume?
-                 (str "Task Status: " (:task_status context) "\n"
-                      "Pending: " (:pending_tasks context) "\n\n"
-                      "Continue working. Signal COMPLETE_AND_READY_FOR_MERGE when your current task is done and ready for review.")
+                 (load-framework-prompt "resume.md"
+                                        {:task_status (:task_status context)
+                                         :pending_tasks (:pending_tasks context)})
 
                  ;; Fresh start — full task header + tokenized user prompts
                  ;; Template tokens ({context_header}, {queue_md}, etc.) are
@@ -375,20 +445,20 @@
                                            (str/join "\n\n"))
                                       (or (some-> (load-prompt "config/prompts/worker.md")
                                                   (agent/tokenize template-tokens))
-                                          "You are a worker. Claim tasks, execute them, complete them."))]
+                                          (load-framework-prompt "worker_default.md" {})))]
                    (str task-header "\n"
                         "Task Status: " (:task_status context) "\n"
                         "Pending: " (:pending_tasks context) "\n\n"
                         user-prompts)))
 
-        swarm-id* (or swarm-id "unknown")
-        tagged-prompt (str "[oompa:" swarm-id* ":" id "] " prompt)
+        tagged-prompt (tag-prompt swarm-id id prompt)
         abs-worktree (.getAbsolutePath (io/file worktree-path))
 
         result (try
                  (harness/run-command! harness
                                        {:cwd abs-worktree :model model :reasoning reasoning
                                         :session-id session-id :resume? resume?
+                                        :drive (turn-drive id harness resume?)
                                         :prompt tagged-prompt :format? true})
                  (catch Exception e
                    (println (format "[%s] Agent exception: %s" id (.getMessage e)))
@@ -432,7 +502,16 @@
                          (str (subs d 0 24000) "\n... [diff truncated at 24000 chars]")
                          d))
 
-        swarm-id* (or swarm-id "unknown")
+        ;; Recently MERGED subject lines on main (not the worker's own branch
+        ;; commits — use the `main` ref). This gives the reviewer pacing context
+        ;; so it can flag a diff that duplicates or churns work already merged.
+        merged-log (-> (process/sh ["git" "log" "-n" "10" "--format=%s" "main"]
+                                   {:dir worktree-path :out :string :err :string})
+                       :out str/trim)
+        merged-section (when (seq merged-log)
+                         (str "\n## Recently merged work on main (last 10)\n\n"
+                              merged-log
+                              "\n\n"))
 
         ;; Only include the most recent round's feedback — the worker has already
         ;; attempted fixes based on it, so the reviewer just needs to verify.
@@ -456,19 +535,15 @@
                                                     (map load-prompt)
                                                     (remove nil?)
                                                     (str/join "\n\n")))
-                               review-body (str (or custom-prompt
-                                                     (str "Review the changes in this worktree.\n"
-                                                          "Focus on architecture and design, not style.\n"))
-                                                "\n\nDiff:\n```\n" diff-content "\n```\n"
-                                                (when history-block history-block)
-                                                "\nYour verdict MUST be on its own line, exactly one of:\n"
-                                                "VERDICT: APPROVED\n"
-                                                "VERDICT: NEEDS_CHANGES\n\n"
-                                                "Pick APPROVED if the changes are correct and complete. "
-                                                "Pick NEEDS_CHANGES if there are specific issues to fix.\n"
-                                                "If you pick NEEDS_CHANGES, list every issue as a numbered item with "
-                                                "the file path and what needs to change.\n")
-                               review-prompt (str "[oompa:" swarm-id* ":" id "] " review-body)
+                               review-base (or custom-prompt
+                                                "Review the changes in this worktree.\nFocus on architecture and design, not style.\n")
+                               review-body (load-framework-prompt
+                                             "reviewer.md"
+                                             {:base review-base
+                                              :diff_content diff-content
+                                              :merged_section (or merged-section "")
+                                              :history_block (or history-block "")})
+                               review-prompt (tag-prompt swarm-id id review-body)
                                res (try
                                         (harness/run-command! harness {:cwd abs-wt :model model :prompt review-prompt})
                                         (catch Exception e
@@ -517,7 +592,6 @@
    Returns {:output string, :exit int, :session-id string}"
   [{:keys [id swarm-id harness model]} worktree-path all-feedback session-id]
   (let [start-ms (System/currentTimeMillis)
-        swarm-id* (or swarm-id "unknown")
         feedback-text (if (> (count all-feedback) 1)
                         (str "The reviewer has given feedback across " (count all-feedback) " rounds.\n"
                              "Fix ALL outstanding issues:\n\n"
@@ -527,9 +601,8 @@
                                   (str/join "\n\n")))
                         (str "The reviewer found issues with your changes:\n\n"
                              (first all-feedback)))
-        fix-prompt (str "[oompa:" swarm-id* ":" id "] "
-                        feedback-text "\n\n"
-                        "Fix these issues. Do not add anything the reviewer did not ask for.")
+        fix-prompt (tag-prompt swarm-id id
+                               (load-framework-prompt "fix.md" {:feedback_text feedback-text}))
 
         abs-wt (.getAbsolutePath (io/file worktree-path))
 
@@ -539,7 +612,8 @@
                                          ;; Resume existing session so the worker keeps
                                          ;; full context of the code it already wrote.
                                          session-id (assoc :session-id session-id
-                                                           :resume? true)))
+                                                           :resume? true
+                                                           :drive (turn-drive id harness true))))
                  (catch Exception e
                    {:exit -1 :out "" :err (.getMessage e)}))
         parsed (harness/parse-output harness (:out result) session-id)
@@ -616,14 +690,12 @@
              last-error (:error first-try)]
         (println (format "[%s] Resolve attempt %d/%d" worker-id attempt max-resolve-attempts))
         (let [{:keys [branch-log main-log diff-stat]} (collect-divergence-context wt-path)
-              resolve-prompt (str "[oompa:" (or (:swarm-id worker) "unknown") ":" worker-id "] "
-                                  "Your branch cannot merge into main.\n\n"
-                                  "Error:\n" last-error "\n\n"
-                                  "Your commits (not on main):\n" branch-log "\n\n"
-                                  "New commits on main:\n" main-log "\n\n"
-                                  "Divergence:\n" diff-stat "\n\n"
-                                  "Make your branch cleanly mergeable into main. "
-                                  "Preserve YOUR changes. You have full git access.")
+              resolve-prompt (tag-prompt (:swarm-id worker) worker-id
+                                         (load-framework-prompt "merge_conflict_resolve.md"
+                                                                {:error last-error
+                                                                 :branch_log branch-log
+                                                                 :main_log main-log
+                                                                 :diff_stat diff-stat}))
               abs-wt (.getAbsolutePath (io/file wt-path))
               _ (try
                   (harness/run-command! (:harness worker)
@@ -1001,17 +1073,9 @@
   "Prompt injected when resuming the original agent session to do the merge.
    Agent must run git itself, resolve any conflicts, and signal MERGE_COMPLETE(sha)."
   [wt-branch project-root]
-  (str "## Merge Authorization\n\n"
-       "Your work has been reviewed and approved. You are now authorized to merge to main.\n\n"
-       "Steps:\n"
-       "1. Commit any uncommitted changes in your worktree (git add -A && git commit -m 'wip')\n"
-       "2. In the project root (" project-root "), run:\n"
-       "   git checkout main && git merge " wt-branch " --no-edit\n"
-       "3. If there are merge conflicts: resolve them, then git add -A && git commit --no-edit\n"
-       "4. After the merge succeeds, get the commit SHA: git rev-parse --short HEAD\n"
-       "5. Signal MERGE_COMPLETE(sha) — e.g. MERGE_COMPLETE(a3f7d2c)\n\n"
-       "IMPORTANT: Only signal MERGE_COMPLETE after the merge is actually on main.\n"
-       "If you cannot resolve conflicts after trying hard, signal NEEDS_FOLLOWUP with details."))
+  (load-framework-prompt "merge_authorization.md"
+                         {:project_root project-root
+                          :wt_branch wt-branch}))
 
 (defn run-merge-agent!
   "Resume the original worker session and instruct it to merge its branch to main.
@@ -1030,6 +1094,7 @@
                                             :reasoning (:reasoning worker)
                                             :session-id session-id
                                             :resume? true
+                                            :drive (turn-drive worker-id (:harness worker) true)
                                             :prompt prompt})
                      (catch Exception e
                        (println (format "[%s] Merge agent error: %s" worker-id (.getMessage e)))
@@ -1205,8 +1270,10 @@
   [worker]
   (tasks/ensure-dirs!)
   (let [{:keys [id max-cycles swarm-id wait-between
-                max-wait-for-tasks max-needs-followups max-resumes]} worker
+                max-wait-for-tasks max-resumes]} worker
         cycle-cap (or max-cycles 10)
+        ;; Cheap nil-guard kept per the correctness critic: a worker map built
+        ;; outside create-worker may omit :max-resumes.
         resume-cap (or max-resumes default-max-resumes)
         project-root (System/getProperty "user.dir")]
     (println (format "[%s] Starting worker (%s:%s%s, max_cycle=%d, max_resumes=%d%s)"
@@ -1232,8 +1299,6 @@
            wt-state nil
            claimed-ids #{}
            claim-resume-prompt nil
-           working-resumes 0
-           needs-followups 0
            signals []]
       (let [finish (fn [status]
                      (assoc worker :completed completed
@@ -1289,7 +1354,7 @@
                 (println (format "[%s] Resume cap reached (%d attempts in cycle %d), moving on" id (dec attempt) cycle))
                 (when wt-state
                   (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state)))
-                (recur (inc cycle) 1 (inc completed) 0 metrics nil nil #{} nil 0 0 []))
+                (recur (inc cycle) 1 (inc completed) 0 metrics nil nil #{} nil []))
 
                 (let [wt-state (try
                              (or wt-state (create-iteration-worktree! project-root swarm-id id cycle))
@@ -1304,7 +1369,7 @@
                       (println (format "[%s] %d consecutive errors, stopping" id errors))
                       (finish :error))
                     (do (backoff-sleep! id errors)
-                        (recur (inc cycle) 1 completed errors metrics nil nil #{} nil 0 0 []))))
+                        (recur (inc cycle) 1 completed errors metrics nil nil #{} nil []))))
 
                 (let [resume? (or (some? session-id) (some? claim-resume-prompt))
                       cycle-start-ms (now-ms)
@@ -1364,7 +1429,7 @@
                           (println (format "[%s] %d consecutive errors, stopping" id errors))
                           (finish :error))
                         (do (backoff-sleep! id errors)
-                            (recur (inc cycle) 1 (inc completed) errors metrics nil nil #{} nil 0 0 []))))
+                            (recur (inc cycle) 1 (inc completed) errors metrics nil nil #{} nil []))))
 
                     (and (seq claim-ids) (not merge?) (not done?))
                     (let [_ (println (format "[%s] CLAIM signal: %s" id (str/join ", " claim-ids)))
@@ -1378,11 +1443,11 @@
                                         :claimed-task-ids (vec claimed)})
                       (if (seq claimed)
                         (recur cycle (inc attempt) completed 0 metrics new-session-id wt-state
-                               new-claimed-ids resume-prompt 0 0 signals)
+                               new-claimed-ids resume-prompt signals)
                         (do
                           (println (format "[%s] No claims succeeded; ending cycle without resuming unowned work" id))
                           (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                          (recur (inc cycle) 1 (inc completed) 0 metrics nil nil #{} nil 0 0 []))))
+                          (recur (inc cycle) 1 (inc completed) 0 metrics nil nil #{} nil []))))
 
                     merge?
                     (if (and (worktree-has-changes? (:path wt-state))
@@ -1420,7 +1485,7 @@
                                               :recycled-tasks (seq recycled)
                                               :review-rounds 0})
                             (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                            (recur (inc cycle) 1 (inc completed) 0 metrics nil nil #{} nil 0 0 [])))
+                            (recur (inc cycle) 1 (inc completed) 0 metrics nil nil #{} nil [])))
                               (let [{:keys [approved? attempts timing]} (review-loop! worker (:path wt-state) id cycle {:cycle-timing cycle-timing :session-id new-session-id})
                                     cycle-timing (or timing cycle-timing)
                                     metrics (-> metrics
@@ -1445,7 +1510,7 @@
                                                 :recycled-tasks (seq recycled)
                                                 :review-rounds (or attempts 0)})
                               (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                              (recur (inc cycle) 1 (inc completed) 0 metrics nil nil #{} nil 0 0 []))
+                              (recur (inc cycle) 1 (inc completed) 0 metrics nil nil #{} nil []))
                             (let [recycled (recycle-active-claims! id claimed-ids mv-claimed-tasks)
                                   metrics (update metrics :recycled + (count recycled))]
                               (println (format "[%s] Cycle %d/%d rejected" id (inc completed) cycle-cap))
@@ -1456,7 +1521,7 @@
                                                 :recycled-tasks (seq recycled)
                                                 :review-rounds (or attempts 0)})
                               (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                              (recur (inc cycle) 1 (inc completed) 0 metrics nil nil #{} nil 0 0 [])))))
+                              (recur (inc cycle) 1 (inc completed) 0 metrics nil nil #{} nil [])))))
                       ;; Worker signaled merge with no code diff. If they claimed
                       ;; tasks, they verified the work is already done — complete them.
                       ;; (Tasks live outside the worktree at ../tasks/, so mv is
@@ -1480,7 +1545,7 @@
                                             :outcome :no-changes
                                             :claimed-task-ids (vec active-claimed-ids)})
                           (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                          (recur (inc cycle) 1 (inc completed) 0 metrics nil nil #{} nil 0 0 []))))
+                          (recur (inc cycle) 1 (inc completed) 0 metrics nil nil #{} nil []))))
                       )
 
                     done?
@@ -1498,31 +1563,34 @@
                       (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
                       (finish :error))
 
+                    ;; NEEDS_FOLLOWUP keeps ownership and continues the SAME cycle
+                    ;; with a follow-up prompt. There is no separate followup
+                    ;; budget: the continuation counts against the single
+                    ;; per-cycle attempt budget (max-resumes). When that budget
+                    ;; is spent, the (> attempt resume-cap) guard at the top of
+                    ;; the loop recycles the claims and moves to the next cycle.
                     needs-followup?
                     (let [summary (subs (or output "") 0 (min 240 (count (or output ""))))
-                          next-followups (inc needs-followups)]
+                          followup-prompt (build-needs-followup-prompt active-claimed-ids output)]
                       (emit!
                                        {:timing-ms cycle-timing
                                         :outcome :needs-followup
                                         :claimed-task-ids (vec active-claimed-ids)
                                         :error-snippet summary})
-                      (if (> next-followups max-needs-followups)
-                        (let [recycled (recycle-active-claims! id claimed-ids mv-claimed-tasks)
-                              metrics (-> metrics
-                                          (update :recycled + (count recycled))
-                                          (update :errors inc))]
-                          (println (format "[%s] NEEDS_FOLLOWUP exhausted (%d/%d); stopping worker" id next-followups max-needs-followups))
-                          (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                          (finish :error))
-                        (let [followup-prompt (build-needs-followup-prompt active-claimed-ids output)]
-                          (println (format "[%s] NEEDS_FOLLOWUP signal; continuing cycle with follow-up prompt (%d/%d)"
-                                           id next-followups max-needs-followups))
-                          (recur cycle (inc attempt) completed 0 metrics new-session-id wt-state
-                                 active-claimed-ids followup-prompt 0 next-followups signals))))
+                      (println (format "[%s] NEEDS_FOLLOWUP signal; continuing cycle with follow-up prompt (attempt %d/%d)"
+                                       id attempt resume-cap))
+                      (recur cycle (inc attempt) completed 0 metrics new-session-id wt-state
+                             active-claimed-ids followup-prompt signals))
 
+                    ;; Working without a signal — resume the session. The cycle's
+                    ;; single attempt budget (max-resumes) governs how long this
+                    ;; can continue; the (> attempt resume-cap) guard at the top
+                    ;; of the loop recycles claims and moves on when it is spent.
+                    ;; On the penultimate attempt (one attempt left, i.e.
+                    ;; attempt == resume-cap - 1) inject the wrap-up nudge once so
+                    ;; the agent gets a final chance to produce something mergeable.
                     :else
-                    (let [wr (inc working-resumes)
-                          max-wr (:max-working-resumes worker)]
+                    (let [penultimate? (= attempt (dec resume-cap))]
                       (when parse-warning
                         (if (str/includes? parse-warning "AUTH_REQUIRED:")
                           (println (format "[%s] LOGIN ISSUE: %s"
@@ -1537,38 +1605,15 @@
                         (println (format "[%s] Agent stderr snippet: %s"
                                          id
                                          (snippet (str/replace stderr-snippet #"\s+" " ") 240))))
-                      (cond
-                        (> wr max-wr)
-                        (let [recycled (recycle-active-claims! id claimed-ids mv-claimed-tasks)
-                              metrics (update metrics :recycled + (count recycled))]
-                          (println (format "[%s] Stuck after %d working resumes + nudge, resetting session" id wr))
-                          (emit!
-                                           {:timing-ms cycle-timing
-                                            :outcome :stuck
-                                            :claimed-task-ids (vec active-claimed-ids)
-                                            :recycled-tasks (seq recycled)})
-                          (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
-                          (recur (inc cycle) 1 (inc completed) 0 metrics nil nil #{} nil 0 0 []))
-
-                        (= wr max-wr)
-                        (do
-                          (println (format "[%s] Working... %d/%d resumes, nudging agent to wrap up" id wr max-wr))
-                          (emit!
-                                           {:timing-ms cycle-timing
-                                            :outcome :working
-                                            :claimed-task-ids (vec active-claimed-ids)})
-                          (recur cycle (inc attempt) completed 0 metrics new-session-id wt-state
-                                 active-claimed-ids nudge-prompt wr needs-followups signals))
-
-                        :else
-                        (do
-                          (println (format "[%s] Working... (will resume, %d/%d)" id wr max-wr))
-                          (emit!
-                                           {:timing-ms cycle-timing
-                                            :outcome :working
-                                            :claimed-task-ids (vec active-claimed-ids)})
-                          (recur cycle (inc attempt) completed 0 metrics new-session-id wt-state
-                                 active-claimed-ids nil wr needs-followups signals)))))))))))))))
+                      (if penultimate?
+                        (println (format "[%s] Working... attempt %d/%d, nudging agent to wrap up" id attempt resume-cap))
+                        (println (format "[%s] Working... (will resume, attempt %d/%d)" id attempt resume-cap)))
+                      (emit!
+                                       {:timing-ms cycle-timing
+                                        :outcome :working
+                                        :claimed-task-ids (vec active-claimed-ids)})
+                      (recur cycle (inc attempt) completed 0 metrics new-session-id wt-state
+                             active-claimed-ids (when penultimate? (nudge-prompt)) signals)))))))))))))
 
 ;; =============================================================================
 ;; Multi-Worker Execution
@@ -1683,13 +1728,12 @@
                                     (remove nil?)
                                     (map #(agent/tokenize % template-tokens))
                                     (str/join "\n\n")))
-                             "\n\nTask Status: " (:task_status context) "\n"
-                             "Pending: " (:pending_tasks context) "\n\n"
-                             "Create tasks in tasks/pending/ as .json files.\n"
-                             "Maximum " (- max-pending pending-before) " new tasks.\n"
-                             "Signal __DONE__ when finished planning.")
-            swarm-id* (or swarm-id "unknown")
-            tagged-prompt (str "[oompa:" swarm-id* ":planner] " prompt-text)
+                             (load-framework-prompt
+                               "planner_tail.md"
+                               {:task_status (:task_status context)
+                                :pending_tasks (:pending_tasks context)
+                                :max_new_tasks (- max-pending pending-before)}))
+            tagged-prompt (tag-prompt swarm-id "planner" prompt-text)
             abs-root (.getAbsolutePath (io/file project-root))
 
             _ (println (format "[planner] Running (%s:%s, max_pending: %d, current: %d)"

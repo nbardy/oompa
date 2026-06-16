@@ -8,6 +8,11 @@
   "properties": {
     "worker-id": { "type": "string" },
     "cycle": { "type": "integer", "minimum": 1 },
+    "attempt": {
+      "type": "integer",
+      "minimum": 1,
+      "description": "1-based resume attempt within this cycle (counts against max-resumes)"
+    },
     "outcome": {
       "type": "string",
       "enum": ["merged", "rejected", "error", "done", "executor-done", "no-changes", "no-claim", "working", "claimed", "sync-failed", "merge-failed", "interrupted", "stuck", "needs-followup"]
@@ -25,6 +30,23 @@
     },
     "error-snippet": { "type": ["string", "null"] },
     "review-rounds": { "type": "integer", "minimum": 0 },
+    "session-id": {
+      "type": ["string", "null"],
+      "description": "agent-cli session id — salvage's resume handle for this cycle"
+    },
+    "worktree-path": {
+      "type": ["string", "null"],
+      "description": "Filesystem path of the worktree this cycle ran in"
+    },
+    "signals": {
+      "type": "array",
+      "items": { "type": "string" },
+      "description": "Cumulative per-attempt signal chain (e.g. claim:..., working, merge)"
+    },
+    "merge-sha": {
+      "type": ["string", "null"],
+      "description": "Short commit SHA when this cycle merged to main, else null"
+    },
     "timing-ms": {
       "type": "object",
       "properties": {

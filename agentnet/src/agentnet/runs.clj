@@ -123,17 +123,24 @@
 
 (defn write-cycle-log!
   "Write a cycle event log for a worker.
-   Contains: outcome, timing, claimed task IDs, recycled tasks, session-id.
-   session-id links to the Claude CLI conversation on disk for debugging.
-   Written at cycle end so dashboards can track progress in real-time."
+   Contains: attempt, outcome, timing, claimed task IDs, recycled tasks,
+   session-id, worktree-path, signals, and merge-sha.
+   session-id is salvage's resume handle: it links to the agent-cli conversation
+   on disk so an interrupted cycle can be resumed/recovered. attempt,
+   worktree-path, signals (cumulative attempt chain), and merge-sha were
+   previously emitted by emit-cycle-log! but dropped here — they are now
+   persisted so the event log is complete. Written at cycle end so dashboards can
+   track progress in real-time."
   [swarm-id worker-id cycle
-   {:keys [outcome duration-ms claimed-task-ids recycled-tasks
-           error-snippet review-rounds session-id timing-ms]}]
+   {:keys [attempt outcome duration-ms claimed-task-ids recycled-tasks
+           error-snippet review-rounds session-id timing-ms
+           worktree-path signals merge-sha]}]
   (when swarm-id
     (let [filename (format "%s-c%d.json" worker-id cycle)]
       (write-json! (str (cycles-dir swarm-id) "/" filename)
                    {:worker-id worker-id
                     :cycle cycle
+                    :attempt attempt
                     :outcome (name outcome)
                     :timestamp (str (java.time.Instant/now))
                     :duration-ms duration-ms
@@ -142,6 +149,9 @@
                     :error-snippet error-snippet
                     :review-rounds (or review-rounds 0)
                     :session-id session-id
+                    :worktree-path worktree-path
+                    :signals (or signals [])
+                    :merge-sha merge-sha
                     :timing-ms timing-ms}))))
 
 ;; =============================================================================

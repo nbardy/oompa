@@ -128,15 +128,22 @@
 ;;   :session - session ID strategy (:uuid, :extracted, :implicit)
 ;;   :output  - output format (:plain or :ndjson)
 
+;; :drive is the harness's ADVERTISED per-turn dispatch capability:
+;;   :resume — the harness can resume a prior session (the default everywhere).
+;;   :goal   — STUB. Reserved for the codex `/goal` exec runtime.
 (def ^:private gemini-behavior
-  {:stdin :close :session :extracted :output :ndjson})
+  {:stdin :close :session :extracted :output :ndjson :drive :resume})
 
 (def registry
   (merge
-   {:codex    {:stdin :close   :session :uuid      :output :plain}
-    :claude   {:stdin :prompt  :session :uuid      :output :plain}
-    :opencode {:stdin :close   :session :extracted  :output :ndjson}
-    :cursor   {:stdin :close   :session :extracted  :output :ndjson}
+   {;; !!! goal drive is a STUB pending the codex `/goal` exec runtime; today it
+    ;; follows :resume semantics — see the deferred goal loop in run-command!.
+    ;; Do NOT read :drive :goal as "goal continuation is ready"; codex exec runs
+    ;; one turn then exits, so there is no goal poll/resume loop yet.
+    :codex    {:stdin :close   :session :uuid      :output :plain  :drive :goal}
+    :claude   {:stdin :prompt  :session :uuid      :output :plain  :drive :resume}
+    :opencode {:stdin :close   :session :extracted  :output :ndjson :drive :resume}
+    :cursor   {:stdin :close   :session :extracted  :output :ndjson :drive :resume}
     :gemini   gemini-behavior}
    {:gemini1 gemini-behavior
     :gemini2 gemini-behavior
@@ -187,17 +194,33 @@
       (if (seq extra) (assoc m :extraArgs extra) m))
     m))
 
+(defn resume-drive?
+  "Per-turn dispatch: should this turn RESUME the existing session (vs create a
+   new one)? True when the legacy :resume? boolean is set OR the per-turn :drive
+   is :resume.
+
+   :drive names the dispatch that was previously an anonymous (and session-id
+   (not resume?)) / (and session-id resume?) pair. {:resume :goal} are the two
+   drives. :goal is a STUB (see the registry and run-command!) — it does NOT
+   enable goal continuation today and is NOT treated as resume here; a goal turn
+   that needs to resume must be driven with :drive :resume (which is what the
+   worker handler computes per turn). Both the legacy :resume? and the new
+   :drive are accepted so existing callers keep working unchanged."
+  [opts]
+  (boolean (or (:resume? opts) (= :resume (:drive opts)))))
+
 (defn build-cmd
   "Build CLI command vector via agent-cli JSON input.
    Used for probe/debug flows. Execution should prefer `run-command!`."
   [harness-kw opts]
-  (let [input (-> {:harness (name harness-kw)
+  (let [resume? (resume-drive? opts)
+        input (-> {:harness (name harness-kw)
                    :bypassPermissions true}
                   (cond->
                     (:model opts)      (assoc :model (:model opts))
                     (:prompt opts)     (assoc :prompt (:prompt opts))
                     (:session-id opts) (assoc :sessionId (:session-id opts))
-                    (:resume? opts)    (assoc :resume true)
+                    resume?            (assoc :resume true)
                     (:cwd opts)        (assoc :cwd (:cwd opts))
                     (:reasoning opts)  (assoc :reasoning (:reasoning opts)))
                   (add-extra-args harness-kw opts)
@@ -220,17 +243,33 @@
       :close  "")))
 
 (defn run-command!
-  "Execute a harness through `agent-cli run`, which emits unified JSONL events."
+  "Execute a harness through `agent-cli run`, which emits unified JSONL events.
+
+   Per-turn drive dispatch (the load-bearing session-persistence seam):
+     - RESUME  → :resumeSessionId  (continue the existing agent-cli session)
+     - CREATE  → :sessionId        (start a fresh session with this id)
+   The drive is RESUME when resume-drive? is true (legacy :resume? OR
+   :drive :resume); otherwise it is CREATE. Both keys are emitted by their own
+   branch and neither is dropped, so a salvage/resume that depends on session
+   persistence keeps working across the :drive migration.
+
+   :drive :goal is a documented STUB pending the codex `/goal` exec runtime:
+   `codex exec` runs exactly one turn then shuts down — there is no external
+   poll/resume loop to keep a goal alive. Until that runtime exists, :goal is
+   NOT treated as resume here; a goal turn that must continue is driven with
+   :drive :resume (which the worker handler computes per turn). See the registry
+   :codex :drive :goal entry and the deferred goal loop."
   [harness-kw opts]
-  (let [input (-> {:harness (name harness-kw)
+  (let [resume? (resume-drive? opts)
+        input (-> {:harness (name harness-kw)
                    :mode "conversation"
                    :prompt (:prompt opts)
                    :cwd (:cwd opts)
                    :yolo true}
                   (cond->
                     (:model opts)      (assoc :model (:model opts))
-                    (and (:session-id opts) (not (:resume? opts))) (assoc :sessionId (:session-id opts))
-                    (and (:session-id opts) (:resume? opts))       (assoc :resumeSessionId (:session-id opts))
+                    (and (:session-id opts) (not resume?)) (assoc :sessionId (:session-id opts))
+                    (and (:session-id opts) resume?)       (assoc :resumeSessionId (:session-id opts))
                     (:reasoning opts)  (assoc :reasoningEffort (:reasoning opts))
                     (or (= harness-kw :gemini) (gemini-alias? harness-kw))
                     (assoc :debugRawEvents true))

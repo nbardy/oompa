@@ -95,6 +95,8 @@
             (recur (assoc opts :workers (parse-int next-arg 2))
                    (nnext remaining))))
 
+        ;; --iterations applies to legacy 'run'/'loop' only; config-driven swarms
+        ;; use the per-worker JSON 'max_cycle' field (see cmd-swarm) and ignore this.
         (= arg "--iterations")
         (recur (assoc opts :iterations (parse-int (second remaining) 1))
                (nnext remaining))
@@ -1172,7 +1174,9 @@
                            :can-plan (:can_plan wc)
                            :wait-between (:wait_between wc)
                            :max-wait-for-tasks (:max_wait_for_tasks wc)
-                           :max-working-resumes (:max_working_resumes wc)
+                           ;; max_working_resumes retired: worker-core folded its nudge into
+                           ;; max_resumes. Old configs may still carry the key — it is simply
+                           ;; not read here (harmless, no crash, no warning).
                            :max-resumes (:max_resumes wc)
                            :auto-merge-paths (:auto_merge_paths wc)
                            :reviewers all-reviewers})))
@@ -1371,7 +1375,8 @@
   (println "  --config PATH            Config file for run/swarm")
   (println "  --detach                 Run in background (run command)")
   (println "  --startup-timeout N      Detached startup validation window in seconds")
-  (println "  --iterations N           Number of iterations per worker (default: 1)")
+  (println "  --iterations N           Iterations per worker for legacy 'run'/'loop' only;")
+  (println "                           config-driven swarms set per-worker 'max_cycle' in JSON")
   (println (str "  --harness {" (str/join "," (map name (sort harnesses))) "} Agent harness to use (default: codex)"))
   (println "  --model MODEL            Model to use (e.g., codex:gpt-5.3-codex:medium, claude:opus, gemini:gemini-3-pro-preview)")
   (println "  --dry-run                Skip actual merges")
@@ -1778,9 +1783,23 @@
    "help" cmd-help
    "docs" cmd-docs})
 
+(def ^:private help-tokens
+  "Tokens that should print help and exit 0, never 'Unknown command'.
+   nil = no command given; --help/-h are positional here (parse-args only
+   handles options after the command), so they must be matched before the
+   (get commands cmd) lookup or they fall through to the unknown-command path."
+  #{nil "help" "--help" "-h"})
+
 (defn -main [& args]
-  (let [[cmd & rest-args] args]
-    (if-let [handler (get commands cmd)]
+  (let [[cmd & rest-args] args
+        handler (get commands cmd)]
+    (cond
+      (contains? help-tokens cmd)
+      (do
+        (cmd-help {} [])
+        (System/exit 0))
+
+      handler
       (try
         (let [{:keys [opts args]} (parse-args rest-args)]
           (handler opts args))
@@ -1788,9 +1807,10 @@
           (binding [*out* *err*]
             (println (format "Error: %s" (.getMessage e))))
           (System/exit 1)))
+
+      :else
       (do
         (cmd-help {} [])
-        (when cmd
-          (println)
-          (println (format "Unknown command: %s" cmd)))
-        (System/exit (if cmd 1 0))))))
+        (println)
+        (println (format "Unknown command: %s" cmd))
+        (System/exit 1)))))

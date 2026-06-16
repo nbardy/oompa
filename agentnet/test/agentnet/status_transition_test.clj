@@ -9,7 +9,7 @@
 
 (defn- stubbed-worker-shell
   [run-agent-fn emit-log-fn
-   & {:keys [can-plan max-cycles max-working-resumes max-needs-followups
+   & {:keys [can-plan max-cycles max-resumes
              task-status pending-tasks current-count current-task-ids
              worktree-has-changes? review-loop-fn sync-fn merge-fn execute-claims-fn
              recycle-tasks-fn complete-by-ids-fn]}]
@@ -35,7 +35,7 @@
                 worker/worktree-has-changes? (if (fn? worktree-has-changes?)
                                                worktree-has-changes?
                                                (fn [_] (boolean worktree-has-changes?)))
-                worker/task-only-diff? (fn [_] false)
+                worker/auto-mergeable-diff? (fn [& _] false)
                 worker/review-loop! (or review-loop-fn (fn [& _] {:approved? true :attempts 0}))
                 worker/sync-worktree-to-main! (or sync-fn (fn [& _] :ok))
                 worker/merge-to-main! (or merge-fn (fn [& _] {:ok? true :completed-count 1}))
@@ -48,8 +48,7 @@
                          :model "gpt-5"
                          :max-cycles (or max-cycles 1)
                          :can-plan (if (nil? can-plan) true can-plan)
-                         :max-working-resumes (or max-working-resumes 5)
-                         :max-needs-followups (or max-needs-followups 1)})))
+                         :max-resumes (or max-resumes 7)})))
 
 (defn- capture-log!
   [logs]
@@ -287,7 +286,13 @@
     (t/is (= :no-claim (:outcome (last @logs))))
     (t/is (= [] (:claimed-task-ids (last @logs))))))
 
-(t/deftest exhausted-needs-followup-recycles-claims-and-stops
+(t/deftest repeated-needs-followup-consumes-resume-budget-and-recycles
+  ;; K1: NEEDS_FOLLOWUP no longer has its own budget. Each continuation counts
+  ;; against the single per-cycle attempt budget (max-resumes). When that budget
+  ;; is spent, the resume-cap guard recycles the claims and moves to the next
+  ;; cycle. With max-resumes 2: attempt 1 = CLAIM, attempt 2 = NEEDS_FOLLOWUP
+  ;; (continues), attempt 3 exceeds the cap → recycle. The agent is never asked a
+  ;; 4th time, so it emits at most three NEEDS_FOLLOWUP logs before the cap.
   (let [logs (atom [])
         recycled (atom [])
         call-count (atom 0)
@@ -301,13 +306,6 @@
                         :merge? false
                         :claim-ids ["task-001"]
                         :session-id "sid-followup-limit"}
-                     2 {:output "NEEDS_FOLLOWUP\n\nFirst follow-up."
-                        :exit 0
-                        :done? false
-                        :merge? false
-                        :needs-followup? true
-                        :claim-ids nil
-                        :session-id "sid-followup-limit"}
                      {:output "NEEDS_FOLLOWUP\n\nStill blocked."
                       :exit 0
                       :done? false
@@ -316,15 +314,20 @@
                       :claim-ids nil
                       :session-id "sid-followup-limit"}))
                  (capture-log! logs)
-                 :max-cycles 3
-                 :max-needs-followups 1
+                 :max-cycles 1
+                 :max-resumes 2
                  :recycle-tasks-fn (fn [ids]
                                      (let [ids (vec (sort ids))]
                                        (swap! recycled conj ids)
                                        ids)))]
-    (t/is (= :error (:status result)))
+    ;; Cycle 1 budget is spent; completed→1 == max-cycles → finish :completed.
+    (t/is (= :completed (:status result)))
+    ;; The resume-cap guard recycled the still-owned claim.
     (t/is (= [["task-001"]] @recycled))
-    (t/is (= :needs-followup (:outcome (last @logs))))))
+    ;; The last recorded attempt before the cap was a NEEDS_FOLLOWUP continuation.
+    (t/is (= :needs-followup (:outcome (last @logs))))
+    ;; Agent was asked exactly twice: CLAIM then one NEEDS_FOLLOWUP turn.
+    (t/is (= 2 @call-count))))
 
 (t/deftest cycle-schema-includes-claimed-outcome
   (let [schema (json/parse-string (slurp (io/file "schemas/cycle.schema.json")) true)
@@ -353,7 +356,13 @@
         outcomes (set (get-in schema [:properties :outcome :enum]))]
     (t/is (contains? outcomes "needs-followup"))))
 
-(t/deftest working-resumes-emits-stuck-after-max
+(t/deftest working-resumes-bounded-by-resume-cap-without-stuck-outcome
+  ;; K1: the separate max-working-resumes counter and its :stuck outcome are
+  ;; gone. A worker that keeps "working" without a signal is resumed until the
+  ;; single per-cycle attempt budget (max-resumes) is spent, at which point the
+  ;; resume-cap guard recycles claims and moves on WITHOUT emitting a log. With
+  ;; max-resumes 2 the worker runs attempt 1 and attempt 2 (both :working), then
+  ;; attempt 3 exceeds the cap.
   (let [logs (atom [])
         result (stubbed-worker-shell
                  (fn [& _]
@@ -362,18 +371,20 @@
                     :done? false
                     :merge? false
                     :claim-ids nil
-                    :session-id "sid-stuck"})
+                    :session-id "sid-working"})
                  (capture-log! logs)
                  :max-cycles 1
-                 :max-working-resumes 2)]
+                 :max-resumes 2)]
     (t/is (= :completed (:status result)))
     (let [outcomes (mapv :outcome @logs)]
-      (t/is (= 3 (count outcomes)))
-      (t/is (= :working (nth outcomes 0)))
-      (t/is (= :working (nth outcomes 1)))
-      (t/is (= :stuck (nth outcomes 2))))))
+      (t/is (= [:working :working] outcomes))
+      (t/is (not (some #{:stuck} outcomes))))))
 
-(t/deftest nudge-prompt-injected-at-max-working-resumes
+(t/deftest nudge-prompt-injected-on-penultimate-resume-attempt
+  ;; K1: the wrap-up nudge is folded into max-resumes and fires exactly once, on
+  ;; the penultimate attempt (one attempt left, attempt == max-resumes - 1). With
+  ;; max-resumes 3 the agent is called on attempts 1, 2, 3; the nudge is injected
+  ;; into the attempt-3 prompt because attempt 2 is the penultimate one.
   (let [prompts-seen (atom [])
         call-count (atom 0)]
     (stubbed-worker-shell
@@ -388,11 +399,14 @@
          :session-id "sid-nudge"})
       (fn [& _] nil)
       :max-cycles 1
-      :max-working-resumes 2)
+      :max-resumes 3)
     (t/is (= 3 @call-count))
+    ;; attempt 1 prompt: none; attempt 2 prompt: none (not yet penultimate);
+    ;; attempt 3 prompt: the nudge (injected when attempt 2 was penultimate).
     (t/is (nil? (nth @prompts-seen 0)))
     (t/is (nil? (nth @prompts-seen 1)))
-    (t/is (string? (nth @prompts-seen 2)))))
+    (t/is (string? (nth @prompts-seen 2)))
+    (t/is (re-find #"without signaling completion" (nth @prompts-seen 2)))))
 
 (defn run-tests! []
   (let [{:keys [fail error]} (t/run-tests 'agentnet.status-transition-test)]
