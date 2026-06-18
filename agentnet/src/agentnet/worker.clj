@@ -13,7 +13,23 @@
       treated as an error outcome (workers signal CLAIM(...) /
       COMPLETE_AND_READY_FOR_MERGE / NEEDS_FOLLOWUP, never __DONE__).
 
-   No separate orchestrator - workers self-organize."
+   No separate orchestrator - workers self-organize.
+
+   Drive model (2026-06 lean-design alignment): a GOAL drives a cycle, the
+   per-cycle attempt budget only CAPS it. The inner attempt counter
+   (historically called 'iterations') is NOT the driver of a cycle — it is the
+   per-cycle BUDGET CAP (max-resumes) that bounds how long a single cycle may
+   keep resuming. What advances work inside a cycle is the drive:
+     - :resume drive (today, every harness): oompa owns continuation. When the
+       agent ends a turn still working, the worker manually re-prompts it
+       ('continue working' / nudge) and resumes the session. The budget cap is
+       what stops an otherwise-unbounded resume chain.
+     - :goal drive (future-real, codex `/goal` exec runtime): the goal loop owns
+       continuation — the agent keeps driving toward the goal without an
+       oompa-side re-prompt. Here the manual re-prompt is unnecessary; the
+       budget (max-resumes) is the ONLY cap and the only guard against an
+       unbounded codex goal. This is a documented STUB today (turn-drive falls
+       back to :resume), so the manual re-prompt is still the live fallback."
   (:require [agentnet.tasks :as tasks]
             [agentnet.agent :as agent]
             [agentnet.core :as core]
@@ -116,18 +132,29 @@
   "Compute the per-turn drive keyword for harness/run-command!.
    First turn / no session → create (nil drive). Otherwise → :resume.
 
+   Drive vs cap (lean-design intent): the drive is what continues a cycle; the
+   per-cycle attempt budget (max-resumes) only CAPS it. Two drives exist:
+     :resume — oompa owns continuation. The worker re-prompts ('continue
+               working'/nudge) and resumes the session each attempt; the budget
+               cap is what eventually stops the resume chain. This is the live
+               path for every harness today.
+     :goal   — the goal loop would own continuation, so the manual re-prompt
+               becomes unnecessary and the budget (max-resumes) is the ONLY cap.
+
    Guard: a harness may advertise {:drive :goal} in the registry, but goal drive
    is a STUB pending the codex `/goal` exec runtime (codex exec runs one turn
    then shuts down; there is no external poll/resume loop). We do NOT half-build
    a goal loop here: a resuming turn always follows :resume semantics, and when
    the harness advertised :goal we note that once so logs explain the fallback.
+   The manual re-prompt in the loop's :else branch is exactly that fallback for
+   :resume; only when a real goal drive lands does it become a no-op.
 
    Returns :resume when resuming, nil when creating. Callers also keep passing
    the legacy :resume? boolean; run-command! accepts both and drops neither key."
   [worker-id harness resume?]
   (when resume?
     (when (= :goal (:drive (harness/get-config harness)))
-      (println (format "[%s] goal drive pending codex runtime; defaulting to resume semantics" worker-id)))
+      (println (format "[%s] goal drive pending codex runtime; defaulting to resume semantics (manual re-prompt fallback; budget remains the cap)" worker-id)))
     :resume))
 
 (defn- snippet
@@ -178,9 +205,11 @@
         (str/replace "{TASKS_ROOT}" task-root))))
 
 (def ^:private default-max-wait-for-tasks 600)
-;; The single per-cycle attempt (resume) budget. CLAIM, working, and
-;; NEEDS_FOLLOWUP continuations all count against it. The wrap-up nudge fires
-;; once on the penultimate attempt (one attempt left), then the cycle stops.
+;; The single per-cycle attempt (resume) BUDGET CAP — not a driver. CLAIM,
+;; working, and NEEDS_FOLLOWUP continuations all count against it. The wrap-up
+;; nudge fires once on the penultimate attempt (one attempt left), then the
+;; cycle stops. Under a real goal drive this budget would be the ONLY guard
+;; against an unbounded codex goal, which is why it must never be removed.
 (def ^:private default-max-resumes 7)
 
 (defn create-worker
@@ -1265,8 +1294,13 @@
 
    A cycle is one complete unit of work: claim → implement → review → merge/reject.
    max-cycles controls how many completed cycles before the worker stops.
-   max-resumes (default 7) caps how many attempts (resumes) can happen within
-   a single cycle — CLAIM, working, NEEDS_FOLLOWUP all count as resumes."
+
+   max-resumes (default 7) is the per-cycle BUDGET CAP, not the driver of a
+   cycle. What drives a cycle is the drive (see turn-drive): under :resume the
+   worker re-prompts/resumes each attempt and the budget caps that chain; under
+   a real :goal drive the goal loop would drive and the budget would be the ONLY
+   cap. CLAIM, working, and NEEDS_FOLLOWUP all count as attempts against this
+   budget. The inner attempt counter is the cap, never the work driver."
   [worker]
   (tasks/ensure-dirs!)
   (let [{:keys [id max-cycles swarm-id wait-between
@@ -1582,9 +1616,15 @@
                       (recur cycle (inc attempt) completed 0 metrics new-session-id wt-state
                              active-claimed-ids followup-prompt signals))
 
-                    ;; Working without a signal — resume the session. The cycle's
-                    ;; single attempt budget (max-resumes) governs how long this
-                    ;; can continue; the (> attempt resume-cap) guard at the top
+                    ;; Working without a signal — resume the session. This is the
+                    ;; :resume-drive FALLBACK: oompa manually re-prompts ('continue
+                    ;; working' / nudge) and resumes, because today's goal drive is
+                    ;; a stub (turn-drive falls back to :resume). Under a real :goal
+                    ;; drive the goal loop would own this continuation and the
+                    ;; manual re-prompt would not fire — but the budget cap below
+                    ;; stays either way, as the only guard against an unbounded run.
+                    ;; The cycle's single attempt budget (max-resumes) is the CAP,
+                    ;; not the driver: the (> attempt resume-cap) guard at the top
                     ;; of the loop recycles claims and moves on when it is spent.
                     ;; On the penultimate attempt (one attempt left, i.e.
                     ;; attempt == resume-cap - 1) inject the wrap-up nudge once so

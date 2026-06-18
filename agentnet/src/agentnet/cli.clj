@@ -4,8 +4,8 @@
    Usage:
      ./swarm.bb run                                    # Run swarm from config (oompa.json)
      ./swarm.bb run --detach --config oompa.json       # Run in background with startup validation
-     ./swarm.bb loop 20 --harness claude               # 20 iterations with Claude
-     ./swarm.bb loop --workers claude:5 opencode:2 --iterations 20  # Mixed harnesses
+     ./swarm.bb loop 20 --harness claude               # [DEPRECATED] legacy: N = per-worker max_cycle
+     ./swarm.bb loop --workers claude:5 opencode:2 --iterations 20  # [DEPRECATED] use oompa.json + swarm
      ./swarm.bb swarm oompa.json                       # Multi-model from config
      ./swarm.bb prompt \"...\"                          # Ad-hoc task
      ./swarm.bb status                                 # Show last run
@@ -95,11 +95,17 @@
             (recur (assoc opts :workers (parse-int next-arg 2))
                    (nnext remaining))))
 
-        ;; --iterations applies to legacy 'run'/'loop' only; config-driven swarms
-        ;; use the per-worker JSON 'max_cycle' field (see cmd-swarm) and ignore this.
+        ;; DEPRECATED: --iterations applies to legacy 'run'/'loop' only and is
+        ;; superseded by the cycle + per-cycle budget (max-resumes) + goal-drive
+        ;; model. 'iterations' here meant per-worker max_cycle, NOT the per-cycle
+        ;; attempt budget cap. Config-driven swarms use the per-worker JSON
+        ;; 'max_cycle'/'max_resumes' fields (see cmd-swarm) and ignore this flag.
+        ;; Still parsed so legacy invocations keep working; prefer oompa.json.
         (= arg "--iterations")
-        (recur (assoc opts :iterations (parse-int (second remaining) 1))
-               (nnext remaining))
+        (do
+          (println "WARNING: --iterations is deprecated (legacy 'run'/'loop' only). Use oompa.json with per-worker 'max_cycle'/'max_resumes'; cycle + budget cap + goal drive replaces it.")
+          (recur (assoc opts :iterations (parse-int (second remaining) 1))
+                 (nnext remaining)))
 
         (= arg "--harness")
         (let [h (keyword (second remaining))]
@@ -582,7 +588,10 @@
       (println))))
 
 (defn- cmd-run-legacy
-  "Run orchestrator once from worker specs (legacy mode)."
+  "DEPRECATED legacy mode: run orchestrator once from worker specs.
+   Superseded by config-driven swarms (oompa.json) + the cycle/budget/goal-drive
+   model. Kept only so `run` without a config still does something; new work
+   should use `oompa run <config>` / `oompa swarm oompa.json`."
   [opts args]
   (let [swarm-id (make-swarm-id)]
     (if-let [specs (:worker-specs opts)]
@@ -620,8 +629,13 @@
     (cmd-run-legacy opts args)))
 
 (defn cmd-loop
-  "Run orchestrator N times"
+  "DEPRECATED: run orchestrator with N as each worker's max_cycle.
+   The N here is per-worker max_cycle (completed cycles), NOT the per-cycle
+   attempt budget cap (max-resumes). This legacy loop is superseded by
+   config-driven swarms (oompa.json) plus the cycle + per-cycle budget cap +
+   goal-drive model. Kept for backward compatibility; prefer `oompa swarm`."
   [opts args]
+  (println "WARNING: 'loop' / --iterations is deprecated. Use oompa.json (per-worker 'max_cycle'/'max_resumes'); cycle + budget cap + goal drive replaces the legacy iteration loop.")
   (let [swarm-id (make-swarm-id)
         iterations (or (some-> (first args) (parse-int nil))
                        (:iterations opts)
@@ -1349,7 +1363,7 @@
   (println)
   (println "Commands:")
   (println "  run [file]       Run swarm from config (default: oompa.json, oompa/oompa.json)")
-  (println "  loop N           Run N iterations")
+  (println "  loop N           [DEPRECATED] Legacy: N = per-worker max_cycle. Use 'swarm' + oompa.json")
   (println "  swarm [file]     Run multiple worker configs from oompa.json (parallel)")
   (println "  tasks            Show task status (pending/current/complete)")
   (println "  requeue [ids..]  Move current tasks back to pending")
@@ -1375,8 +1389,9 @@
   (println "  --config PATH            Config file for run/swarm")
   (println "  --detach                 Run in background (run command)")
   (println "  --startup-timeout N      Detached startup validation window in seconds")
-  (println "  --iterations N           Iterations per worker for legacy 'run'/'loop' only;")
-  (println "                           config-driven swarms set per-worker 'max_cycle' in JSON")
+  (println "  --iterations N           [DEPRECATED] legacy 'run'/'loop' only; sets per-worker max_cycle.")
+  (println "                           Superseded by cycle + per-cycle budget (max_resumes) + goal drive.")
+  (println "                           Config-driven swarms set per-worker 'max_cycle'/'max_resumes' in JSON.")
   (println (str "  --harness {" (str/join "," (map name (sort harnesses))) "} Agent harness to use (default: codex)"))
   (println "  --model MODEL            Model to use (e.g., codex:gpt-5.3-codex:medium, claude:opus, gemini:gemini-3-pro-preview)")
   (println "  --dry-run                Skip actual merges")
@@ -1387,9 +1402,9 @@
   (println "  ./swarm.bb list --all")
   (println "  ./swarm.bb view 6cd50f5a")
   (println "  ./swarm.bb run --detach --config oompa/oompa_overnight_self_healing.json")
-  (println "  ./swarm.bb loop 10 --harness codex --model gpt-5.3-codex --workers 3")
-  (println "  ./swarm.bb loop --workers claude:5 opencode:2 --iterations 20")
-  (println "  ./swarm.bb swarm oompa.json  # Run multi-model config"))
+  (println "  ./swarm.bb loop 10 --harness codex --model gpt-5.3-codex --workers 3   # [DEPRECATED]")
+  (println "  ./swarm.bb loop --workers claude:5 opencode:2 --iterations 20         # [DEPRECATED]")
+  (println "  ./swarm.bb swarm oompa.json  # Run multi-model config (preferred over loop/--iterations)"))
 
 (defn cmd-docs
   "Dump core architecture and design documents"
