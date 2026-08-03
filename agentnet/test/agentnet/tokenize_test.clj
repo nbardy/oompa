@@ -123,3 +123,40 @@
 
 ;; Auto-run when loaded
 (run-tests!)
+
+;; =============================================================================
+;; Regression: dollar signs in token VALUES (run 7601e722, 2026-07-29)
+;; =============================================================================
+;;
+;; `tokenize` quoted its regex PATTERN with Pattern/quote but passed the
+;; replacement through raw. Java's Matcher.appendReplacement interprets $1, $&
+;; etc. in the replacement as group references, so any token value containing a
+;; dollar sign threw:
+;;
+;;   java.lang.IllegalArgumentException: Illegal group reference
+;;
+;; In run 7601e722 this killed EVERY review — the diff under review contained a
+;; JS regex-escape helper, `.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')`, and `$&` is
+;; a group reference. Result: 18 workers, 5 successful claims, 0 merges, and a
+;; fatal-error shutdown. Nothing about the failure pointed at prompt templating.
+;;
+;; Diff text is attacker-agnostic but fully arbitrary: any value substituted into
+;; a prompt (diffs, queue listings, task notes, stderr snippets) can contain a $.
+
+(defn- expect-roundtrip [label v]
+  (let [out (try (agent/tokenize "before {diff} after" {:diff v})
+                 (catch Exception e (str "THREW: " (.getMessage e))))
+        want (str "before " v " after")]
+    (if (= out want)
+      (do (println "  PASS" label) true)
+      (do (println "  FAIL" label "->" (pr-str out)) false))))
+
+(defn run-dollar-regression! []
+  (println "tokenize: dollar-sign regression")
+  (every? true?
+          (doall
+            [(expect-roundtrip "$& (the actual crash)" "s.replace(/x/g, '\\$&')")
+             (expect-roundtrip "$1 group reference"    "foo $1 bar")
+             (expect-roundtrip "bare dollar"           "cost is $5")
+             (expect-roundtrip "${brace}"              "${HOME}/x")
+             (expect-roundtrip "trailing backslash"    "C:\\path\\to")])))

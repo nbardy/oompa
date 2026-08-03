@@ -407,7 +407,15 @@
             (str/replace acc
                          (re-pattern (java.util.regex.Pattern/quote
                                        (str "{" (name k) "}")))
-                         (str v)))
+                         ;; Matcher/quoteReplacement is REQUIRED here. Java treats $1, $&
+                         ;; and friends in the replacement string as group references, so a
+                         ;; token value containing a dollar sign throws
+                         ;; IllegalArgumentException: Illegal group reference.
+                         ;; This crashed every review in run 7601e722 (0 merges): the diff
+                         ;; being reviewed contained `.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')`
+                         ;; from a JS regex-escape helper, and $& is a group reference.
+                         ;; The pattern is already quoted above; the replacement was not.
+                         (java.util.regex.Matcher/quoteReplacement (str v))))
           template
           tokens))
 
