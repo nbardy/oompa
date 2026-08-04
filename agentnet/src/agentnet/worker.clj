@@ -989,6 +989,31 @@
   (process/sh ["git" "worktree" "remove" wt-dir "--force"] {:dir project-root})
   (process/sh ["git" "branch" "-D" wt-branch] {:dir project-root}))
 
+(defn- preserve-merge-failure-salvage!
+  "On merge failure, keep the approved work reachable instead of destroying it.
+
+   Audit (run 9f004a39): worker w7's round-2 APPROVED deliverable (an
+   art-direction doc + four visual fixes, 2.5h of work) ended outcome
+   merge-failed and its worktree was cleaned up unconditionally — the content
+   exists in no git ref today. Never cleanup on merge failure; pin the branch
+   head under a salvage ref (create-iteration-worktree! force-deletes stale
+   oompa/* branches on restart, so the worktree branch alone is not safe) and
+   leave the worktree in place.
+
+   Creates refs/heads/salvage/{swarm-id}-{worker-id}-c{cycle} at the worktree
+   branch head. Prints the surviving worktree path and ref name. A failure to
+   create the ref is reported loudly (no silent fallback)."
+  [project-root swarm-id worker-id cycle wt-state]
+  (let [salvage-branch (format "salvage/%s-%s-c%d" (or swarm-id "unknown") worker-id cycle)
+        result (process/sh ["git" "branch" "-f" salvage-branch (:branch wt-state)]
+                           {:dir project-root :out :string :err :string})]
+    (if (zero? (:exit result))
+      (println (format "[%s] Merge failed — work preserved at ref refs/heads/%s; worktree left for salvage: %s"
+                       worker-id salvage-branch (:path wt-state)))
+      (println (format "[%s] Merge failed — could NOT create salvage ref %s (%s); worktree left for salvage: %s"
+                       worker-id salvage-branch
+                       (str/trim (str (:err result))) (:path wt-state))))))
+
 (defn- get-head-hash
   "Get the short HEAD commit hash."
   [dir]
@@ -1253,6 +1278,13 @@
 ;; This keeps workers alive while planners/designers ramp up the queue.
 (def ^:private wait-poll-interval 10)
 (def ^:private max-consecutive-errors 5)
+;; Merge signaled with changes but no claimed tasks is an agent PROTOCOL error,
+;; not a worker-fatal condition. Audit (runs 80a33337/9f004a39): treating the
+;; first occurrence as fatal killed 32 of 36 worker-lifetimes and burned 11.8h
+;; (32% of all worker time). The cycle is recycled instead; only after this
+;; many occurrences does the worker fall through to the old fatal stop, so a
+;; pathological agent cannot loop forever.
+(def ^:private max-merge-no-claim-events 3)
 
 (defn- backoff-sleep! [id errors]
   (when (< errors max-consecutive-errors)
@@ -1328,7 +1360,8 @@
            attempt 1
            completed 0
            consec-errors 0
-           metrics {:merges 0 :rejections 0 :errors 0 :recycled 0 :review-rounds-total 0 :claims 0}
+           metrics {:merges 0 :rejections 0 :errors 0 :recycled 0 :review-rounds-total 0 :claims 0
+                    :merge-no-claim 0}
            session-id nil
            wt-state nil
            claimed-ids #{}
@@ -1488,14 +1521,29 @@
                              (not (seq active-claimed-ids))
                              (not (auto-mergeable-diff? (:path wt-state)
                                                         (:auto-merge-paths worker))))
-                      (do
-                        (println (format "[%s] Merge signaled with changes but no claimed tasks; leaving worktree for salvage and stopping worker" id))
+                      ;; Protocol error: merge signaled with changes but no
+                      ;; claimed tasks. Audit (runs 80a33337/9f004a39): stopping
+                      ;; the worker on the FIRST occurrence killed 32 of 36
+                      ;; worker-lifetimes (11.8h = 32% of all worker time).
+                      ;; Recycle the cycle like the rejection path below —
+                      ;; leaving the worktree for salvage — and only stop after
+                      ;; max-merge-no-claim-events occurrences.
+                      (let [occurrences (inc (:merge-no-claim metrics))
+                            metrics (-> metrics
+                                        (assoc :merge-no-claim occurrences)
+                                        (update :errors inc))
+                            fatal? (>= occurrences max-merge-no-claim-events)]
+                        (println (format "[%s] Merge signaled with changes but no claimed tasks (occurrence %d/%d); leaving worktree for salvage%s"
+                                         id occurrences max-merge-no-claim-events
+                                         (if fatal? " and stopping worker" " and recycling cycle")))
                         (emit!
                                          {:timing-ms cycle-timing
                                           :outcome :error
                                           :claimed-task-ids []
                                           :error-snippet "merge signaled with changes but no claimed tasks"})
-                        (finish :error))
+                        (if fatal?
+                          (finish :error)
+                          (recur (inc cycle) 1 (inc completed) 0 metrics nil nil #{} nil [])))
                       (if (worktree-has-changes? (:path wt-state))
                       (if (auto-mergeable-diff? (:path wt-state) (:auto-merge-paths worker))
                         (let [all-claimed active-claimed-ids]
@@ -1518,7 +1566,13 @@
                                               :claimed-task-ids (vec all-claimed)
                                               :recycled-tasks (seq recycled)
                                               :review-rounds 0})
-                            (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                            ;; Cleanup ONLY on successful merge — a failed merge
+                            ;; must leave the work reachable (see
+                            ;; preserve-merge-failure-salvage!, audit run
+                            ;; 9f004a39 w7-c2 lost-work incident).
+                            (if merged?
+                              (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                              (preserve-merge-failure-salvage! project-root swarm-id id cycle wt-state))
                             (recur (inc cycle) 1 (inc completed) 0 metrics nil nil #{} nil [])))
                               (let [{:keys [approved? attempts timing]} (review-loop! worker (:path wt-state) id cycle {:cycle-timing cycle-timing :session-id new-session-id})
                                     cycle-timing (or timing cycle-timing)
@@ -1543,7 +1597,13 @@
                                                 :claimed-task-ids (vec all-claimed)
                                                 :recycled-tasks (seq recycled)
                                                 :review-rounds (or attempts 0)})
-                              (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                              ;; Cleanup ONLY on successful merge. Audit run
+                              ;; 9f004a39: worker w7's round-2 APPROVED
+                              ;; deliverable was destroyed here by an
+                              ;; unconditional cleanup after merge failure.
+                              (if merged?
+                                (cleanup-worktree! project-root (:dir wt-state) (:branch wt-state))
+                                (preserve-merge-failure-salvage! project-root swarm-id id cycle wt-state))
                               (recur (inc cycle) 1 (inc completed) 0 metrics nil nil #{} nil []))
                             (let [recycled (recycle-active-claims! id claimed-ids mv-claimed-tasks)
                                   metrics (update metrics :recycled + (count recycled))]
@@ -1659,15 +1719,99 @@
 ;; Multi-Worker Execution
 ;; =============================================================================
 
+(defn- swarm-pid-alive?
+  "Probe pid liveness by shelling out to `kill -0` and checking the exit code.
+   (ProcessHandle/of is not available in babashka.)"
+  [pid]
+  (zero? (:exit (process/sh ["kill" "-0" (str pid)]
+                            {:out :string :err :string}))))
+
+(defn- live-prior-swarms
+  "Scan runs/*/started.json entries that lack a sibling stopped.json and whose
+   recorded pid is still alive. Returns [{:swarm-id .. :pid ..}].
+   Excludes the current process's own run entry — cmd-swarm writes started.json
+   before workers launch, so the caller's own pid always shows up here."
+  []
+  (let [self-pid (.pid (java.lang.ProcessHandle/current))]
+    (->> (or (runs/list-runs) [])
+         (keep (fn [rid]
+                 (when (nil? (runs/read-stopped rid))
+                   (when-let [started (runs/read-started rid)]
+                     (let [pid (:pid started)]
+                       (when (and pid
+                                  (not= (long pid) (long self-pid))
+                                  (swarm-pid-alive? pid))
+                         {:swarm-id rid :pid pid}))))))
+         vec)))
+
+(defn ensure-single-swarm!
+  "Refuse to start when another live swarm is already running against this repo.
+
+   Audit (runs 80a33337/9f004a39): two swarms overlapped 2h21m on one queue,
+   manufacturing stale-base diffs (18/22 round-1 review rejections),
+   double-claims, and a 68-minute duplicate implementation of an already-merged
+   task. Startup previously only printed a stale-claims warning.
+
+   Escape hatches: force? true (CLI --force) or env OOMPA_FORCE_SWARM=1.
+   Throws ex-info naming the live run id and pid when refusing."
+  [force?]
+  (let [forced? (or force? (= "1" (System/getenv "OOMPA_FORCE_SWARM")))
+        live (live-prior-swarms)]
+    (when (seq live)
+      (if forced?
+        (println (format "WARNING: single-swarm lock bypassed (--force / OOMPA_FORCE_SWARM=1); live swarm(s): %s"
+                         (str/join ", " (map #(format "%s (pid %s)" (:swarm-id %) (:pid %)) live))))
+        (let [{:keys [swarm-id pid]} (first live)]
+          (println (format "ERROR: swarm %s (pid %s) appears to be running against this repo." swarm-id pid))
+          (println "       Two overlapping swarms on one queue manufacture stale-base diffs, double-claims,")
+          (println "       and duplicate implementations (audit: runs 80a33337/9f004a39, 2h21m overlap).")
+          (println (format "       Stop it first (kill %s), or re-run with --force / OOMPA_FORCE_SWARM=1" pid))
+          (println "       if you are certain it is not doing real work.")
+          (throw (ex-info (format "another swarm is already running: %s (pid %s) — stop it or use --force / OOMPA_FORCE_SWARM=1"
+                                  swarm-id pid)
+                          {:live-swarms live})))))))
+
+(defn- worker-terminal-outcome
+  "Slim JSON-serializable terminal record for one worker's final state,
+   persisted into stopped.json so a dead run is diagnosable from the event
+   log alone (audit: runs 80a33337/9f004a39 recorded reason \"completed\",
+   error nil, while every worker had terminated in an error state)."
+  [result]
+  (cond-> {:id (or (:id result) "unknown")
+           :status (name (or (:status result) :unknown))}
+    (contains? result :cycles-completed) (assoc :cycles-completed (:cycles-completed result))
+    (contains? result :merges) (assoc :merges (:merges result))
+    (contains? result :errors) (assoc :errors (:errors result))
+    (contains? result :rejections) (assoc :rejections (:rejections result))
+    (contains? result :recycled) (assoc :recycled (:recycled result))
+    (contains? result :claims) (assoc :claims (:claims result))
+    (:error result) (assoc :error (:error result))))
+
+(defn- stopped-reason
+  "Honest stop reason for stopped.json. \"completed\" is reserved for a
+   genuinely drained queue; when ZERO workers ended :completed and pending
+   tasks remain, the swarm died, and the reason says so."
+  [results pending-count]
+  (let [any-completed? (boolean (some #(= :completed (:status %)) results))]
+    (if (and (not any-completed?) (pos? pending-count))
+      :workers-exhausted
+      :completed)))
+
 (defn run-workers!
   "Run multiple workers in parallel.
    Writes stopped event to runs/{swarm-id}/stopped.json on completion.
 
    Arguments:
      workers - seq of worker configs
+     opts    - optional {:force? bool} — bypass the single-swarm startup lock
+               (equivalent to CLI --force / env OOMPA_FORCE_SWARM=1)
 
    Returns seq of final worker states."
-  [workers]
+  ([workers] (run-workers! workers {}))
+  ([workers {:keys [force?]}]
+  ;; Single-swarm lock — refuse to overlap a live prior swarm (Defect: two
+  ;; overlapping swarms manufactured stale-base diffs and double-claims).
+  (ensure-single-swarm! force?)
   (tasks/ensure-dirs!)
   (let [swarm-id (-> workers first :swarm-id)
         stale-current (tasks/list-current)]
@@ -1731,12 +1875,25 @@
                           :ReviewRounds :ImplMs :ReviewMs :FixMs :HarnessMs :TotalMs]
                          rows))
 
-          ;; Write stopped event — all state derivable from cycle logs
+          ;; Write stopped event — per-worker terminal outcomes plus an HONEST
+          ;; reason. Audit (runs 80a33337/9f004a39): both dead runs recorded
+          ;; reason "completed", error nil, although every worker terminated in
+          ;; an error state and pending tasks remained — nothing alerted for
+          ;; ~20h. "completed" is now reserved for a genuinely drained queue.
           (when swarm-id
-            (runs/write-stopped! swarm-id :completed)
-            (println (format "\nStopped event written to runs/%s/stopped.json" swarm-id)))
+            (let [worker-outcomes (mapv worker-terminal-outcome results)
+                  pending (tasks/pending-count)
+                  reason (stopped-reason results pending)]
+              (runs/write-stopped! swarm-id reason
+                                   :worker-outcomes worker-outcomes
+                                   :pending-count pending)
+              (when (= :workers-exhausted reason)
+                (println (format "\nWARNING: all %d workers terminated without completing and %d task(s) remain pending."
+                                 (count results) pending)))
+              (println (format "\nStopped event written to runs/%s/stopped.json (reason: %s)"
+                               swarm-id (name reason)))))
 
-          results)))))
+          results))))))
 
 ;; =============================================================================
 ;; Planner — first-class config concept, NOT a worker

@@ -25,7 +25,7 @@ Oompa writes exactly four types of events, at two levels:
 | Event | File | Written | Records |
 |-------|------|---------|---------|
 | **Started** | `started.json` | Once, at swarm launch | What was configured, when it began, orchestrator PID |
-| **Stopped** | `stopped.json` | Once, at clean swarm exit | When it ended, why (completed / interrupted / error) |
+| **Stopped** | `stopped.json` | Once, at swarm exit | When it ended, why (completed / workers-exhausted / interrupted / error), per-worker terminal outcomes, pending-count. `completed` is reserved for a genuinely drained queue; `workers-exhausted` means zero workers ended `:completed` and pending tasks remained (audit: runs 80a33337/9f004a39 recorded `completed` while every worker had died) |
 
 ### Worker-level events
 

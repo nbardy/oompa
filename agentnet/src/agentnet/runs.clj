@@ -88,13 +88,23 @@
 ;; =============================================================================
 
 (defn write-stopped!
-  "Write the stopped event when a swarm exits cleanly."
-  [swarm-id reason & {:keys [error]}]
+  "Write the stopped event when a swarm exits.
+   reason: :completed (genuinely drained queue), :workers-exhausted (zero
+   workers ended :completed and pending tasks remain), :interrupted, :error.
+   Optional:
+     :worker-outcomes — per-worker terminal outcome maps ({:id :status ...})
+     :pending-count   — tasks still pending at stop time
+   Audit (runs 80a33337/9f004a39): stopped.json previously always said
+   \"completed\"/error nil even when every worker died in an error state, so
+   dead runs went unnoticed for ~20h."
+  [swarm-id reason & {:keys [error worker-outcomes pending-count]}]
   (write-json! (str (run-dir swarm-id) "/stopped.json")
-               {:swarm-id swarm-id
-                :stopped-at (str (java.time.Instant/now))
-                :reason (name reason)
-                :error error}))
+               (cond-> {:swarm-id swarm-id
+                        :stopped-at (str (java.time.Instant/now))
+                        :reason (name reason)
+                        :error error}
+                 worker-outcomes (assoc :worker-outcomes worker-outcomes)
+                 (some? pending-count) (assoc :pending-count pending-count))))
 
 ;; =============================================================================
 ;; Review Log — written after each review round

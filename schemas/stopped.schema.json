@@ -2,14 +2,34 @@
   "$schema": "http://json-schema.org/draft-07/schema#",
   "$id": "https://github.com/nbardy/oompa_loompas/schemas/stopped.schema.json",
   "title": "OompaStopped",
-  "description": "Swarm stopped event. Written once at clean exit. File: runs/{swarm-id}/stopped.json",
+  "description": "Swarm stopped event. Written once at exit. File: runs/{swarm-id}/stopped.json. reason 'completed' is reserved for a genuinely drained queue; 'workers-exhausted' means zero workers ended :completed and pending tasks remained (audit: runs 80a33337/9f004a39 recorded 'completed' while every worker had died).",
   "type": "object",
   "required": ["swarm-id", "stopped-at", "reason"],
   "properties": {
     "swarm-id": { "type": "string" },
     "stopped-at": { "type": "string", "format": "date-time" },
-    "reason": { "type": "string", "enum": ["completed", "interrupted", "error"] },
-    "error": { "type": ["string", "null"] }
+    "reason": { "type": "string", "enum": ["completed", "workers-exhausted", "interrupted", "error"] },
+    "error": { "type": ["string", "null"] },
+    "pending-count": { "type": "integer", "minimum": 0 },
+    "worker-outcomes": {
+      "type": "array",
+      "items": {
+        "type": "object",
+        "required": ["id", "status"],
+        "properties": {
+          "id": { "type": "string" },
+          "status": { "type": "string" },
+          "cycles-completed": { "type": "integer" },
+          "merges": { "type": "integer" },
+          "errors": { "type": "integer" },
+          "rejections": { "type": "integer" },
+          "recycled": { "type": "integer" },
+          "claims": { "type": "integer" },
+          "error": { "type": ["string", "null"] }
+        },
+        "additionalProperties": false
+      }
+    }
   },
   "additionalProperties": false
 }

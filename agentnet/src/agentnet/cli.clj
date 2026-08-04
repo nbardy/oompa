@@ -76,6 +76,7 @@
                :model nil
                :dry-run false
                :detach false
+               :force false
                :all false
                :config-file nil
                :startup-timeout nil
@@ -127,6 +128,12 @@
 
         (or (= arg "--detach") (= arg "--dettach"))
         (recur (assoc opts :detach true)
+               (next remaining))
+
+        ;; Bypass the single-swarm startup lock (see worker/ensure-single-swarm!).
+        ;; Equivalent env escape hatch: OOMPA_FORCE_SWARM=1.
+        (= arg "--force")
+        (recur (assoc opts :force true)
                (next remaining))
 
         (= arg "--all")
@@ -487,6 +494,7 @@
   [opts config-file]
   (cond-> ["nohup" "bb" "--classpath" (run-classpath) (run-script-path) "swarm"]
     (:dry-run opts) (conj "--dry-run")
+    (:force opts) (conj "--force")
     true (conj config-file)))
 
 (defn- spawn-detached!
@@ -1134,6 +1142,12 @@
     ;; Preflight: abort if git is dirty to prevent merge conflicts
     (check-git-clean!)
 
+    ;; Preflight: refuse to overlap a live prior swarm BEFORE the planner runs
+    ;; or started.json is written (audit: runs 80a33337/9f004a39 overlapped
+    ;; 2h21m — stale-base diffs, double-claims, duplicate implementation).
+    ;; Bypass with --force or OOMPA_FORCE_SWARM=1.
+    (worker/ensure-single-swarm! (:force opts))
+
     (let [config (json/parse-string (slurp f) true)
           ;; Parse reviewer config — supports legacy + new formats.
           generic-reviewers (parse-reviewers-config config)
@@ -1250,7 +1264,7 @@
         (worker/run-planner! (assoc planner-parsed :swarm-id swarm-id)))
 
       ;; Run workers using new worker module
-      (worker/run-workers! workers))))
+      (worker/run-workers! workers {:force? (:force opts)}))))
 
 (defn cmd-tasks
   "Show task status"
@@ -1388,6 +1402,7 @@
   (println "  --all                    Show full history for list command")
   (println "  --config PATH            Config file for run/swarm")
   (println "  --detach                 Run in background (run command)")
+  (println "  --force                  Bypass the single-swarm startup lock (also OOMPA_FORCE_SWARM=1)")
   (println "  --startup-timeout N      Detached startup validation window in seconds")
   (println "  --iterations N           [DEPRECATED] legacy 'run'/'loop' only; sets per-worker max_cycle.")
   (println "                           Superseded by cycle + per-cycle budget (max_resumes) + goal drive.")
