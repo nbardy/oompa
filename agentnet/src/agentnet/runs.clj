@@ -165,6 +165,33 @@
                     :timing-ms timing-ms}))))
 
 ;; =============================================================================
+;; Worker State — live per-worker liveness for dashboards
+;; =============================================================================
+
+(defn write-worker-state!
+  "Write runs/{swarm-id}/workers/{worker-id}.json — the worker's LIVE state.
+
+   This is the one deliberate exception to \"no mutable summary files\": cycle
+   logs are only written at cycle END, so mid-cycle there is no record that a
+   worker is alive. Dashboards that derived status from the latest cycle file
+   rendered a worker red/'done' for its entire next cycle after one bad cycle
+   (observed run a98d3b2e: all three workers shown dead + 'All idle' while all
+   three were mid-cycle-2). Overwritten at every cycle start and at worker
+   terminal stop; atomic rename keeps readers consistent.
+
+   status: \"running\" (cycle in progress) | \"stopped\" (worker exited; :reason
+   carries the terminal status name, e.g. completed/error/fatal-error)."
+  [swarm-id worker-id {:keys [status cycle attempt reason]}]
+  (when swarm-id
+    (write-json! (str (run-dir swarm-id) "/workers/" worker-id ".json")
+                 (cond-> {:worker-id worker-id
+                          :status status
+                          :updated-at (str (java.time.Instant/now))}
+                   cycle (assoc :cycle cycle)
+                   attempt (assoc :attempt attempt)
+                   reason (assoc :reason reason)))))
+
+;; =============================================================================
 ;; Read helpers (for cmd-status, dashboards)
 ;; =============================================================================
 

@@ -1384,6 +1384,11 @@
            claim-resume-prompt nil
            signals []]
       (let [finish (fn [status]
+                     ;; Terminal record for dashboards — cycle files alone can't
+                     ;; distinguish "errored, retrying" from "errored, gave up".
+                     (runs/write-worker-state! swarm-id id
+                                               {:status "stopped" :reason (name status)
+                                                :cycle (dec cycle)})
                      (assoc worker :completed completed
                                    :cycles-completed (dec cycle)
                                    :status status
@@ -1462,6 +1467,12 @@
                                          id
                                          (if (= attempt 1) "Starting" "Resuming")
                                          (inc completed) cycle-cap attempt resume-cap))
+                      ;; Liveness heartbeat: written at every cycle/attempt start so
+                      ;; dashboards see "running" instead of the last cycle's outcome.
+                      _ (runs/write-worker-state! swarm-id id
+                                                  {:status "running"
+                                                   :cycle (inc completed)
+                                                   :attempt attempt})
                       context (build-context)
                       agent-start-ms (now-ms)
                       {:keys [output exit done? merge? merge-notes needs-followup? claim-ids parse-warning raw-snippet] :as agent-result}
