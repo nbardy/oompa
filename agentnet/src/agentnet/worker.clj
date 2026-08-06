@@ -779,7 +779,10 @@
     ;; bootstrap means no node_modules, which burns the whole cycle budget on a
     ;; doomed npm install (documented swarm-killer). Loud failure, no fallback:
     ;; a broken bootstrap fails the cycle here with the script's stderr.
-    (let [bootstrap (str project-root "/scripts/worktree-bootstrap.sh")]
+    ;; NB: invoke the WORKTREE's copy of the script, not the primary's — it
+    ;; self-locates via BASH_SOURCE, so the primary's copy would resolve
+    ;; WORKTREE_ROOT to the primary checkout and silently no-op.
+    (let [bootstrap (str wt-path "/scripts/worktree-bootstrap.sh")]
       (when (.exists (java.io.File. bootstrap))
         (let [result (process/sh [bootstrap] {:dir wt-path :out :string :err :string})]
           (when-not (zero? (:exit result))
