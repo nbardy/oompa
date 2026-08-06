@@ -157,7 +157,10 @@
 (defn- gemini-alias?
   [harness-kw]
   (and (keyword? harness-kw)
-       (re-matches #"^gemini\\d+$" (name harness-kw))))
+       ;; NB: #"..." is already a raw regex literal — `\\d` matched a literal
+       ;; backslash + 'd', so this NEVER matched. gemini1-3 only worked because
+       ;; they are explicit registry keys; gemini4+ threw "Unknown harness".
+       (re-matches #"^gemini\d+$" (name harness-kw))))
 
 (defn valid-harness?
   "True for explicit registry entries and any `geminiNN` alias."
