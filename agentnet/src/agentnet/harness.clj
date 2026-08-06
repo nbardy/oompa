@@ -144,6 +144,11 @@
     :claude   {:stdin :prompt  :session :uuid      :output :plain  :drive :resume}
     :opencode {:stdin :close   :session :extracted  :output :ndjson :drive :resume}
     :cursor   {:stdin :close   :session :extracted  :output :ndjson :drive :resume}
+    ;; muse: oompa generates the session UUID and passes --session-id on every
+    ;; turn (create and resume use the same flag — see agent-cli muse.ts), so
+    ;; :session is :uuid, not :extracted. Probed 2026-08-06:
+    ;; `agent-cli run --harness muse --model muse-spark-1.2-contributor` → PROBE_OK.
+    :muse     {:stdin :close   :session :uuid      :output :ndjson :drive :resume}
     :gemini   gemini-behavior}
    {:gemini1 gemini-behavior
     :gemini2 gemini-behavior
