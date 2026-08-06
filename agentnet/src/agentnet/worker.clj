@@ -773,6 +773,19 @@
       (when-not (zero? (:exit result))
         (throw (ex-info (str "Failed to create worktree: " (:err result))
                         {:dir wt-dir :branch wt-branch}))))
+    ;; Deterministic worktree setup: if the repo ships scripts/worktree-bootstrap.sh,
+    ;; the FRAMEWORK runs it here — before the agent ever starts — instead of
+    ;; trusting every model to obey a "STEP ZERO: run this" prompt line. A missed
+    ;; bootstrap means no node_modules, which burns the whole cycle budget on a
+    ;; doomed npm install (documented swarm-killer). Loud failure, no fallback:
+    ;; a broken bootstrap fails the cycle here with the script's stderr.
+    (let [bootstrap (str project-root "/scripts/worktree-bootstrap.sh")]
+      (when (.exists (java.io.File. bootstrap))
+        (let [result (process/sh [bootstrap] {:dir wt-path :out :string :err :string})]
+          (when-not (zero? (:exit result))
+            (throw (ex-info (str "worktree bootstrap failed (exit " (:exit result) "): "
+                                 (str/trim (str (:err result) " " (:out result))))
+                            {:dir wt-dir :script bootstrap}))))))
     {:dir wt-dir :branch wt-branch :path wt-path}))
 
 (defn- detect-claimed-tasks
