@@ -1559,10 +1559,24 @@
                             metrics (-> metrics
                                         (assoc :merge-no-claim occurrences)
                                         (update :errors inc))
-                            fatal? (>= occurrences max-merge-no-claim-events)]
-                        (println (format "[%s] Merge signaled with changes but no claimed tasks (occurrence %d/%d); leaving worktree for salvage%s"
+                            fatal? (>= occurrences max-merge-no-claim-events)
+                            ;; Bounce instead of recycle: resume the SAME session in
+                            ;; the SAME worktree with a corrective prompt. Recycling
+                            ;; threw away the finished work along with the session —
+                            ;; runs c0c0c6ae/f72d78d0 burned ~half of all muse cycles
+                            ;; on exactly this (work done, CLAIM never emitted). The
+                            ;; resume-cap still bounds the attempt chain, and the
+                            ;; 3-strike fatal stays for workers that never comply.
+                            bounce-prompt (str "PROTOCOL ERROR: you signaled COMPLETE_AND_READY_FOR_MERGE "
+                                               "with a non-empty diff but no claimed task, so the merge was refused. "
+                                               "Your work is still present in this worktree. Reply with ONLY the claim "
+                                               "signal for the pending task your diff implements, e.g. CLAIM(task-id) "
+                                               "— choose from the pending list for your role shown in your context. "
+                                               "After the framework confirms the claim, re-signal COMPLETE_AND_READY_FOR_MERGE.")]
+                        (println (format "[%s] Merge signaled with changes but no claimed tasks (occurrence %d/%d); %s"
                                          id occurrences max-merge-no-claim-events
-                                         (if fatal? " and stopping worker" " and recycling cycle")))
+                                         (if fatal? "leaving worktree for salvage and stopping worker"
+                                                    "bouncing back to worker for a corrective CLAIM")))
                         (emit!
                                          {:timing-ms cycle-timing
                                           :outcome :error
@@ -1570,7 +1584,8 @@
                                           :error-snippet "merge signaled with changes but no claimed tasks"})
                         (if fatal?
                           (finish :error)
-                          (recur (inc cycle) 1 (inc completed) 0 metrics nil nil #{} nil [])))
+                          (recur cycle (inc attempt) completed 0 metrics new-session-id wt-state
+                                 claimed-ids bounce-prompt (conj signals "merge-no-claim-bounce"))))
                       (if (worktree-has-changes? (:path wt-state))
                       (if (auto-mergeable-diff? (:path wt-state) (:auto-merge-paths worker))
                         (let [all-claimed active-claimed-ids]
