@@ -768,11 +768,25 @@
     ;; Clean stale worktree/branch from previous failed runs
     (process/sh ["git" "worktree" "remove" wt-dir "--force"] {:dir project-root})
     (process/sh ["git" "branch" "-D" wt-branch] {:dir project-root})
-    (let [result (process/sh ["git" "worktree" "add" wt-dir "-b" wt-branch]
-                             {:dir project-root :out :string :err :string})]
+    ;; Prefer simgit (`sg`) — it creates a REAL git linked worktree but clones
+    ;; the tree copy-on-write (APFS clonefile / btrfs-xfs reflink), so N agent
+    ;; worktrees cost ~1x the disk instead of N x. Measured on this repo
+    ;; 2026-08-15: 2.9s, mode "cow-clone", ~0 bytes physical vs 345MB for a
+    ;; plain checkout — 124 accumulated plain worktrees had eaten the disk down
+    ;; to 9.7Gi mid-run. Falls back to plain `git worktree add` (announced, not
+    ;; silent) when sg is absent or CoW is unavailable on this filesystem.
+    ;; NB: sg's argument order is BRANCH then PATH, the reverse of git's.
+    (let [sg? (zero? (:exit (process/sh ["which" "sg"] {:out :string :err :string})))
+          result (if sg?
+                   (process/sh ["sg" "worktree" "add" wt-branch wt-dir]
+                               {:dir project-root :out :string :err :string})
+                   (process/sh ["git" "worktree" "add" wt-dir "-b" wt-branch]
+                               {:dir project-root :out :string :err :string}))]
+      (when-not sg?
+        (println "[worktree] simgit (sg) not found; using plain git worktree (full-size checkout)"))
       (when-not (zero? (:exit result))
         (throw (ex-info (str "Failed to create worktree: " (:err result))
-                        {:dir wt-dir :branch wt-branch}))))
+                        {:dir wt-dir :branch wt-branch :via (if sg? "sg" "git")}))))
     ;; Deterministic worktree setup: if the repo ships scripts/worktree-bootstrap.sh,
     ;; the FRAMEWORK runs it here — before the agent ever starts — instead of
     ;; trusting every model to obey a "STEP ZERO: run this" prompt line. A missed
