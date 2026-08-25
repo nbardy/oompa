@@ -237,6 +237,18 @@ oompa help                  # Show all commands
 
 `./swarm.bb ...` works the same when running from a source checkout.
 
+## Disk-efficient worktrees
+
+Oompa prefers [`sg`](https://github.com/nbardy/simgit) when it is available on
+`PATH`. `sg` creates a real Git linked worktree and uses native copy-on-write
+clones on APFS and reflink-capable Linux filesystems, so unchanged tracked files
+share physical storage across workers. Oompa prints a warning and falls back to
+plain `git worktree add` when `sg` is unavailable.
+
+Ignored dependencies, caches, build products, model weights, and media are not
+made cheap by tracked-file CoW. Keep those behind the project's worktree
+bootstrap and cleanup policy, and run `oompa cleanup` after disposable swarms.
+
 ## Opencode Harness
 
 `opencode` workers use one-shot `opencode run --format json` calls with the same worker prompt tagging:
@@ -265,6 +277,8 @@ so downstream UIs can identify and group worker conversations.
 - Node.js 18+ (only for npm wrapper / npx usage)
 - [Babashka](https://github.com/babashka/babashka) (bb)
 - Git 2.5+ (for worktrees)
+- Optional but recommended: [`sg`](https://github.com/nbardy/simgit) for
+  disk-efficient copy-on-write worktrees
 - One of:
   - [Claude CLI](https://github.com/anthropics/claude-cli)
   - [Codex CLI](https://github.com/openai/codex)
