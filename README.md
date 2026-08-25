@@ -243,7 +243,7 @@ Oompa prefers [`sg`](https://github.com/nbardy/simgit) when it is available on
 `PATH`. `sg` creates a real Git linked worktree and uses native copy-on-write
 clones on APFS and reflink-capable Linux filesystems, so unchanged tracked files
 share physical storage across workers. Oompa prints a warning and falls back to
-plain `git worktree add` when `sg` is unavailable.
+plain `git worktree add` when `sg` or native CoW is unavailable.
 
 Ignored dependencies, caches, build products, model weights, and media are not
 made cheap by tracked-file CoW. Keep those behind the project's worktree

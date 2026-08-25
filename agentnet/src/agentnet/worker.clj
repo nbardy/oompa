@@ -777,16 +777,23 @@
     ;; silent) when sg is absent or CoW is unavailable on this filesystem.
     ;; NB: sg's argument order is BRANCH then PATH, the reverse of git's.
     (let [sg? (zero? (:exit (process/sh ["which" "sg"] {:out :string :err :string})))
-          result (if sg?
-                   (process/sh ["sg" "worktree" "add" wt-branch wt-dir]
-                               {:dir project-root :out :string :err :string})
-                   (process/sh ["git" "worktree" "add" wt-dir "-b" wt-branch]
-                               {:dir project-root :out :string :err :string}))]
+          sg-result (when sg?
+                      (process/sh ["sg" "worktree" "add" "--require-cow" wt-branch wt-dir]
+                                  {:dir project-root :out :string :err :string}))
+          result (if (and sg? (zero? (:exit sg-result)))
+                   sg-result
+                   (do
+                     (when sg?
+                       (println (str "[worktree] simgit CoW unavailable; using plain git worktree "
+                                     "(full-size checkout): " (str/trim (:err sg-result)))))
+                     (process/sh ["git" "worktree" "add" wt-dir "-b" wt-branch]
+                                 {:dir project-root :out :string :err :string})))]
       (when-not sg?
         (println "[worktree] simgit (sg) not found; using plain git worktree (full-size checkout)"))
       (when-not (zero? (:exit result))
         (throw (ex-info (str "Failed to create worktree: " (:err result))
-                        {:dir wt-dir :branch wt-branch :via (if sg? "sg" "git")}))))
+                        {:dir wt-dir :branch wt-branch
+                         :via (if (and sg? (zero? (:exit sg-result))) "sg" "git")}))))
     ;; Deterministic worktree setup: if the repo ships scripts/worktree-bootstrap.sh,
     ;; the FRAMEWORK runs it here — before the agent ever starts — instead of
     ;; trusting every model to obey a "STEP ZERO: run this" prompt line. A missed
