@@ -322,8 +322,10 @@ canonical tasks without launching a model. Run from the target project with
 The endpoint and bearer must come from the supported scoped Buddy runtime.
 Never save a bearer in configuration, use the owner's HTTP credentials, or open
 Buddy database files. Missing, expired or denied authority stops explicitly;
-there is no local-queue fallback. A turn-scoped bearer is not a durable daemon
-credential: unattended renewal needs a supported runtime grant lifecycle.
+there is no local-queue fallback. A turn-scoped bearer ends with its chat. For unattended work use the Buddy
+host's owner-authorized `oompa` launch tool, which creates a separate task-scoped
+connection lasting only that run (up to twelve hours). It survives chat completion
+and backend replacement; stop, exit and deadline revoke it.
 
 Only explicit task IDs belonging to the configured Buddy and workspace are
 admitted. Claims compare the observed revision and preserve the accountable
@@ -339,6 +341,18 @@ An empty runnable set with unfinished canonical tasks reports
 in-progress tasks stay held until their owner reconciles the original run;
 Oompa must not silently recycle another executor's claim.
 
-This fork establishes the task/workspace adapter, not a replacement for the live
-wave_sim delivery controller. Task acceptance, supported grant renewal and the
-controller's next-task loop must be proven before switching the beta run.
+For deterministic delivery use top-level `task_execution`: `wall_time_seconds`,
+`attempt_timeout_seconds`, `validators` keyed by canonical task ID and optional
+`prepare_only_task_ids`. A validator contains argv `command`, `timeout_seconds`
+and a nonempty `source_files` map of owner-pinned SHA-256 values. The host executes
+the source-bound consumer once, verifies its typed verdict and clean source,
+fast-forwards the integration checkout, then CAS-accepts the task. Configured code
+review runs before the full consumer; its verdict cannot accept physics.
+
+Rejected work keeps its native model session and Cambium source. Held work stays
+in the existing run recovery record while independent tasks advance; an empty
+runnable set is polled until the shared deadline. Missing validators permit only
+explicit preparation/review. Final completion requires every selected canonical
+task actually done, including the parent when it is included as an observed gate.
+The wave_sim all-beta example lives at `oompa/beta/all.json` in that repository.
+Its source, account, physical and human acceptance requirements remain unchanged.
