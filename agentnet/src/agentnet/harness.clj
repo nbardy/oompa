@@ -194,13 +194,18 @@
   "Attach harness-specific extraArgs to the JSON input map.
    Only opencode needs extra flags (--format json, --attach)."
   [m harness-kw opts]
-  (if (= harness-kw :opencode)
+  (if (= harness-kw :claude)
+    (if-let [effort (:reasoning opts)]
+      (-> m (dissoc :reasoning :reasoningEffort)
+          (assoc :extraArgs ["--effort" effort]))
+      m)
+    (if (= harness-kw :opencode)
     (let [url (opencode-attach-url)
           extra (cond-> []
                   (:format? opts) (into ["--format" "json" "--print-logs" "--log-level" "WARN"])
                   url             (into ["--attach" url]))]
       (if (seq extra) (assoc m :extraArgs extra) m))
-    m))
+    m)))
 
 (defn resume-drive?
   "Per-turn dispatch: should this turn RESUME the existing session (vs create a

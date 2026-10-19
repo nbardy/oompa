@@ -576,7 +576,7 @@
         abs-wt (.getAbsolutePath (io/file worktree-path))
 
         ;; Try each reviewer until one succeeds and returns a verdict
-        result (reduce (fn [_ {:keys [harness model prompts]}]
+        result (reduce (fn [_ {:keys [harness model reasoning prompts]}]
                          (let [custom-prompt (when (seq prompts)
                                                (->> prompts
                                                     (map load-prompt)
@@ -592,7 +592,7 @@
                                               :history_block (or history-block "")})
                                review-prompt (tag-prompt swarm-id id review-body)
                                res (try
-                                        (harness/run-command! harness {:cwd abs-wt :model model :prompt review-prompt})
+                                        (harness/run-command! harness {:cwd abs-wt :model model :reasoning reasoning :prompt review-prompt})
                                         (catch Exception e
                                           {:exit -1 :out "" :err (.getMessage e)}))
                                parsed (harness/parse-output harness (:out res) nil)
