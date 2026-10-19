@@ -37,6 +37,8 @@
             [agentnet.worktree :as worktree]
             [agentnet.cambium :as cambium]
             [agentnet.runs :as runs]
+            [agentnet.task-execution :as execution]
+            [agentnet.bounded-process :as bounded]
             [babashka.process :as process]
             [cheshire.core :as json]
             [clojure.java.io :as io]
@@ -236,13 +238,15 @@
   [{:keys [id swarm-id harness model max-cycles prompts can-plan reasoning
            reviewers wait-between
            max-wait-for-tasks max-resumes
-           role can-claim-gpu auto-merge-paths]}]
+           role can-claim-gpu auto-merge-paths task-execution resume-swarm-id]}]
   {:id id
    :swarm-id swarm-id
    :harness (or harness :codex)
    :model model
    :role role
    :can-claim-gpu (boolean can-claim-gpu)
+   :task-execution task-execution
+   :resume-swarm-id resume-swarm-id
    :max-cycles (or max-cycles 10)
    :prompts (cond
               (vector? prompts) prompts
@@ -451,7 +455,7 @@
    resume-prompt-override: when non-nil, replaces the default resume prompt
    (used to inject CLAIM results). All harness-specific CLI knowledge
    is delegated to harness/build-cmd."
-  [{:keys [id swarm-id harness model prompts reasoning]} worktree-path context session-id resume?
+  [{:keys [id swarm-id harness model prompts reasoning timeout-ms]} worktree-path context session-id resume?
    & {:keys [resume-prompt-override]}]
   (let [session-id (or session-id (harness/make-session-id harness))
         template-tokens (build-template-tokens context worktree-path)
@@ -506,7 +510,7 @@
                                        {:cwd abs-worktree :model model :reasoning reasoning
                                         :session-id session-id :resume? resume?
                                         :drive (turn-drive id harness resume?)
-                                        :prompt tagged-prompt :format? true})
+                                        :prompt tagged-prompt :format? true :timeout-ms timeout-ms})
                  (catch Exception e
                    (println (format "[%s] Agent exception: %s" id (.getMessage e)))
                    {:exit -1 :out "" :err (.getMessage e)}))
@@ -535,15 +539,20 @@
    Uses custom review-prompts when configured, otherwise falls back to default.
    prev-feedback: vector of previous review outputs (for multi-round context).
    Returns {:verdict :approved|:needs-changes, :comments [...], :output string}"
-  [{:keys [id swarm-id reviewers]} worktree-path prev-feedback]
+  [{:keys [id swarm-id reviewers timeout-ms deadline-ms review-base selected-task]} worktree-path prev-feedback]
   (let [start-ms (System/currentTimeMillis)
+        git-run (fn [argv]
+                  (let [opts {:dir worktree-path :out :string :err :string}]
+                    (if timeout-ms
+                      (bounded/run! argv opts (max 1 (min timeout-ms
+                                                        (if deadline-ms (execution/remaining-ms deadline-ms) timeout-ms))))
+                      (process/sh argv opts))))
         ;; -U10 gives 10 lines of context (vs default 3) so reviewer sees more
         ;; surrounding code without needing to shell out and read files.
         ;; -W extends hunks to show the enclosing function for each change.
         ;; 24000 char limit gives ~500-600 lines of diff — enough for most PRs
         ;; to be reviewed without tool calls to read files.
-        diff-result (process/sh ["git" "diff" "-U10" "-W" "main"]
-                                {:dir worktree-path :out :string :err :string})
+        diff-result (git-run ["git" "diff" "-U10" "-W" (or review-base "main")])
         diff-content (let [d (:out diff-result)]
                        (if (> (count d) 24000)
                          (str (subs d 0 24000) "\n... [diff truncated at 24000 chars]")
@@ -552,8 +561,7 @@
         ;; Recently MERGED subject lines on main (not the worker's own branch
         ;; commits — use the `main` ref). This gives the reviewer pacing context
         ;; so it can flag a diff that duplicates or churns work already merged.
-        merged-log (-> (process/sh ["git" "log" "-n" "10" "--format=%s" "main"]
-                                   {:dir worktree-path :out :string :err :string})
+        merged-log (-> (git-run ["git" "log" "-n" "10" "--format=%s" (or review-base "main")])
                        :out str/trim)
         merged-section (when (seq merged-log)
                          (str "\n## Recently merged work on main (last 10)\n\n"
@@ -582,8 +590,12 @@
                                                     (map load-prompt)
                                                     (remove nil?)
                                                     (str/join "\n\n")))
-                               review-base (or custom-prompt
-                                                "Review the changes in this worktree.\nFocus on architecture and design, not style.\n")
+                               review-base (str (or custom-prompt
+                                                    "Review the changes in this worktree.\nFocus on architecture and design, not style.\n")
+                                                (when selected-task
+                                                  (str "\nCanonical task and original done criteria:\n"
+                                                       (json/generate-string (dissoc selected-task :_file))
+                                                       "\nReview only this committed candidate. Do not modify source, merge, or change task status.\n")))
                                review-body (load-framework-prompt
                                              "reviewer.md"
                                              {:base review-base
@@ -592,7 +604,12 @@
                                               :history_block (or history-block "")})
                                review-prompt (tag-prompt swarm-id id review-body)
                                res (try
-                                        (harness/run-command! harness {:cwd abs-wt :model model :reasoning reasoning :prompt review-prompt})
+                                        (harness/run-command! harness
+                                                              {:cwd abs-wt :model model :reasoning reasoning :prompt review-prompt
+                                                               :timeout-ms (when timeout-ms
+                                                                             (max 1 (if deadline-ms
+                                                                                      (min timeout-ms (execution/remaining-ms deadline-ms))
+                                                                                      timeout-ms)))})
                                         (catch Exception e
                                           {:exit -1 :out "" :err (.getMessage e)}))
                                parsed (harness/parse-output harness (:out res) nil)
@@ -602,14 +619,14 @@
                                                 (re-find #"VERDICT:\s*REJECTED" output)
                                                 (re-find #"(?i)\bAPPROVED\b" output))]
                            (if (and (= (:exit res) 0) has-verdict?)
-                             (reduced res)
+                             (reduced (assoc res :parsed-output output))
                              (do
                                (println (format "[%s] Reviewer %s failed or returned no verdict, falling back..." id model))
                                res))))
                        {:exit -1 :out "" :err "No reviewers configured or no verdict returned"}
                        reviewers)
 
-        output (:out result)
+        output (or (:parsed-output result) (:out result) "")
 
         ;; Parse verdict
         verdict (cond
@@ -626,6 +643,7 @@
                        (if (> (count output) 300) "..." ""))))
 
     {:verdict verdict
+     :exit (:exit result)
      :comments (when (not= (:exit result) 0)
                  [(:err result)])
      :output output
@@ -790,7 +808,10 @@
     ;; WORKTREE_ROOT to the primary checkout and silently no-op.
     (let [bootstrap (str wt-path "/scripts/worktree-bootstrap.sh")]
       (when (.exists (java.io.File. bootstrap))
-        (let [result (process/sh [bootstrap] {:dir wt-path :out :string :err :string})]
+        (let [result (if cambium/*deadline-ms*
+                       (bounded/run! [bootstrap] {:dir wt-path :out :string :err :string}
+                                     (max 1 (execution/remaining-ms cambium/*deadline-ms*)))
+                       (process/sh [bootstrap] {:dir wt-path :out :string :err :string}))]
           (when-not (zero? (:exit result))
             (throw (ex-info (str "worktree bootstrap failed (exit " (:exit result) "): "
                                  (str/trim (str (:err result) " " (:out result))))
@@ -1360,7 +1381,7 @@
     (println (format "[%s] Sleeping %ds before next iteration" worker-id wait-between))
     (Thread/sleep (* wait-between 1000))))
 
-(defn run-worker!
+(defn- run-queue-worker!
   "Run worker loop with persistent sessions.
 
    A cycle is one complete unit of work: claim → implement → review → merge/reject.
@@ -1780,6 +1801,281 @@
                       (recur cycle (inc attempt) completed 0 metrics new-session-id wt-state
                              active-claimed-ids (when penultimate? (nudge-prompt)) signals)))))))))))))
 
+;; Selected Buddy executions deliberately bypass the model-driven queue protocol.
+;; One task owns its source workspace/session until a real consumer gate passes.
+(def ^:private selected-writer-lock (Object.))
+(def ^:private selected-active-owner (atom nil))
+
+(defn- selected-all-accepted? []
+  (every? #(= "done" (:status %)) (tasks/list-all)))
+
+(defn- selected-prompt [worker task feedback]
+  (str "Execute only this already-claimed canonical Buddy task:\n"
+       (json/generate-string (dissoc task :_file)) "\n\n"
+       "Keep this workspace and session. Commit the candidate before requesting validation. "
+       "Signal COMPLETE_AND_READY_FOR_MERGE when ready for the executable consumer gate. "
+       "A completion token or review does not accept the task. The framework owns task status, "
+       "validation and integration. Do not merge, change task status, bypass checks, weaken a validator, "
+       "start paid/GPU/deployment/account operations without existing project authorization, "
+       "or claim another task. Follow the repository's AGENTS.md and owning task criteria.\n\n"
+       (when (seq (:prompts worker))
+         (str/join "\n\n" (keep load-prompt (:prompts worker))))
+       (when feedback
+         (str "\n\nThe independently executed gate has not accepted this task. "
+              "Repair the same candidate and commit; then request validation again.\n"
+              (json/generate-string feedback)))))
+
+(defn- prepare-only? [config id]
+  (boolean (some #{id} (:prepare_only_task_ids config))))
+
+(defn- selected-next-task! [worker config]
+  ;; Scan every eligible task. A missing oracle must not hide later runnable work.
+  (some (fn [task]
+          (when (and (or (execution/validator-for config (:id task))
+                         (prepare-only? config (:id task)))
+                     (nil? (task-claim-denial worker task)))
+            (tasks/claim-task! task)))
+        (tasks/list-pending)))
+
+(defn- selected-state! [worker state status reason]
+  (runs/write-worker-state! (:swarm-id worker) (:id worker)
+                            {:status status :reason (when reason (name reason))
+                             :cycle (:cycle state) :attempt (:attempt state)
+                             :execution state}))
+
+(defn- hold-selected [state reason]
+  ;; This is execution recovery inside the existing run record, not another
+  ;; task queue. Canonical Buddy status still decides what is eligible.
+  (let [held (assoc (or (:held_executions state) {}) (:task_id state)
+                    (assoc (dissoc state :held_executions) :held_reason (name reason)))]
+    (reset! selected-active-owner nil)
+    {:state {:cycle (inc (:cycle state)) :attempt 0 :deadline_ms (:deadline_ms state)
+             :accepted_count (:accepted_count state) :held_executions held}}))
+
+(defn- reconcile-held! [root state accepted]
+  (reduce (fn [state [id held]]
+            (if (= "done" (:status (tasks/get-task id)))
+              (do (swap! accepted inc)
+                  (when-let [workspace (:workspace held)] (cambium/remove! root workspace))
+                  (update state :held_executions dissoc id))
+              state))
+          state (:held_executions state)))
+
+(defn- host-validation-step! [worker task state]
+  (let [result (tasks/request-acceptance! task (:workspace state)
+                                           (get-in state [:candidate_pin :source_commit]))
+        receipt (:validation result)
+        state (assoc state :validation receipt)]
+    (when receipt
+      (runs/write-cycle-log! (:swarm-id worker) (:id worker) (:cycle state)
+                             {:attempt (:attempt state) :outcome (keyword (:kind result))
+                              :claimed-task-ids [(:id task)] :session-id (:session_id state)
+                              :worktree-path (get-in state [:workspace :path]) :validation receipt}))
+    (case (:kind result)
+      "validating" (do (Thread/sleep (min 1000 (execution/remaining-ms (:deadline_ms state))))
+                       {:state (assoc state :phase "validating")})
+      "accepted" {:state (assoc state :phase "awaiting-acceptance" :feedback nil)}
+      "rejected" {:state (assoc state :phase "implementing" :feedback receipt)}
+      "blocked" (hold-selected state :validation-blocked))))
+
+(defn- resume-selected-state [worker config deadline]
+  (when-let [resume-id (:resume-swarm-id worker)]
+    (let [saved (:execution (runs/read-worker-state resume-id (:id worker)))
+          registered (cambium/list-workspaces (System/getProperty "user.dir"))]
+      (when-not saved (throw (ex-info "No selected execution exists in the requested run" {})))
+      (doseq [execution (cond-> (vals (:held_executions saved)) (:task_id saved) (conj saved))
+              :let [workspace (:workspace execution)
+                    found (some #(when (= (:path workspace) (:path %)) %) registered)
+                    task (tasks/get-task (:task_id execution))]]
+        (when-not (and found
+                       (= (:validator_digest execution)
+                          (some-> (execution/validator-for config (:task_id execution)) execution/validator-digest)))
+          (throw (ex-info "Selected execution resume lacks the exact registered source or validator pin" {})))
+        (when (and (= "in_progress" (:status task)) (not= "awaiting-acceptance" (:phase execution)))
+          (tasks/restore-claim! (:task_id execution) (:claim_revision execution)))
+        (cambium/claim-existing! (System/getProperty "user.dir") found))
+      ;; A resume does not create another 12-hour budget.
+      (-> saved
+          (assoc :deadline_ms (min deadline (:deadline_ms saved)))
+          (update :held_executions #(into {} (map (fn [[id execution]] [(execution/key-string id) execution]) %)))))))
+
+(defn run-selected-worker!
+  "Bounded, fail-closed Buddy consumer loop. Model output requests validation;
+   only actual canonical done permits the next task. Failed gates resume the
+   same native session in the same workspace. Existing run state owns recovery."
+  [worker]
+  (when-not (tasks/buddies?)
+    (throw (ex-info "task_execution requires the canonical Buddy task backend" {})))
+  (let [config (execution/validate-config! (:task-execution worker))
+        root (System/getProperty "user.dir")
+        deadline (min (or (:deadline_ms config) Long/MAX_VALUE)
+                      (+ (execution/now-ms) (* 1000 (:wall_time_seconds config))))
+        initial (tasks/with-deadline deadline #(binding [cambium/*deadline-ms* deadline]
+                                               (resume-selected-state worker config deadline)))
+        accepted (atom (or (:accepted_count initial) 0))
+        finish (fn [status state & [error]]
+                 (when (= [(:swarm-id worker) (:id worker)] @selected-active-owner)
+                   (reset! selected-active-owner nil))
+                 (selected-state! worker state "stopped" status)
+                 (cond-> (assoc worker :status status :completed @accepted
+                                 :cycles-completed @accepted :claims (if (:task_id state) 1 0)
+                                 :merges @accepted :errors (if error 1 0))
+                   error (assoc :error error)))
+        attempt-cap (or (:max-resumes worker) default-max-resumes)]
+    (tasks/with-deadline deadline (fn []
+    (binding [cambium/*deadline-ms* deadline]
+    (loop [state (or initial {:cycle 1 :attempt 0 :accepted_count 0 :deadline_ms deadline})]
+      (let [deadline (:deadline_ms state)]
+        (cond
+          @shutdown-requested? (finish :interrupted state)
+          (zero? (execution/remaining-ms deadline)) (finish :wall-time-exhausted state)
+          (>= @accepted (or (:max-cycles worker) 10))
+          (finish (if (selected-all-accepted?) :completed :budget-exhausted) state)
+          :else
+          (let [checkpoint (atom state)
+                result
+                ;; Serialize real project writers/GPU consumers across workers.
+                ;; A rejected task retains this lock until accepted or blocked.
+                (locking selected-writer-lock
+                  (try
+                    (if (and @selected-active-owner
+                             (not= [(:swarm-id worker) (:id worker)] @selected-active-owner))
+                      {:state state :yield true}
+                    (let [state (reconcile-held! root state accepted)
+                          state (assoc state :accepted_count @accepted)
+                          task (if (:task_id state)
+                                 (tasks/get-task (:task_id state))
+                                 (selected-next-task! worker config))
+                          prior-held (get (:held_executions state) (:id task))
+                          state (if (and task prior-held)
+                                  (merge prior-held (select-keys state [:deadline_ms :cycle :held_executions :accepted_count])
+                                         {:claim_revision (:revision task) :phase "implementing"}) state)
+                          state (if prior-held (update state :held_executions dissoc (:id task)) state)
+                          state (if (and task (not (:task_id state)))
+                                  (assoc state :task_id (:id task) :claim_revision (:revision task)) state)
+                          _ (when task (reset! selected-active-owner [(:swarm-id worker) (:id worker)]))
+                          _ (reset! checkpoint state)
+                          _ (when (:task_id state) (selected-state! worker state "running" nil))]
+                      (cond
+                        (nil? task)
+                        (if (selected-all-accepted?)
+                          {:stop :completed :state state}
+                          (do (selected-state! worker state "waiting" :awaiting-buddy-acceptance)
+                              (Thread/sleep (min 1000 (execution/remaining-ms deadline)))
+                              {:state state :waiting true}))
+
+                        (= "done" (:status task))
+                        (do
+                          (swap! accepted inc)
+                          (when-let [workspace (:workspace state)]
+                            (cambium/remove! root workspace))
+                          (reset! selected-active-owner nil)
+                          {:state {:cycle (inc (:cycle state)) :attempt 0 :deadline_ms deadline
+                                   :accepted_count @accepted :held_executions (:held_executions state)}})
+
+                        (or (:paused task) (#{"blocked" "cancelled"} (:status task)))
+                        (hold-selected state :canonical-task-blocked)
+
+                        (and (not= "awaiting-acceptance" (:phase state))
+                             (not= (:claim_revision state) (:revision task)))
+                        (hold-selected state :canonical-revision-conflict)
+
+                        (= "awaiting-acceptance" (:phase state))
+                        ;; Poll authoritative acceptance; a review token cannot advance.
+                        (do (Thread/sleep (min 1000 (execution/remaining-ms deadline))) {:state state})
+
+                        (= "validating" (:phase state))
+                        (host-validation-step! worker task state)
+
+                        (>= (:attempt state) attempt-cap)
+                        (hold-selected state :attempt-budget-exhausted)
+
+                        :else
+                        (let [validator (execution/validator-for config (:id task))
+                              workspace (or (:workspace state)
+                                            (create-iteration-worktree! root (:swarm-id worker) (:id worker) (:cycle state)))
+                              state (assoc state :task_id (:id task) :claim_revision (:revision task)
+                                           :workspace workspace :validator_digest (some-> validator execution/validator-digest)
+                                           :attempt (inc (:attempt state)) :phase "implementing")
+                              _ (reset! checkpoint state)
+                              _ (selected-state! worker state "running" nil)
+                              context {:task_status (str "Selected task " (:id task) " remains in progress")
+                                       :pending_tasks "The framework selects the next task after actual acceptance."}
+                              attempt-ms (max 1 (min (* 1000 (:attempt_timeout_seconds config))
+                                                     (execution/remaining-ms deadline)))
+                              result (run-agent! (assoc worker :timeout-ms attempt-ms)
+                                                 (:path workspace) context (:session_id state)
+                                                 (some? (:session_id state))
+                                                 :resume-prompt-override (selected-prompt worker task (:feedback state)))
+                              state (assoc state :session_id (or (:session-id result) (:session_id state)))
+                              _ (reset! checkpoint state)
+                              _ (selected-state! worker state "running" nil)]
+                          (cond
+                            (zero? (execution/remaining-ms deadline)) {:stop :wall-time-exhausted :state state}
+                            (= 124 (:exit result)) (hold-selected state :attempt-timeout)
+                            (not (zero? (:exit result)))
+                            {:state (assoc state :feedback {:reason "model-attempt-failed" :exit (:exit result)
+                                                          :stderr (:stderr-snippet result)})}
+                            (not (:merge? result))
+                            {:state (assoc state :feedback {:reason "candidate-not-ready"
+                                                          :output (snippet (:output result) 2000)})}
+                            :else
+                            (let [pin (if validator
+                                        (execution/source-pin! (:path workspace) validator deadline)
+                                        (do
+                                          (when-not (str/blank? (execution/git! (:path workspace) deadline "status" "--porcelain"))
+                                            (throw (ex-info "Preparation candidate must be clean and committed" {:reason :dirty-source})))
+                                          {:source_commit (execution/git! (:path workspace) deadline "rev-parse" "HEAD")}))
+                                  review (when (seq (:reviewers worker))
+                                           (run-reviewer! (assoc worker :timeout-ms attempt-ms :deadline-ms deadline :selected-task task
+                                                               :review-base (execution/git! root deadline "rev-parse" "HEAD"))
+                                                          (:path workspace) (:review_feedback state)))
+                                  approved? (and (= :approved (:verdict review))
+                                                 (zero? (:exit review))
+                                                 (re-find #"(?m)^VERDICT:\s*APPROVED\s*$" (:output review)))
+                                  _ (when review
+                                      (runs/write-review-log! (:swarm-id worker) (:id worker) (:cycle state) (:attempt state)
+                                                              (assoc review :duration-ms (:duration-ms review))))
+                                  _ (when (and validator approved?
+                                               (not= pin (execution/source-pin! (:path workspace) validator deadline)))
+                                      (throw (ex-info "Reviewer changed the candidate source; a fresh implementation/validation is required" {})))
+                                  state (assoc state :candidate_pin pin :phase "validating")
+                                  _ (reset! checkpoint state)
+                                  _ (selected-state! worker state "running" nil)]
+                              (cond
+                                (nil? review) (hold-selected state :reviewer-unconfigured)
+                                (not approved?)
+                                {:state (-> state
+                                            (assoc :phase "implementing"
+                                                   :feedback {:reason "reviewer-rejected" :output (:output review)
+                                                              :comments (:comments review)})
+                                            (update :review_feedback (fnil conj []) (:output review)))}
+                                (nil? validator)
+                                (do (tasks/complete-task! task)
+                                    (hold-selected (assoc state :phase "awaiting-acceptance") :validator-unconfigured))
+                                :else
+                                ;; Host is the single full-oracle owner. Review
+                                ;; remains advisory and cannot mark task done.
+                                (host-validation-step! worker task state))))))))
+                    (catch Exception e
+                      (if (:task_id @checkpoint)
+                        (let [state (assoc @checkpoint :feedback {:error (.getMessage e)
+                                                                 :reason (some-> (ex-data e) :reason name)})]
+                          (if (= :dirty-source (:reason (ex-data e)))
+                            {:state state}
+                            (hold-selected state :execution-blocked)))
+                        {:stop :execution-blocked :state @checkpoint :error (.getMessage e)}))))]
+            (selected-state! worker (:state result) (cond (:stop result) "stopped" (:waiting result) "waiting" :else "running") (:stop result))
+            (when (:yield result) (Thread/sleep (min 1000 (execution/remaining-ms deadline))))
+            (if-let [status (:stop result)]
+              (finish status (:state result) (:error result))
+              (recur (:state result))))))))))))
+
+(defn run-worker! [worker]
+  (if (:task-execution worker)
+    (run-selected-worker! worker)
+    (run-queue-worker! worker)))
+
 ;; =============================================================================
 ;; Multi-Worker Execution
 ;; =============================================================================
@@ -1856,12 +2152,17 @@
   "Honest stop reason for stopped.json. \"completed\" is reserved for a
    genuinely drained queue; when ZERO workers ended :completed and pending
    tasks remain, the swarm died, and the reason says so."
-  [results pending-count]
+  ([results pending-count] (stopped-reason results pending-count (boolean (some :task-execution results))))
+  ([results pending-count selected?]
   (let [any-completed? (boolean (some #(= :completed (:status %)) results))]
     (cond
+      ;; An expired run grant may no longer permit another task read. Deadline
+      ;; exhaustion is already decisive negative evidence and never "completed".
+      (and selected? (some #(= :wall-time-exhausted (:status %)) results)) :wall-time-exhausted
+      selected? (if (and any-completed? (selected-all-accepted?)) :completed :awaiting-buddy-acceptance)
       (and (tasks/buddies?) (not (tasks/all-complete?))) :awaiting-buddy-acceptance
       (and (not any-completed?) (pos? pending-count)) :workers-exhausted
-      :else :completed)))
+      :else :completed))))
 
 (defn run-workers!
   "Run multiple workers in parallel.
@@ -1879,7 +2180,15 @@
   ;; overlapping swarms manufactured stale-base diffs and double-claims).
   (ensure-single-swarm! force?)
   (tasks/ensure-dirs!)
-  (let [swarm-id (-> workers first :swarm-id)
+  (let [started-ms (execution/now-ms)
+        workers (mapv (fn [worker]
+                        (if-let [config (:task-execution worker)]
+                          (assoc worker :task-execution
+                                 (assoc config :deadline_ms
+                                        (min (or (:deadline_ms config) Long/MAX_VALUE)
+                                             (+ started-ms (* 1000 (:wall_time_seconds config))))))
+                          worker)) workers)
+        swarm-id (-> workers first :swarm-id)
         stale-current (tasks/list-current)]
     (when (seq stale-current)
       (println (format "WARNING: %d task(s) already in current/ from a previous run. These may be stale claims."
@@ -1948,8 +2257,10 @@
           ;; ~20h. "completed" is now reserved for a genuinely drained queue.
           (when swarm-id
             (let [worker-outcomes (mapv worker-terminal-outcome results)
-                  pending (tasks/pending-count)
-                  reason (stopped-reason results pending)]
+                  selected? (boolean (some :task-execution workers))
+                  pending (try (tasks/pending-count) (catch Exception e
+                                                     (if selected? nil (throw e))))
+                  reason (stopped-reason results pending selected?)]
               (runs/write-stopped! swarm-id reason
                                    :worker-outcomes worker-outcomes
                                    :pending-count pending)

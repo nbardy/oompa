@@ -8,6 +8,7 @@
    Harness = Codex | Claude | Opencode | Gemini | Cursor
    δ(harness) → config map → agent-cli JSON → command vector"
   (:require [babashka.process :as process]
+            [agentnet.bounded-process :as bounded]
             [cheshire.core :as json]
             [clojure.string :as str]))
 
@@ -288,8 +289,11 @@
                     (assoc :debugRawEvents true))
                   (add-extra-args harness-kw opts)
                   json/generate-string)]
-    (process/sh ["agent-cli" "run" "--input" "-"]
-                {:in input :out :string :err :string})))
+    (if-let [timeout-ms (:timeout-ms opts)]
+      (bounded/run! ["agent-cli" "run" "--input" "-"]
+                    {:in input :out :string :err :string} timeout-ms)
+      (process/sh ["agent-cli" "run" "--input" "-"]
+                  {:in input :out :string :err :string}))))
 
 ;; =============================================================================
 ;; Session Management

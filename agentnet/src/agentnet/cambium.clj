@@ -2,12 +2,18 @@
   "Cambium lifecycle shared by iteration workers and the legacy pool.
    Creation never replaces an existing workspace. Removal fails closed."
   (:require [babashka.process :as process]
+            [agentnet.bounded-process :as bounded]
             [cheshire.core :as json]
             [clojure.java.io :as io]
             [clojure.string :as str]))
 
+(def ^:dynamic *deadline-ms* nil)
+(defn- run! [argv opts]
+  (if *deadline-ms*
+    (bounded/run! argv opts (max 1 (min 30000 (- *deadline-ms* (System/currentTimeMillis)))))
+    (process/sh argv opts)))
 (defn- git [root & args]
-  (process/sh (into ["git"] args) {:dir root :out :string :err :string}))
+  (run! (into ["git"] args) {:dir root :out :string :err :string}))
 
 (defn project-root []
   (let [result (git "." "rev-parse" "--show-toplevel")]
@@ -111,7 +117,7 @@
     (if reason
       (do (println (str "[worktree] Preserved " path " (" branch "): " (clojure.core/name reason)))
           {:removed? false :reason reason :workspace workspace})
-      (let [result (process/sh ["cambium" "remove" workspace-name]
+      (let [result (run! ["cambium" "remove" workspace-name]
                                {:dir root :out :string :err :string})]
         (if (zero? (:exit result))
           (do (let [owner (owner-file root workspace-name)]

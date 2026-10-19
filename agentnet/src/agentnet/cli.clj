@@ -1136,6 +1136,8 @@
                            :harness harness
                            :model model
                            :reasoning reasoning
+                           :task-execution (:task_execution config)
+                           :resume-swarm-id (:resume_swarm_id config)
                            :role (or (:_role wc) (:role wc))
                            :can-claim-gpu (:can_claim_gpu wc)
                            :max-cycles (:max_cycle wc)

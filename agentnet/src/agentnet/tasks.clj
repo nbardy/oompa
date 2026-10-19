@@ -8,6 +8,8 @@
 (defonce ^:private backend (atom :filesystem))
 (defn buddies? [] (= :buddies @backend))
 (defn backend? [] @backend)
+(defn with-deadline [deadline f]
+  (binding [buddy/*deadline-ms* deadline] (f)))
 (defn configure! [config]
   (let [kind (keyword (or (:type config) "filesystem"))]
     (case kind
@@ -25,6 +27,12 @@
 (defn get-task [id]
   (if (buddies?) (buddy/get-task id) (first (filter #(= id (:id %)) (list-all)))))
 (defn claim-task! [task] (if (buddies?) (buddy/claim-task! task) (filesystem/claim-task! task)))
+(defn restore-claim! [id revision]
+  (if (buddies?) (buddy/restore-claim! id revision)
+      (throw (ex-info "Persisted selected-task execution requires the Buddy backend" {}))))
+(defn request-acceptance! [task workspace source-commit]
+  (if (buddies?) (buddy/request-acceptance! task workspace source-commit)
+      (throw (ex-info "Executable acceptance requires the run-owned Buddy host" {}))))
 (defn complete-task! [task] (if (buddies?) (buddy/complete-task! task) (filesystem/complete-task! task)))
 (defn unclaim-task! [task] (if (buddies?) (buddy/unclaim-task! task) (filesystem/unclaim-task! task)))
 (defn claim-next! []

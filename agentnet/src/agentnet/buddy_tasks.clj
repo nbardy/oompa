@@ -5,6 +5,7 @@
             [clojure.string :as str]))
 
 (def ^:dynamic *transport* nil) ; tests: (fn [tool arguments] decoded-tool-result)
+(def ^:dynamic *deadline-ms* nil)
 (defonce ^:private settings (atom nil))
 (defonce ^:private claims (atom {}))
 (defonce ^:private created (atom #{}))
@@ -43,7 +44,10 @@
                                                "Accept" "application/json, text/event-stream"
                                                "MCP-Protocol-Version" "2025-03-26"}
                                      :body (json/generate-string {:jsonrpc "2.0" :id id :method method :params params})
-                                     :timeout 30000 :throw false :follow-redirects :never})
+                                     :timeout (if *deadline-ms*
+                                                (max 1 (min 30000 (- *deadline-ms* (System/currentTimeMillis))))
+                                                30000)
+                                     :throw false :follow-redirects :never})
                      (catch Exception _
                        (throw (ex-info "Buddy MCP request failed; check scoped grant and endpoint" {:type :transport-error}))))]
       (when-not (= 200 (:status response))
@@ -84,7 +88,9 @@
 (defn- validate-task [task]
   (when-not (and (map? task) (allowed? (:id task))
                  (= (:workspace_id @settings) (:workspaceId task))
-                 (= (:buddy_id @settings) (:ownerId task))
+                 (= (or (get-in @settings [:owner_by_task (:id task)])
+                        (get-in @settings [:owner_by_task (keyword (:id task))])
+                        (:buddy_id @settings)) (:ownerId task))
                  (pos-int? (:revision task))
                  (boolean? (:paused task))
                  (#{"open" "in_progress" "blocked" "review" "done" "cancelled"} (:status task)))
@@ -164,6 +170,38 @@
   ;; A model/merge signal is only a review handoff, never independent acceptance.
   (release! task "review"))
 (defn unclaim-task! [task] (release! task "open"))
+
+(defn restore-claim!
+  "Restore only an explicitly selected persisted execution at its exact revision.
+   No scan/recycle of foreign in-progress tasks is permitted."
+  [id revision]
+  (let [task (get-task id)]
+    (when-not (and (= revision (:revision task)) (= "in_progress" (:status task))
+                   (false? (:paused task)))
+      (throw (ex-info "Persisted Buddy execution no longer matches its canonical claim"
+                      {:type :revision-conflict :id id})))
+    (swap! claims assoc id revision)
+    task))
+
+(defn request-acceptance!
+  "The run-owned host executes the pinned oracle and integrates before done.
+   Worker/model credentials cannot issue the done task_write transition."
+  [task workspace source-commit]
+  (let [id (:id task)]
+    (when-not (= (:revision task) (get @claims id))
+      (throw (ex-info "Acceptance requires this execution's exact canonical claim" {:id id})))
+    (let [result (call! "oompa" {:action {:kind "accept" :taskId id
+                                         :baseRevision (:revision task)
+                                         :sourceCommit source-commit
+                                         :workspacePath (:path workspace)}})]
+      (when (= "accepted" (:kind result))
+        (let [accepted (validate-task (:task result))]
+          (when-not (= "done" (:status accepted))
+            (throw (ex-info "Host acceptance did not return canonical done" {:id id})))
+          (swap! claims dissoc id)))
+      (when-not (#{"validating" "accepted" "rejected" "blocked"} (:kind result))
+        (throw (ex-info "Host returned an unknown executable acceptance state" {:id id})))
+      result)))
 
 (defn create-task! [task]
   (when (or (seq (:dependencies task)) (seq (:files task)))
