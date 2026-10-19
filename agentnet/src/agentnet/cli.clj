@@ -272,21 +272,22 @@
 
 
 (defn- probe-model
-  "Send 'say ok' to a model via its harness CLI. Returns true if model responds.
-   Uses harness/build-probe-cmd for the command.
-   For stdin-based harnesses (e.g. claude), delivers the probe prompt via stdin.
-   For close-stdin harnesses, uses /dev/null to prevent hang."
+  "Use the same unified execution/timeout path as a real worker.
+   Raw build argv is not an execution contract: Codex now expects the prompt
+   on stdin, so the historical close-stdin probe falsely rejected valid models."
   [harness-kw model]
   (try
-    (let [cmd (harness/build-probe-cmd harness-kw model)
-          probe-prompt "[_HIDE_TEST_] say ok"
-          stdin-val (harness/process-stdin harness-kw probe-prompt)
-          proc (process/process cmd {:out :string :err :string :in stdin-val})
-          result (deref proc 60000 :timeout)]
-      (if (= result :timeout)
-        (do (.destroyForcibly (:proc proc)) false)
-        (zero? (:exit result))))
-    (catch Exception _ false)))
+    (let [result (harness/run-command! harness-kw
+                   {:model model :prompt "[_HIDE_TEST_] say ok"
+                    :cwd (System/getProperty "user.dir") :timeout-ms 60000})]
+      (when-not (zero? (:exit result))
+        (println (str "  Probe runtime failed for " (name harness-kw) ":" model
+                      " (exit " (:exit result) "): "
+                      (subs (or (:err result) "") 0 (min 1000 (count (or (:err result) "")))))))
+      (zero? (:exit result)))
+    (catch Exception e
+      (println (str "  Probe startup failed: " (.getMessage e)))
+      false)))
 
 (defn- validate-models!
   "Probe each unique harness:model pair. Prints results and exits if any fail."
@@ -309,11 +310,11 @@
         failures (filter (complement :ok) results)]
     (when (seq failures)
       (println)
-      (println "ERROR: The following models are not accessible:")
+      (println "ERROR: The following model runtime probes failed:")
       (doseq [{:keys [harness model]} failures]
         (println (format "  %s:%s" (name harness) model)))
       (println)
-      (println "Fix model names in oompa.json and retry.")
+      (println "Inspect the probe diagnostics before changing model names or retrying.")
       (System/exit 1))
     (println)))
 
