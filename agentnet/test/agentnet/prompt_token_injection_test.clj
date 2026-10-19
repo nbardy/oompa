@@ -51,7 +51,8 @@
       (let [prompt @captured-prompt]
         (t/is (string? prompt))
         (t/is (str/starts-with? prompt "[oompa:sw-1:w0] "))
-        (t/is (str/includes? prompt "Header path tasks tasks"))
+        (let [root (#'worker/task-root-for-cwd "/tmp/oompa-test-worktree")]
+          (t/is (str/includes? prompt (str "Header path " root " " root))))
       (t/is (str/includes? prompt "Prompt ctx | propose | src/a.clj | 180 | - task-001: Build thing | roots tasks|tasks|tasks|tasks"))
       (doseq [token ["{context_header}" "{mode_hint}" "{targets}" "{recent_sec}" "{pending_tasks}"
                      "{TASK_ROOT}" "{TASKS_ROOT}" "{{TASK_ROOT}}" "{{TASKS_ROOT}}"]]

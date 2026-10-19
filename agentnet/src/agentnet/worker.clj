@@ -35,6 +35,7 @@
             [agentnet.core :as core]
             [agentnet.harness :as harness]
             [agentnet.worktree :as worktree]
+            [agentnet.cambium :as cambium]
             [agentnet.runs :as runs]
             [babashka.process :as process]
             [cheshire.core :as json]
@@ -118,7 +119,10 @@
     (when (nil? resolved)
       (throw (ex-info (str "Framework prompt not found: " path)
                       {:name name :path path :package-root package-root})))
-    (agent/tokenize (slurp resolved) tokens)))
+    (let [body (agent/tokenize (slurp resolved) tokens)]
+      (if (tasks/buddies?)
+        (str/replace body "tasks/pending/" "the canonical Buddy task service (through the accountable Buddy)")
+        body))))
 
 (defn- tag-prompt
   "Prefix a prompt with its run-identity tag: \"[oompa:<swarm-id>:<id>] \".
@@ -188,8 +192,11 @@
   [cwd]
   (let [cwd-file (io/file cwd)
         local-tasks (io/file cwd-file "tasks")
+        project-tasks (io/file (System/getProperty "user.dir") "tasks")
         parent-tasks (some-> cwd-file .getParentFile (io/file "tasks"))]
     (cond
+      (.exists project-tasks) (str (.relativize (.toPath (.getCanonicalFile cwd-file))
+                                              (.toPath (.getCanonicalFile project-tasks))))
       (and parent-tasks (.exists parent-tasks)) "../tasks"
       (.exists local-tasks) "tasks"
       :else "tasks")))
@@ -277,7 +284,9 @@
     {:pending_count (count pending)
      :current_count (count current)
      :complete_count (count complete)
-     :pending_tasks (str/join "\n" (map #(str "- " (:id %) ": " (:summary %)) pending))
+     :pending_tasks (str/join "\n" (map #(if (tasks/buddies?)
+                                             (json/generate-string (dissoc % :_file))
+                                             (str "- " (:id %) ": " (:summary %))) pending))
      :task_status (format "Pending: %d, In Progress: %d, Complete: %d"
                           (count pending) (count current) (count complete))}))
 
@@ -358,7 +367,12 @@
                             failed)
         context (build-context)
         claimed-line (if (seq claimed-ids)
-                       (str "Claimed: " (str/join ", " claimed-ids) "\n")
+                       (str "Claimed: " (str/join ", " claimed-ids) "\n"
+                            (when (tasks/buddies?)
+                              (str "Canonical claimed task criteria:\n"
+                                   (json/generate-string
+                                     (filterv #(some #{(:id %)} claimed-ids)
+                                              (tasks/list-current))) "\n")))
                        "No tasks were successfully claimed.\n")
         failed-line (if (seq failed-labels)
                       (str "Rejected, already taken, or not found: "
@@ -463,18 +477,22 @@
                  ;; replaced here. Without this, raw {var} placeholders leak
                  ;; into the agent prompt verbatim.
                  :else
-                 (let [task-header (render-task-header
-                                     (load-prompt "config/prompts/_task_header.md")
-                                     worktree-path)
+                 (let [task-header (if (tasks/buddies?)
+                                     (load-prompt "config/prompts/_buddy_task_header.md")
+                                     (render-task-header
+                                       (load-prompt "config/prompts/_task_header.md")
+                                       worktree-path))
                        user-prompts (if (seq prompts)
                                       (->> prompts
                                            (map load-prompt)
                                            (remove nil?)
                                            (map #(agent/tokenize % template-tokens))
                                            (str/join "\n\n"))
-                                      (or (some-> (load-prompt "config/prompts/worker.md")
+                                      (if (tasks/buddies?)
+                                        "Execute the claimed Buddy task through its original done criteria."
+                                        (or (some-> (load-prompt "config/prompts/worker.md")
                                                   (agent/tokenize template-tokens))
-                                          (load-framework-prompt "worker_default.md" {})))]
+                                          (load-framework-prompt "worker_default.md" {}))))]
                    (str task-header "\n"
                         "Task Status: " (:task_status context) "\n"
                         "Pending: " (:pending_tasks context) "\n\n"
@@ -678,11 +696,9 @@
   5)
 
 (defn- abort-any-merge!
-  "Ensure no merge is in progress. Tries --abort first, falls back to hard reset."
+  "Abort only Git's merge operation; never reset unrelated or dirty work."
   [dir]
-  (let [abort (process/sh ["git" "merge" "--abort"] {:dir dir :out :string :err :string})]
-    (when-not (zero? (:exit abort))
-      (process/sh ["git" "reset" "--hard" "HEAD"] {:dir dir}))))
+  (process/sh ["git" "merge" "--abort"] {:dir dir :out :string :err :string}))
 
 (defn- try-merge-main!
   "Try `git merge main` in a worktree. Returns {:ok? bool :error string}.
@@ -757,43 +773,12 @@
         (pos? ahead-count))))
 
 (defn- create-iteration-worktree!
-  "Create a fresh worktree for an iteration. Returns {:dir :branch :path}.
-   Force-removes stale worktree+branch from previous failed runs first."
+  "Create a unique ephemeral Cambium workspace outside the project checkout."
   [project-root swarm-id worker-id iteration]
-  (let [swarm-token (or swarm-id (subs (str (java.util.UUID/randomUUID)) 0 8))
-        work-id (format "s%s-%s-i%d" swarm-token worker-id iteration)
-        wt-dir (format ".w%s" work-id)
-        wt-branch (format "oompa/%s" work-id)
-        wt-path (str project-root "/" wt-dir)]
-    ;; Clean stale worktree/branch from previous failed runs
-    (process/sh ["git" "worktree" "remove" wt-dir "--force"] {:dir project-root})
-    (process/sh ["git" "branch" "-D" wt-branch] {:dir project-root})
-    ;; Prefer simgit (`sg`) — it creates a REAL git linked worktree but clones
-    ;; the tree copy-on-write (APFS clonefile / btrfs-xfs reflink), so N agent
-    ;; worktrees cost ~1x the disk instead of N x. Measured on this repo
-    ;; 2026-08-15: 2.9s, mode "cow-clone", ~0 bytes physical vs 345MB for a
-    ;; plain checkout — 124 accumulated plain worktrees had eaten the disk down
-    ;; to 9.7Gi mid-run. Falls back to plain `git worktree add` (announced, not
-    ;; silent) when sg is absent or CoW is unavailable on this filesystem.
-    ;; NB: sg's argument order is BRANCH then PATH, the reverse of git's.
-    (let [sg? (zero? (:exit (process/sh ["which" "sg"] {:out :string :err :string})))
-          sg-result (when sg?
-                      (process/sh ["sg" "worktree" "add" "--require-cow" wt-branch wt-dir]
-                                  {:dir project-root :out :string :err :string}))
-          result (if (and sg? (zero? (:exit sg-result)))
-                   sg-result
-                   (do
-                     (when sg?
-                       (println (str "[worktree] simgit CoW unavailable; using plain git worktree "
-                                     "(full-size checkout): " (str/trim (:err sg-result)))))
-                     (process/sh ["git" "worktree" "add" wt-dir "-b" wt-branch]
-                                 {:dir project-root :out :string :err :string})))]
-      (when-not sg?
-        (println "[worktree] simgit (sg) not found; using plain git worktree (full-size checkout)"))
-      (when-not (zero? (:exit result))
-        (throw (ex-info (str "Failed to create worktree: " (:err result))
-                        {:dir wt-dir :branch wt-branch
-                         :via (if (and sg? (zero? (:exit sg-result))) "sg" "git")}))))
+  (let [work-id (format "s%s-%s-i%d" (or swarm-id "local") worker-id iteration)
+        workspace (cambium/create! project-root work-id "oompa/")
+        wt-dir (:dir workspace)
+        wt-path (:path workspace)]
     ;; Deterministic worktree setup: if the repo ships scripts/worktree-bootstrap.sh,
     ;; the FRAMEWORK runs it here — before the agent ever starts — instead of
     ;; trusting every model to obey a "STEP ZERO: run this" prompt line. A missed
@@ -810,7 +795,7 @@
             (throw (ex-info (str "worktree bootstrap failed (exit " (:exit result) "): "
                                  (str/trim (str (:err result) " " (:out result))))
                             {:dir wt-dir :script bootstrap}))))))
-    {:dir wt-dir :branch wt-branch :path wt-path}))
+    workspace))
 
 (defn- detect-claimed-tasks
   "Do not infer ownership from shared current/ diffs.
@@ -1021,10 +1006,10 @@
 
 
 (defn- cleanup-worktree!
-  "Remove worktree and branch."
+  "Retire integrated clean workspaces through Cambium; preserve other work."
   [project-root wt-dir wt-branch]
-  (process/sh ["git" "worktree" "remove" wt-dir "--force"] {:dir project-root})
-  (process/sh ["git" "branch" "-D" wt-branch] {:dir project-root}))
+  (cambium/remove! project-root {:dir wt-dir :branch wt-branch
+                                 :path (cambium/workspace-path project-root wt-dir)}))
 
 (defn- preserve-merge-failure-salvage!
   "On merge failure, keep the approved work reachable instead of destroying it.
@@ -1033,8 +1018,7 @@
    art-direction doc + four visual fixes, 2.5h of work) ended outcome
    merge-failed and its worktree was cleaned up unconditionally — the content
    exists in no git ref today. Never cleanup on merge failure; pin the branch
-   head under a salvage ref (create-iteration-worktree! force-deletes stale
-   oompa/* branches on restart, so the worktree branch alone is not safe) and
+   head under a salvage ref and
    leave the worktree in place.
 
    Creates refs/heads/salvage/{swarm-id}-{worker-id}-c{cycle} at the worktree
@@ -1168,6 +1152,21 @@
                          {:project_root project-root
                           :wt_branch wt-branch}))
 
+(defn- verified-merge?
+  "An agent signal is advisory; Git must prove the delivered branch is integrated."
+  [wt-path wt-branch project-root sha]
+  (let [run (fn [dir & args]
+              (process/sh (into ["git"] args) {:dir dir :out :string :err :string}))
+        status (run wt-path "status" "--porcelain")
+        checked-out (run wt-path "symbolic-ref" "--short" "HEAD")
+        target (run project-root "symbolic-ref" "--short" "HEAD")
+        integrated (run project-root "merge-base" "--is-ancestor" wt-branch "HEAD")
+        receipt (run project-root "merge-base" "--is-ancestor" sha "HEAD")]
+    (and (zero? (:exit status)) (str/blank? (:out status))
+         (zero? (:exit checked-out)) (= wt-branch (str/trim (:out checked-out)))
+         (zero? (:exit target)) (= "main" (str/trim (:out target)))
+         (zero? (:exit integrated)) (zero? (:exit receipt)))))
+
 (defn run-merge-agent!
   "Resume the original worker session and instruct it to merge its branch to main.
    Serialized via merge-lock so concurrent workers don't corrupt the git index.
@@ -1195,8 +1194,11 @@
             gave-up? (agent/needs-followup-signal? output)]
         (cond
           sha
-          (do (println (format "[%s] Merged → %s" worker-id sha))
-              {:ok? true :sha sha :message (str "merged → " sha)})
+          (if (verified-merge? wt-path wt-branch project-root sha)
+            (do (println (format "[%s] Merged → %s (Git verified)" worker-id sha))
+                {:ok? true :sha sha :message (str "merged → " sha)})
+            (do (println (format "[%s] MERGE_COMPLETE rejected: Git does not prove a clean integrated branch" worker-id))
+                {:ok? false :sha nil :message "MERGE_COMPLETE failed Git verification; workspace preserved"}))
 
           gave-up?
           (do (println (format "[%s] Merge agent gave up" worker-id))
@@ -1856,9 +1858,10 @@
    tasks remain, the swarm died, and the reason says so."
   [results pending-count]
   (let [any-completed? (boolean (some #(= :completed (:status %)) results))]
-    (if (and (not any-completed?) (pos? pending-count))
-      :workers-exhausted
-      :completed)))
+    (cond
+      (and (tasks/buddies?) (not (tasks/all-complete?))) :awaiting-buddy-acceptance
+      (and (not any-completed?) (pos? pending-count)) :workers-exhausted
+      :else :completed)))
 
 (defn run-workers!
   "Run multiple workers in parallel.
@@ -1970,6 +1973,8 @@
    Runs in project root. Respects max_pending cap.
    Returns {:tasks-created N}"
   [{:keys [harness model prompts max-pending swarm-id]}]
+  (when (tasks/buddies?)
+    (throw (ex-info "Filesystem planner cannot run against Buddy tasks" {})))
   (tasks/ensure-dirs!)
   (let [project-root (System/getProperty "user.dir")
         pending-before (tasks/pending-count)

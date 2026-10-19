@@ -1,0 +1,182 @@
+(ns agentnet.buddy-tasks
+  "Scoped Buddy task adapter. No filesystem queue, owner credentials or database access."
+  (:require [babashka.http-client :as http]
+            [cheshire.core :as json]
+            [clojure.string :as str]))
+
+(def ^:dynamic *transport* nil) ; tests: (fn [tool arguments] decoded-tool-result)
+(defonce ^:private settings (atom nil))
+(defonce ^:private claims (atom {}))
+(defonce ^:private created (atom #{}))
+(defonce ^:private initialized? (atom false))
+
+(defn configure! [config]
+  (doseq [field [:workspace_id :buddy_id]]
+    (when (str/blank? (get config field))
+      (throw (ex-info (str "Buddy task backend requires " (name field)) {:field field}))))
+  (when-not (and (sequential? (:task_ids config)) (every? string? (:task_ids config)))
+    (throw (ex-info "Buddy task backend requires explicit task_ids (an empty list admits only tasks created here)" {})))
+  (reset! settings (merge {:url_env "OOMPA_BUDDY_MCP_URL"
+                          :token_env "OOMPA_BUDDY_MCP_TOKEN"} config))
+  (reset! claims {})
+  (reset! created #{})
+  (reset! initialized? false)
+  nil)
+
+(defn- rpc! [method params]
+  (let [{:keys [url_env token_env]} @settings
+        url (or (:url @settings) (System/getenv url_env))
+        token (System/getenv (or (:authorization_env @settings) token_env))]
+    (when (or (str/blank? url) (str/blank? token))
+      (throw (ex-info (str "Buddy MCP transport requires " url_env " and " token_env
+                           " from a supported scoped turn grant; no local fallback") {:type :transport-unconfigured})))
+    (let [uri (java.net.URI. url)]
+      (when-not (and (= "http" (.getScheme uri))
+                     (#{"127.0.0.1" "localhost" "[::1]"} (.getHost uri))
+                     (= "/mcp" (.getPath uri))
+                     (nil? (.getRawUserInfo uri)) (nil? (.getQuery uri)))
+        (throw (ex-info "Buddy MCP URL must be the supported loopback /mcp endpoint" {}))))
+    (let [id (str (random-uuid))
+          response (try
+                     (http/post url {:headers {"Authorization" (if (str/starts-with? token "Bearer ") token (str "Bearer " token))
+                                               "Content-Type" "application/json"
+                                               "Accept" "application/json, text/event-stream"
+                                               "MCP-Protocol-Version" "2025-03-26"}
+                                     :body (json/generate-string {:jsonrpc "2.0" :id id :method method :params params})
+                                     :timeout 30000 :throw false :follow-redirects :never})
+                     (catch Exception _
+                       (throw (ex-info "Buddy MCP request failed; check scoped grant and endpoint" {:type :transport-error}))))]
+      (when-not (= 200 (:status response))
+        (throw (ex-info "Buddy MCP refused request; check scoped turn grant (never owner credentials)"
+                        {:type :transport-error :http-status (:status response)})))
+      (let [body (:body response)
+            messages (if (str/starts-with? (str/trim body) "{")
+                       [(json/parse-string body true)]
+                       (->> (str/split body #"\r?\n\r?\n")
+                            (keep (fn [event]
+                                    (let [data (->> (str/split-lines event)
+                                                    (keep #(when (str/starts-with? % "data:") (str/trim (subs % 5))))
+                                                    (str/join "\n"))]
+                                      (when (seq data) (json/parse-string data true)))))))
+            message (first (filter #(= id (:id %)) messages))]
+        (when (or (nil? message) (:error message))
+          (throw (ex-info "Buddy MCP returned an invalid or rejected JSON-RPC response" {:type :protocol-error})))
+        (:result message)))))
+
+(defn- call! [tool arguments]
+  (if *transport*
+    (*transport* tool arguments)
+    (do
+      (when-not @initialized?
+        (rpc! "initialize" {:protocolVersion "2025-03-26" :capabilities {}
+                             :clientInfo {:name "oompa-buddy-tasks" :version "1"}})
+        (reset! initialized? true))
+      (let [result (rpc! "tools/call" {:name tool :arguments arguments})
+            body (:text (first (:content result)))]
+        (when (:isError result)
+          (throw (ex-info (str "Buddy " tool " rejected: " body)
+                          {:type (if (and body (re-find #"revision[_ ]conflict" body)) :revision-conflict :tool-error)})))
+        (when-not (string? body)
+          (throw (ex-info "Buddy tool response has no primary JSON content" {:type :protocol-error})))
+        (json/parse-string body true)))))
+
+(defn- allowed? [id] (contains? (into (set (:task_ids @settings)) @created) id))
+(defn- validate-task [task]
+  (when-not (and (map? task) (allowed? (:id task))
+                 (= (:workspace_id @settings) (:workspaceId task))
+                 (= (:buddy_id @settings) (:ownerId task))
+                 (pos-int? (:revision task))
+                 (boolean? (:paused task))
+                 (#{"open" "in_progress" "blocked" "review" "done" "cancelled"} (:status task)))
+    (throw (ex-info "Buddy task is malformed or outside the configured owner/workspace/task scope" {:type :scope-error})))
+  (assoc task :summary (:title task) :description (:doneCriteria task)
+         :acceptance [(:doneCriteria task)] :_buddy true))
+
+(defn get-task [id]
+  (when-not (allowed? id)
+    (throw (ex-info "Task ID is outside the configured Buddy task allowlist" {:type :scope-error :id id})))
+  (validate-task (:task (call! "tasks" {:action {:kind "get" :taskId id}}))))
+
+(defn list-all []
+  ;; Get exact IDs instead of a broad list; details carry revision and pause state.
+  (mapv get-task (sort (into (set (:task_ids @settings)) @created))))
+
+(defn- dependencies-done? [task]
+  ;; Current Buddy Task has no dependency field. Explicit dependencies are admitted only
+  ;; through the scoped config; reject unknown incoming dependency formats rather than guess.
+  (and (not-any? #(contains? task %) [:dependencies :dependsOn :depends_on])
+       (every? #(= "done" (:status (get-task %)))
+               (or (get-in @settings [:dependencies (:id task)])
+                   (get-in @settings [:dependencies (keyword (:id task))]) []))))
+
+(defn runnable? [task]
+  (and (= "open" (:status task)) (false? (:paused task)) (dependencies-done? task)))
+(defn list-pending [] (filterv runnable? (list-all)))
+(defn list-current [] (filterv #(= "in_progress" (:status %)) (list-all)))
+(defn list-complete [] (filterv #(= "done" (:status %)) (list-all)))
+
+(defn- update! [task changes]
+  (validate-task
+    (call! "task_write" {:write {:kind "update" :taskId (:id task)
+                                  :baseRevision (:revision task) :changes changes}
+                         :key (str "oompa-" (random-uuid))})))
+
+(defn claim-task! [candidate]
+  ;; Keep the revision the caller observed: two claimants can never both win.
+  (let [task (validate-task candidate)]
+    (when (runnable? task)
+      (try
+        (let [claimed (update! task {:status "in_progress"})]
+          (when-not (= "in_progress" (:status claimed))
+            (throw (ex-info "Buddy claim did not enter in_progress" {})))
+          (swap! claims assoc (:id task) (:revision claimed))
+          claimed)
+        (catch clojure.lang.ExceptionInfo e
+          (if (= :revision-conflict (:type (ex-data e))) nil (throw e)))))))
+
+(defn claim-by-id! [id {:keys [claim-denial-fn]}]
+  (if-not (allowed? id)
+    {:status :not-found :id id}
+    (let [task (get-task id)]
+      (cond
+        (= "in_progress" (:status task)) {:status :already-taken :id id}
+        (not (runnable? task)) {:status :not-claimable :id id :reason "Buddy task is paused, blocked, closed, in review or has unfinished dependencies"}
+        :else
+        (if-let [denial (when claim-denial-fn (claim-denial-fn task))]
+          (merge {:status :not-claimable :id id}
+                 (if (map? denial) denial {:reason (str denial)}))
+          {:status (if (claim-task! task) :claimed :already-taken) :id id})))))
+
+(defn- release! [task status]
+  (let [id (:id task)
+        owned-revision (get @claims id)]
+    ;; Startup cleanup must never recycle another process's work.
+    (when owned-revision
+      (let [fresh (get-task id)]
+        (when-not (and (= owned-revision (:revision fresh))
+                       (= "in_progress" (:status fresh)) (false? (:paused fresh)))
+          (throw (ex-info "Buddy task changed since this process claimed it; re-read and reconcile" {:type :revision-conflict :id id})))
+        (let [result (update! fresh {:status status})]
+          (swap! claims dissoc id)
+          result)))))
+
+(defn complete-task! [task]
+  ;; A model/merge signal is only a review handoff, never independent acceptance.
+  (release! task "review"))
+(defn unclaim-task! [task] (release! task "open"))
+
+(defn create-task! [task]
+  (when (or (seq (:dependencies task)) (seq (:files task)))
+    (throw (ex-info "Buddy create supports title and done criteria; dependencies/files require an explicit supported task contract" {})))
+  (when (:parentId task) (get-task (:parentId task)))
+  (let [result (call! "task_write"
+                      {:write (cond-> {:kind "create" :ownerId (:buddy_id @settings)
+                                       :title (:summary task)
+                                       :doneCriteria (str/join "\n" (remove str/blank? (concat [(:description task)] (:acceptance task))))}
+                                (:parentId task) (assoc :parentId (:parentId task)))
+                       :key (str "oompa-create-" (random-uuid))})]
+    (swap! created conj (:id result))
+    (validate-task result)))
+
+(defn all-complete? []
+  (every? #(#{"done" "cancelled"} (:status %)) (list-all)))

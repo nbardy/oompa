@@ -16,8 +16,8 @@ From the [Oompa Loompas blog post](notes/2025-01-instant_software_blog_draft.md)
 for w in $(seq 1 ${WORKERS:-3}); do
   (for i in $(seq 1 ${ITERATIONS:-5}); do
     wt=".w${w}-i${i}"
-    git worktree add $wt -b $wt 2>/dev/null
-    { echo "Worktree: $wt"; cat prompts/worker.md; } | claude -p -
+    git cambium add -b "$wt" -name "oompa-$w-$i" -ephemeral "../oompa-$w-$i"
+    { echo "Worktree: ../oompa-$w-$i"; cat prompts/worker.md; } | claude -p -
   done) &
 done; wait
 ```
@@ -29,7 +29,8 @@ Process: Create/claim tasks in tasks/{pending,in_progress,complete}.md
 Method: Isolate changes to your worktree, commit and merge when complete
 ```
 
-That's it. Parallel agents with worktree isolation.
+This historical sketch illustrates parallel agents with worktree isolation.
+Use the full runner below for guarded integration and Cambium retirement.
 
 ---
 
@@ -239,15 +240,18 @@ oompa help                  # Show all commands
 
 ## Disk-efficient worktrees
 
-Oompa prefers [`sg`](https://github.com/nbardy/simgit) when it is available on
-`PATH`. `sg` creates a real Git linked worktree and uses native copy-on-write
-clones on APFS and reflink-capable Linux filesystems, so unchanged tracked files
-share physical storage across workers. Oompa prints a warning and falls back to
-plain `git worktree add` when `sg` or native CoW is unavailable.
+Oompa requires Cambium on `PATH` and creates each worker with
+`git cambium add -b BRANCH -name NAME -ephemeral PATH`. Workspaces have unique
+names and live beside the project under `.oompa-worktrees/`, where Cambium
+can share files through copy-on-write. Creation fails if Cambium fails.
 
-Ignored dependencies, caches, build products, model weights, and media are not
-made cheap by tracked-file CoW. Keep those behind the project's worktree
-bootstrap and cleanup policy, and run `oompa cleanup` after disposable swarms.
+`oompa worktrees` discovers registered external workspaces. Cleanup uses
+`cambium remove NAME` after checking that the owner process is inactive,
+the workspace is clean, no Git operation is in progress, and its branch is
+integrated into the project checkout. Dirty, active, unmerged, and legacy
+unregistered worktrees are preserved; branches are retained. Workers can
+retire their own completed workspace. Cambium also carries dependency
+folders when supported; follow project bootstrap policy for anything else.
 
 ## Opencode Harness
 
@@ -277,8 +281,7 @@ so downstream UIs can identify and group worker conversations.
 - Node.js 18+ (only for npm wrapper / npx usage)
 - [Babashka](https://github.com/babashka/babashka) (bb)
 - Git 2.5+ (for worktrees)
-- Optional but recommended: [`sg`](https://github.com/nbardy/simgit) for
-  disk-efficient copy-on-write worktrees
+- Cambium (`git cambium` and `cambium`) for managed ephemeral workspaces
 - One of:
   - [Claude CLI](https://github.com/anthropics/claude-cli)
   - [Codex CLI](https://github.com/openai/codex)
@@ -287,3 +290,55 @@ so downstream UIs can identify and group worker conversations.
 ## License
 
 MIT
+
+## Buddy-task fork
+
+The `buddies-cambium` branch adds a scoped Buddy task backend. Buddy tasks remain
+the authority for ownership, done criteria, blockers and acceptance. Oompa owns
+execution, isolated workspaces and candidate review; it does not mirror tasks
+into `tasks/`. Existing filesystem mode remains available for upstream projects.
+
+```json
+{
+  "task_backend": {
+    "type": "buddies",
+    "workspace_id": "your-workspace-id",
+    "buddy_id": "accountable-buddy-id",
+    "task_ids": ["task-first", "task-next"],
+    "dependencies": {"task-next": ["task-first"]},
+    "url_env": "OOMPA_BUDDY_MCP_URL",
+    "authorization_env": "AGENT_CLI_MCP_UNLEASHD_BUDDY__AUTHORIZATION"
+  },
+  "workers": [
+    {"model": "codex:gpt-6.1-sol:medium", "max_cycle": 10,
+     "max_resumes": 100, "count": 1, "can_plan": false}
+  ]
+}
+```
+
+Start with `./swarm.bb tasks --config oompa.buddies.json` to check the selected
+canonical tasks without launching a model. Run from the target project with
+`/path/to/oompa/swarm.bb run --config oompa.buddies.json` after that check.
+The endpoint and bearer must come from the supported scoped Buddy runtime.
+Never save a bearer in configuration, use the owner's HTTP credentials, or open
+Buddy database files. Missing, expired or denied authority stops explicitly;
+there is no local-queue fallback. A turn-scoped bearer is not a durable daemon
+credential: unattended renewal needs a supported runtime grant lifecycle.
+
+Only explicit task IDs belonging to the configured Buddy and workspace are
+admitted. Claims compare the observed revision and preserve the accountable
+owner; blocked, paused, in-progress and review tasks are not new work. Explicit
+prerequisites must be in the admitted task set and actually done. The filesystem
+planner is disabled in Buddy mode. Workers receive the full task criteria and
+claim results through their prompt rather than finding JSON files themselves.
+
+A merge-ready signal submits the task to **review**, never **done**. Independent
+consumer/physics validation and the accountable Buddy still own acceptance.
+An empty runnable set with unfinished canonical tasks reports
+`awaiting-buddy-acceptance`, not beta completion. After process loss, existing
+in-progress tasks stay held until their owner reconciles the original run;
+Oompa must not silently recycle another executor's claim.
+
+This fork establishes the task/workspace adapter, not a replacement for the live
+wave_sim delivery controller. Task acceptance, supported grant renewal and the
+controller's next-task loop must be proven before switching the beta run.
