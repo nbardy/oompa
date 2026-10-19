@@ -154,5 +154,23 @@
   (with-redefs [filesystem/list-pending (fn [] [{:id "local"}])]
     (is (= [{:id "local"}] (tasks/list-pending)))))
 
+(deftest blocked-return-cas-retains-canonical-reason-owner-and-next-action
+  (let [store (atom {"one" (task "one" "open") "two" (task "two" "open")}) calls (atom [])
+        blocked {:reason "CUDA/replay/funding and full oracle absent"
+                 :requiredOwnerAction "Lead supplies authorized CUDA target"}]
+    (binding [buddy/*transport* (fake-transport store calls)]
+      (tasks/claim-by-id! "one")
+      (let [held (tasks/block-task! (tasks/get-task "one") blocked)]
+        (is (= "blocked" (:status held)))
+        (is (= (:reason blocked) (:blockedReason held)))
+        (is (= (:requiredOwnerAction blocked) (:nextAction held)))
+        (is (= "buddy" (:ownerId held)))
+        (is (= 3 (:revision held))))
+      (is (= ["two"] (mapv :id (tasks/list-pending))))
+      (tasks/claim-by-id! "two")
+      (swap! store update-in ["two" :revision] inc)
+      (is (thrown-with-msg? Exception #"changed" (tasks/block-task! (tasks/get-task "two") blocked)))
+      (is (= "in_progress" (get-in @store ["two" :status]))))))
+
 (let [{:keys [fail error]} (run-tests 'agentnet.buddy-tasks-test)]
   (when (pos? (+ fail error)) (System/exit 1)))

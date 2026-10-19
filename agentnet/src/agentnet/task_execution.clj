@@ -8,6 +8,22 @@
 (def schema "oompa.task-validation/v1")
 (defn now-ms [] (System/currentTimeMillis))
 (defn remaining-ms [deadline] (max 0 (- deadline (now-ms))))
+(defn blocked-result
+  "A selected-task hold signal only. Parse explicit JSON, never prose or an
+   acceptance claim. Supports a whole object, JSON lines, and fenced JSON."
+  [output task-id]
+  (let [output (or output "")
+        candidates (concat [output] (str/split-lines output)
+                           (map second (re-seq #"(?s)```(?:json)?\s*\n(.*?)```" output)))]
+    (some (fn [candidate]
+            (let [result (try (json/parse-string candidate true) (catch Exception _ nil))]
+              (when (and (map? result) (= "blocked" (:status result))
+                         (string? (:reason result)) (not (str/blank? (:reason result)))
+                         (false? (:taskComplete result)) (false? (:readyForMergeValidation result))
+                         (or (nil? (:requiredOwnerAction result)) (string? (:requiredOwnerAction result)))
+                         (or (nil? (:task_id result)) (= task-id (:task_id result))))
+                result)))
+          candidates)))
 (defn- sha256 [bytes]
   (format "%064x" (java.math.BigInteger. 1 (.digest (java.security.MessageDigest/getInstance "SHA-256") bytes))))
 (defn file-sha256 [path] (sha256 (java.nio.file.Files/readAllBytes (.toPath (io/file path)))))

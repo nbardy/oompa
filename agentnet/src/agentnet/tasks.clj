@@ -35,6 +35,9 @@
       (throw (ex-info "Executable acceptance requires the run-owned Buddy host" {}))))
 (defn complete-task! [task] (if (buddies?) (buddy/complete-task! task) (filesystem/complete-task! task)))
 (defn unclaim-task! [task] (if (buddies?) (buddy/unclaim-task! task) (filesystem/unclaim-task! task)))
+(defn block-task! [task result]
+  (if (buddies?) (buddy/block-task! task result)
+      (throw (ex-info "Selected-task holds require the Buddy backend" {}))))
 (defn claim-next! []
   (if (buddies?) (some buddy/claim-task! (list-pending)) (filesystem/claim-next!)))
 (defn claim-by-id!

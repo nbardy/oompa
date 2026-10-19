@@ -1818,6 +1818,9 @@
        "validation and integration. Do not merge, change task status, bypass checks, weaken a validator, "
        "start paid/GPU/deployment/account operations without existing project authorization, "
        "or claim another task. Follow the repository's AGENTS.md and owning task criteria.\n\n"
+       "If progress requires missing external evidence, access or authority, return a JSON object "
+       "with status=\"blocked\", reason (a nonempty string), taskComplete=false and "
+       "readyForMergeValidation=false. The framework retains this source/session pending an owner handoff.\n\n"
        (when (seq (:prompts worker))
          (str/join "\n\n" (keep load-prompt (:prompts worker))))
        (when feedback
@@ -1828,11 +1831,14 @@
 (defn- prepare-only? [config id]
   (boolean (some #{id} (:prepare_only_task_ids config))))
 
-(defn- selected-next-task! [worker config]
+(defn- selected-next-task! [worker config held]
   ;; Scan every eligible task. A missing oracle must not hide later runnable work.
   (some (fn [task]
           (when (and (or (execution/validator-for config (:id task))
                          (prepare-only? config (:id task)))
+                     (not= (:revision task)
+                           (or (:held_task_revision (get held (:id task)))
+                               (:claim_revision (get held (:id task)))))
                      (nil? (task-claim-denial worker task)))
             (tasks/claim-task! task)))
         (tasks/list-pending)))
@@ -1843,11 +1849,12 @@
                              :cycle (:cycle state) :attempt (:attempt state)
                              :execution state}))
 
-(defn- hold-selected [state reason]
+(defn- hold-selected [state reason & [task]]
   ;; This is execution recovery inside the existing run record, not another
   ;; task queue. Canonical Buddy status still decides what is eligible.
   (let [held (assoc (or (:held_executions state) {}) (:task_id state)
-                    (assoc (dissoc state :held_executions) :held_reason (name reason)))]
+                    (cond-> (assoc (dissoc state :held_executions) :held_reason (name reason))
+                      task (assoc :held_task_revision (:revision task))))]
     (reset! selected-active-owner nil)
     {:state {:cycle (inc (:cycle state)) :attempt 0 :deadline_ms (:deadline_ms state)
              :accepted_count (:accepted_count state) :held_executions held}}))
@@ -1891,7 +1898,10 @@
                        (= (:validator_digest execution)
                           (some-> (execution/validator-for config (:task_id execution)) execution/validator-digest)))
           (throw (ex-info "Selected execution resume lacks the exact registered source or validator pin" {})))
-        (when (and (= "in_progress" (:status task)) (not= "awaiting-acceptance" (:phase execution)))
+        ;; Held executions are retained, not reclaimed on startup. A canonical
+        ;; open transition goes through claim-task! before their source is reused.
+        (when (and (= execution saved) (= "in_progress" (:status task))
+                   (not= "awaiting-acceptance" (:phase execution)))
           (tasks/restore-claim! (:task_id execution) (:claim_revision execution)))
         (cambium/claim-existing! (System/getProperty "user.dir") found))
       ;; A resume does not create another 12-hour budget.
@@ -1912,6 +1922,7 @@
                       (+ (execution/now-ms) (* 1000 (:wall_time_seconds config))))
         initial (tasks/with-deadline deadline #(binding [cambium/*deadline-ms* deadline]
                                                (resume-selected-state worker config deadline)))
+        deadline (or (:deadline_ms initial) deadline)
         accepted (atom (or (:accepted_count initial) 0))
         finish (fn [status state & [error]]
                  (when (= [(:swarm-id worker) (:id worker)] @selected-active-owner)
@@ -1945,7 +1956,7 @@
                           state (assoc state :accepted_count @accepted)
                           task (if (:task_id state)
                                  (tasks/get-task (:task_id state))
-                                 (selected-next-task! worker config))
+                                 (selected-next-task! worker config (:held_executions state)))
                           prior-held (get (:held_executions state) (:id task))
                           state (if (and task prior-held)
                                   (merge prior-held (select-keys state [:deadline_ms :cycle :held_executions :accepted_count])
@@ -1973,12 +1984,13 @@
                           {:state {:cycle (inc (:cycle state)) :attempt 0 :deadline_ms deadline
                                    :accepted_count @accepted :held_executions (:held_executions state)}})
 
-                        (or (:paused task) (#{"blocked" "cancelled"} (:status task)))
-                        (hold-selected state :canonical-task-blocked)
+                        (or (:paused task) (#{"blocked" "cancelled"} (:status task))
+                            (and (= "review" (:status task)) (not= "awaiting-acceptance" (:phase state))))
+                        (hold-selected state :canonical-task-blocked task)
 
                         (and (not= "awaiting-acceptance" (:phase state))
                              (not= (:claim_revision state) (:revision task)))
-                        (hold-selected state :canonical-revision-conflict)
+                        (hold-selected state :canonical-revision-conflict task)
 
                         (= "awaiting-acceptance" (:phase state))
                         ;; Poll authoritative acceptance; a review token cannot advance.
@@ -2008,10 +2020,26 @@
                                                  (some? (:session_id state))
                                                  :resume-prompt-override (selected-prompt worker task (:feedback state)))
                               state (assoc state :session_id (or (:session-id result) (:session_id state)))
+                              ;; Persist the return before any external read can fail.
+                              state (update state :attempt_history (fnil conj [])
+                                            {:attempt (:attempt state) :session_id (:session_id state)
+                                             :exit (:exit result) :output (snippet (:output result) 4000)})
                               _ (reset! checkpoint state)
-                              _ (selected-state! worker state "running" nil)]
+                              _ (selected-state! worker state "running" nil)
+                              fresh (tasks/get-task (:id task))
+                              blocked (execution/blocked-result (:output result) (:id task))]
                           (cond
                             (zero? (execution/remaining-ms deadline)) {:stop :wall-time-exhausted :state state}
+                            (= "done" (:status fresh)) {:state state}
+                            (or (:paused fresh) (not= "in_progress" (:status fresh)))
+                            (hold-selected state :canonical-task-blocked fresh)
+                            (not= (:claim_revision state) (:revision fresh))
+                            (hold-selected state :canonical-revision-conflict fresh)
+                            blocked
+                            (let [state (assoc state :blocked_result blocked :feedback blocked)
+                                  _ (reset! checkpoint state)
+                                  held-task (tasks/block-task! fresh blocked)]
+                              (hold-selected state :model-blocked held-task))
                             (= 124 (:exit result)) (hold-selected state :attempt-timeout)
                             (not (zero? (:exit result)))
                             {:state (assoc state :feedback {:reason "model-attempt-failed" :exit (:exit result)

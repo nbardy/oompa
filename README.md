@@ -354,5 +354,13 @@ in the existing run recovery record while independent tasks advance; an empty
 runnable set is polled until the shared deadline. Missing validators permit only
 explicit preparation/review. Final completion requires every selected canonical
 task actually done, including the parent when it is included as an observed gate.
+Workers can return a JSON blocked result with `status: "blocked"`, a nonempty
+`reason`, `taskComplete: false`, `readyForMergeValidation: false`, and optional
+`requiredOwnerAction`. The framework CAS-holds the canonical task with its reason
+and next action before review, retaining its source/session and return history.
+Canonical status/revision is also rechecked after every model return. Held work
+resumes only after an explicit canonical `open` transition at a new revision;
+restarting the run or editing blocked-task metadata does not retry it or renew
+the deadline.
 The wave_sim all-beta example lives at `oompa/beta/all.json` in that repository.
 Its source, account, physical and human acceptance requirements remain unchanged.

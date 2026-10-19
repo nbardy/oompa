@@ -153,7 +153,7 @@
                  (if (map? denial) denial {:reason (str denial)}))
           {:status (if (claim-task! task) :claimed :already-taken) :id id})))))
 
-(defn- release! [task status]
+(defn- release! [task status & [details]]
   (let [id (:id task)
         owned-revision (get @claims id)]
     ;; Startup cleanup must never recycle another process's work.
@@ -162,7 +162,7 @@
         (when-not (and (= owned-revision (:revision fresh))
                        (= "in_progress" (:status fresh)) (false? (:paused fresh)))
           (throw (ex-info "Buddy task changed since this process claimed it; re-read and reconcile" {:type :revision-conflict :id id})))
-        (let [result (update! fresh {:status status})]
+        (let [result (update! fresh (merge details {:status status}))]
           (swap! claims dissoc id)
           result)))))
 
@@ -170,6 +170,13 @@
   ;; A model/merge signal is only a review handoff, never independent acceptance.
   (release! task "review"))
 (defn unclaim-task! [task] (release! task "open"))
+(defn block-task! [task result]
+  (when-not (and (string? (:reason result)) (not (str/blank? (:reason result)))
+                 (or (nil? (:requiredOwnerAction result)) (string? (:requiredOwnerAction result))))
+    (throw (ex-info "A canonical hold requires a nonempty reason and optional owner action" {})))
+  (release! task "blocked" (cond-> {:blockedReason (:reason result)}
+                            (not (str/blank? (:requiredOwnerAction result)))
+                            (assoc :nextAction (:requiredOwnerAction result)))))
 
 (defn restore-claim!
   "Restore only an explicitly selected persisted execution at its exact revision.

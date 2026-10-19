@@ -312,5 +312,160 @@
     (is (= :awaiting-buddy-acceptance (#'worker/stopped-reason [{:status :completed}] 0 true)))
     (is (= :wall-time-exhausted (#'worker/stopped-reason [{:status :wall-time-exhausted}] nil true)))))
 
+
+(def force-blocked-output
+  (str "```json\n"
+       (json/generate-string
+         {:status "blocked" :candidateCommit "e4e63b23f"
+          :reason "Required native force evidence cannot be produced under the unchanged CUDA, replay and funding holds."
+          :requiredOwnerAction "Supply authorized CUDA target, replay/funding decision and complete force/Product consumer oracle."
+          :taskComplete false :readyForMergeValidation false}
+         {:pretty true})
+       "\n```\nPlease retain this candidate pending the owner handoff."))
+
+(deftest blocked-result-is-explicit-structured-hold-only
+  (is (= "blocked" (:status (execution/blocked-result force-blocked-output "one"))))
+  (doseq [output ["Still blocked; no CUDA/replay/funding or oracle."
+                  "COMPLETE_AND_READY_FOR_MERGE"
+                  "{\"status\":\"blocked\",\"reason\":\"CUDA\"}"
+                  (json/generate-string {:status "accepted" :reason "done" :taskComplete false :readyForMergeValidation false})
+                  (json/generate-string {:status "blocked" :reason "" :taskComplete false :readyForMergeValidation false})
+                  (json/generate-string {:status "blocked" :reason "CUDA" :taskComplete true :readyForMergeValidation false})
+                  (json/generate-string {:status "blocked" :reason "CUDA" :taskComplete false :readyForMergeValidation false :task_id "other"})]]
+    (is (nil? (execution/blocked-result output "one")))))
+
+(deftest blocked-return-holds-before-review-and-continues-independent-work-and-survives-restart
+  ;; Replay the actual turn-five fenced object, plus races where canonical
+  ;; state changes during a model call that even claims merge readiness.
+  (doseq [mode [:structured :canonical-blocked :canonical-paused :canonical-review :canonical-revision :stopped-active]]
+    (testing (name mode)
+      (let [root (fixture-repo) previous-root (System/getProperty "user.dir")
+            store (atom {"one" (task "one" "open") "two" (task "two" "open")})
+            calls (atom []) model-calls (atom []) review-calls (atom []) workspaces (atom []) reopening? (atom false)
+            gate (validator root) shutdown (var-get #'worker/shutdown-requested?)
+            write-state! runs/write-worker-state!
+            backend {:type "buddies" :workspace_id "workspace" :buddy_id "buddy" :task_ids ["one" "two"]}
+            config {:id "w0" :swarm-id "blocked-before" :harness :codex :max-resumes 100
+                    :max-cycles 10 :prompts []
+                    :reviewers [{:harness :claude :model "opus-review" :reasoning "high"}]
+                    :task-execution {:wall_time_seconds 30 :attempt_timeout_seconds 1
+                                     :prepare_only_task_ids ["one"] :validators {"two" gate}}}
+            create-workspace! (fn [cycle]
+                                (let [path (str root "-hold-" cycle) branch (str "hold-" cycle)]
+                                  (git root "worktree" "add" "-b" branch path)
+                                  (let [ws {:path path :dir branch :name branch :branch branch}]
+                                    (swap! workspaces conj ws) ws)))]
+        (try
+          (System/setProperty "user.dir" root)
+          (reset! shutdown false)
+          (tasks/configure! backend)
+          (when (= :stopped-active mode)
+            ;; Exact recovery shape of e992a8d9: attempt 9 was stopped with
+            ;; claim revision 4; its owner subsequently held it at revision 5.
+            (swap! store assoc "one" (assoc (task "one" "blocked") :revision 5))
+            (write-state! "original" "w0"
+                          {:execution {:cycle 1 :attempt 9 :claim_revision 4 :task_id "one"
+                                       :session_id "01a15311-76ff-7201-a0ab-cd928d984daa"
+                                       :deadline_ms (+ (execution/now-ms) 20000) :accepted_count 0
+                                       :workspace (create-workspace! 1) :phase "implementing"
+                                       :validator_digest nil
+                                       :feedback {:reason "model-attempt-failed" :exit 143}}}))
+          (binding [buddy/*transport* (fixture-transport root store calls gate)]
+            (with-redefs [worker/build-template-tokens (fn [& _] {})
+                          worker/create-iteration-worktree! (fn [_ _ _ cycle] (create-workspace! cycle))
+                          cambium/list-workspaces (fn [_] @workspaces)
+                          cambium/claim-existing! (fn [_ ws] ws)
+                          cambium/remove! (fn [& _] {:removed? false})
+                          runs/write-worker-state!
+                          (fn [swarm id state]
+                            (write-state! swarm id state)
+                            (when (= "waiting" (:status state)) (reset! shutdown true)))
+                          harness/run-command!
+                          (fn [h opts]
+                            (if (= :claude h)
+                              (do (swap! review-calls conj opts) {:exit 0 :out "VERDICT: APPROVED" :err ""})
+                              (let [force? (and (not= :stopped-active mode) (empty? @model-calls))]
+                                (swap! model-calls conj opts)
+                                (when force?
+                                  (case mode
+                                    :canonical-blocked (swap! store update "one" #(-> % (assoc :status "blocked") (update :revision inc)))
+                                    :canonical-paused (swap! store update "one" #(-> % (assoc :paused true) (update :revision inc)))
+                                    :canonical-review (swap! store update "one" #(-> % (assoc :status "review") (update :revision inc)))
+                                    :canonical-revision (swap! store update-in ["one" :revision] inc)
+                                    nil))
+                                (when (and (not force?) (not @reopening?))
+                                  (commit-file! (:cwd opts) "two.txt" "repaired\n"))
+                                (when @reopening? (reset! shutdown true))
+                                {:exit 0 :err ""
+                                 :out (str (json/generate-string {:type "session.started" :sessionId (if (or force? @reopening?) "force-session" "independent-session")}) "\n"
+                                           (json/generate-string {:type "text.delta"
+                                                                 :text (cond @reopening? "Working on the explicitly reopened task"
+                                                                             (and force? (= :structured mode))
+                                                                             (str force-blocked-output "\nCOMPLETE_AND_READY_FOR_MERGE")
+                                                                             :else "COMPLETE_AND_READY_FOR_MERGE")}))})))]
+              (let [result (worker/run-worker! (cond-> config (= :stopped-active mode) (assoc :resume-swarm-id "original")))
+                    saved (:execution (runs/read-worker-state "blocked-before" "w0"))
+                    held (get-in saved [:held_executions :one])
+                    expected-session (if (= :stopped-active mode) "01a15311-76ff-7201-a0ab-cd928d984daa" "force-session")]
+                (is (= :interrupted (:status result)))
+                (is (= "done" (get-in @store ["two" :status])))
+                (is (= 1 (:completed result)))
+                (is (= (if (= :stopped-active mode) 1 2) (count @model-calls)))
+                (is (= 1 (count @review-calls)))
+                (is (= 1 (count (filter #(= "oompa" (first %)) @calls))))
+                (is (= expected-session (:session_id held)))
+                (is (= (if (= :stopped-active mode) 9 1) (:attempt held)))
+                (is (.isDirectory (io/file (get-in held [:workspace :path]))))
+                (when (= :structured mode)
+                  (is (= "model-blocked" (:held_reason held)))
+                  (is (= "blocked" (get-in @store ["one" :status])))
+                  (is (= (:reason (execution/blocked-result force-blocked-output "one"))
+                         (get-in @store ["one" :blockedReason])))
+                  (is (str/includes? (get-in @store ["one" :nextAction]) "CUDA"))
+                  (is (= 1 (count (:attempt_history held))))
+                  (is (str/includes? (get-in held [:attempt_history 0 :output]) "CUDA")))
+                (when (= :stopped-active mode)
+                  (is (= (:deadline_ms saved) (get-in (runs/read-worker-state "original" "w0") [:execution :deadline_ms])))
+                  (is (= 4 (:claim_revision held)))
+                  (is (= 5 (:held_task_revision held))))
+                ;; Restart cannot retry unchanged held work, even when its
+                ;; canonical state remains in_progress with a newer revision.
+                (reset! shutdown false)
+                (tasks/configure! backend)
+                (let [restarted (worker/run-worker! (assoc config :swarm-id "blocked-after" :resume-swarm-id "blocked-before"))
+                      after (:execution (runs/read-worker-state "blocked-after" "w0"))]
+                  (is (= :interrupted (:status restarted)))
+                  (is (= saved after))
+                  (is (= (if (= :stopped-active mode) 1 2) (count @model-calls)))
+                  (is (= 1 (count @review-calls))))
+                (when (= :structured mode)
+                  ;; Metadata edits while blocked do not reopen the task.
+                  (swap! store update "one" #(-> % (assoc :nextAction "Owner is investigating") (update :revision inc)))
+                  (reset! shutdown false)
+                  (tasks/configure! backend)
+                  (worker/run-worker! (assoc config :swarm-id "metadata-only" :resume-swarm-id "blocked-after"))
+                  (is (= 2 (count @model-calls)))
+                  ;; Only an explicit open at a new revision resumes the
+                  ;; retained workspace/session; stopping here avoids any gate.
+                  (swap! store update "one" #(-> % (assoc :status "open") (update :revision inc)))
+                  (reset! reopening? true)
+                  (reset! shutdown false)
+                  (tasks/configure! backend)
+                  (worker/run-worker! (assoc config :swarm-id "reopened" :resume-swarm-id "metadata-only"))
+                  (let [resumed (:execution (runs/read-worker-state "reopened" "w0"))]
+                    (is (= 3 (count @model-calls)))
+                    (is (= (:workspace held) (:workspace resumed)))
+                    (is (= "force-session" (:session-id (last @model-calls))))
+                    (is (:resume? (last @model-calls)))
+                    (is (= (:deadline_ms saved) (:deadline_ms resumed)))
+                    (is (= 2 (:attempt resumed)))
+                    (is (= 2 (count (:attempt_history resumed)))))))))
+          (finally
+            (reset! shutdown false)
+            (tasks/configure! nil)
+            (System/setProperty "user.dir" previous-root)
+            (doseq [workspace @workspaces] (fs/delete-tree (:path workspace)))
+            (fs/delete-tree root)))))))
+
 (let [{:keys [fail error]} (run-tests 'agentnet.task-execution-test)]
   (when (pos? (+ fail error)) (System/exit 1)))
