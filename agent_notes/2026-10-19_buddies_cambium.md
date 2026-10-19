@@ -119,3 +119,33 @@ no real model, scoped task mutation, cloud/GPU/paid launch or live-tree edit.
 The committed selected-execution and Buddy-task suites are rechecked separately
 for the recovery handoff. Existing native turns 1–9 remain in their original
 session log; the patch does not invent missing historical return records.
+
+## Host diagnostic continuation handoff — October 19
+
+Blocker: a host diagnostic can observe idle workers and then race canonical task
+selection. Target: explicit host-owned continuation-request.json pause, with an
+acknowledgement in each idle worker's existing state before diagnostics start.
+Keep held source/session/history and the original deadline; active execution is
+never acknowledged idle. Cheapest check: fake transport/model and a temporary
+request file, reopen a held task while paused, then remove the request. Pass:
+no selection/model/review/validation until removal, fresh waiting timestamps,
+same execution resumes, and shutdown/deadline stop bounded waits. Invalid input
+fails closed. No live models, jobs, grants or canonical task mutations. Claim
+boundary: cross-process harness safety only, not beta or physics acceptance.
+
+Result: selected workers read only the host's exact control request. Idle workers
+refresh their existing waiting record with the exact continuation id until the
+request disappears; original shutdown/deadline limits still stop them. A held
+task reopened during the pause does not run until removal, then reuses its
+source/session/history without renewing its deadline. Active implementation or
+validation never acknowledges idle. Invalid request contents and unavailable
+control directories stop fail closed. Started metadata records the inherited
+control directory so the host can reject old/incompatible executors.
+
+Validation: `continuation_control_test.clj` passes 5 tests / 57 assertions,
+including a real child-process environment/started-metadata check. Diff checks
+pass. The existing selected execution suite ran 8 tests / 171 assertions with
+6 failures and 1 error in its four-second repair-and-next-task case. Loading
+the unchanged 6551343 worker and replaying that case alone also exhausts its
+wall budget (5 failures / 21 assertions); no legacy timing/test change is made.
+No live model, job or canonical mutation was launched.

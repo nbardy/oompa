@@ -63,6 +63,7 @@
                 :started-at (str (java.time.Instant/now))
                 :pid (.pid (java.lang.ProcessHandle/current))
                 :config-file config-file
+                :continuation-control-dir (System/getenv "OOMPA_CONTINUATION_CONTROL_DIR")
                 :workers (mapv (fn [w]
                                  {:id (:id w)
                                   :harness (name (:harness w))

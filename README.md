@@ -362,5 +362,17 @@ Canonical status/revision is also rechecked after every model return. Held work
 resumes only after an explicit canonical `open` transition at a new revision;
 restarting the run or editing blocked-task metadata does not retry it or renew
 the deadline.
+Host launches may set `OOMPA_CONTINUATION_CONTROL_DIR` to an existing private
+execution journal directory. Before an authorized bounded diagnostic, the host
+atomically writes `continuation-request.json` with a nonempty string `id`.
+Selected workers acknowledge only when they have no active task, using live state
+`status: "waiting"`, `reason: "host-continuation"` and
+`execution.host_continuation_id`. Held executions remain intact. The host waits
+for every started worker to acknowledge the exact id before running diagnostics,
+then removes the request on completion, stop, failure or expiry. Workers refresh
+their waiting state and do no task selection until removal; original deadlines
+and shutdown still apply. Active tasks continue to their normal checkpoint/hold
+without an idle acknowledgement. Invalid requests stop fail closed; without the
+environment variable the existing selection behavior is unchanged.
 The wave_sim all-beta example lives at `oompa/beta/all.json` in that repository.
 Its source, account, physical and human acceptance requirements remain unchanged.

@@ -1849,6 +1849,24 @@
                              :cycle (:cycle state) :attempt (:attempt state)
                              :execution state}))
 
+(defn- continuation-control-dir []
+  (System/getenv "OOMPA_CONTINUATION_CONTROL_DIR"))
+
+(defn- host-continuation-request [control-dir]
+  ;; Read only the exact host-owned request, never neighbouring authority files.
+  ;; Removal races are normal; malformed/unreadable requests must fail closed.
+  (when control-dir
+    (when-not (and (not (str/blank? control-dir)) (.isDirectory (io/file control-dir)))
+      (throw (ex-info "Continuation control directory is unavailable" {})))
+    (when-let [contents (try
+                         (java.nio.file.Files/readString
+                          (.toPath (io/file control-dir "continuation-request.json")))
+                         (catch java.nio.file.NoSuchFileException _ nil))]
+      (let [request (json/parse-string contents true)]
+        (when-not (and (map? request) (string? (:id request)) (not (str/blank? (:id request))))
+          (throw (ex-info "Continuation request requires a nonempty string id" {})))
+        request))))
+
 (defn- hold-selected [state reason & [task]]
   ;; This is execution recovery inside the existing run record, not another
   ;; task queue. Canonical Buddy status still decides what is eligible.
@@ -1917,6 +1935,7 @@
   (when-not (tasks/buddies?)
     (throw (ex-info "task_execution requires the canonical Buddy task backend" {})))
   (let [config (execution/validate-config! (:task-execution worker))
+        control-dir (continuation-control-dir)
         root (System/getProperty "user.dir")
         deadline (min (or (:deadline_ms config) Long/MAX_VALUE)
                       (+ (execution/now-ms) (* 1000 (:wall_time_seconds config))))
@@ -1936,10 +1955,19 @@
     (tasks/with-deadline deadline (fn []
     (binding [cambium/*deadline-ms* deadline]
     (loop [state (or initial {:cycle 1 :attempt 0 :accepted_count 0 :deadline_ms deadline})]
-      (let [deadline (:deadline_ms state)]
+      (let [deadline (:deadline_ms state)
+            control (try (host-continuation-request control-dir)
+                         (catch Exception e {:invalid (.getMessage e)}))
+            state (if (:id control) state (dissoc state :host_continuation_id))]
         (cond
           @shutdown-requested? (finish :interrupted state)
           (zero? (execution/remaining-ms deadline)) (finish :wall-time-exhausted state)
+          (:invalid control) (finish :continuation-control-invalid state (:invalid control))
+          (and (:id control) (nil? (:task_id state)))
+          (let [state (assoc state :host_continuation_id (:id control))]
+            (selected-state! worker state "waiting" :host-continuation)
+            (Thread/sleep (min 1000 (execution/remaining-ms deadline)))
+            (recur state))
           (>= @accepted (or (:max-cycles worker) 10))
           (finish (if (selected-all-accepted?) :completed :budget-exhausted) state)
           :else
