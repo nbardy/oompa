@@ -327,6 +327,20 @@ host's owner-authorized `oompa` launch tool, which creates a separate task-scope
 connection lasting only that run (up to twelve hours). It survives chat completion
 and backend replacement; stop, exit and deadline revoke it.
 
+Deadline-bound Cambium workspace creation may take up to ten minutes to
+materialize tracked files and dependency layers, clipped to the original run
+deadline. Other Cambium/Git queries retain their thirty-second limit. A timeout
+retains any partial workspace and owner metadata without fallback or deletion.
+Creation resolves the launch checkout's exact HEAD (including a linked checkout),
+passes that commit explicitly to Cambium and verifies the resulting HEAD before
+starting a model. It never relies on the primary checkout's default branch.
+On supported resume, a recorded creation failure before any model/session exists
+may retry provisioning once at the same exact canonical claim and original
+deadline. Partial directories remain evidence, never assumed valid source. Held
+work with model history still requires its original registered workspace and
+validator identity; blocked or changed canonical claims are never retried by
+this startup repair.
+
 Only explicit task IDs belonging to the configured Buddy and workspace are
 admitted. Claims compare the observed revision and preserve the accountable
 owner; blocked, paused, in-progress and review tasks are not new work. Explicit

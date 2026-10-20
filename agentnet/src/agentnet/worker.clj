@@ -1903,6 +1903,26 @@
       "rejected" {:state (assoc state :phase "implementing" :feedback receipt)}
       "blocked" (hold-selected state :validation-blocked))))
 
+(defn- unstarted-provisioning? [state]
+  (and (:task_id state) (:claim_revision state)
+       (zero? (or (:attempt state) 0)) (nil? (:workspace state))
+       (nil? (:session_id state)) (empty? (:attempt_history state))
+       (= "execution-blocked" (:held_reason state))
+       (or (seq (:provisioning_failures state))
+           ;; Older journals lost exception metadata before the first model.
+           (str/starts-with? (or (get-in state [:feedback :error]) "")
+                             "Cambium creation failed; workspace retained if partially created:"))))
+
+(defn- recover-provisioning-task! [held]
+  (some (fn [[id state]]
+          (when (:startup_recovery_ready state)
+            (let [task (tasks/get-task (execution/key-string id))]
+              (when (and (= "in_progress" (:status task)) (false? (:paused task))
+                         (= (:claim_revision state) (:revision task)))
+                (tasks/restore-claim! (:id task) (:revision task))
+                task))))
+        held))
+
 (defn- resume-selected-state [worker config deadline]
   (when-let [resume-id (:resume-swarm-id worker)]
     (let [saved (:execution (runs/read-worker-state resume-id (:id worker)))
@@ -1912,20 +1932,35 @@
               :let [workspace (:workspace execution)
                     found (some #(when (= (:path workspace) (:path %)) %) registered)
                     task (tasks/get-task (:task_id execution))]]
-        (when-not (and found
-                       (= (:validator_digest execution)
-                          (some-> (execution/validator-for config (:task_id execution)) execution/validator-digest)))
+        (when-not (or (and (unstarted-provisioning? execution)
+                          ;; No source or model existed to resume. A nonnil
+                          ;; recorded oracle identity still must match.
+                          (or (nil? (:validator_digest execution))
+                              (= (:validator_digest execution)
+                                 (some-> (execution/validator-for config (:task_id execution)) execution/validator-digest))))
+                     (and found
+                          (= (:validator_digest execution)
+                             (some-> (execution/validator-for config (:task_id execution)) execution/validator-digest))))
           (throw (ex-info "Selected execution resume lacks the exact registered source or validator pin" {})))
         ;; Held executions are retained, not reclaimed on startup. A canonical
         ;; open transition goes through claim-task! before their source is reused.
         (when (and (= execution saved) (= "in_progress" (:status task))
                    (not= "awaiting-acceptance" (:phase execution)))
           (tasks/restore-claim! (:task_id execution) (:claim_revision execution)))
-        (cambium/claim-existing! (System/getProperty "user.dir") found))
+        (when found (cambium/claim-existing! (System/getProperty "user.dir") found)))
       ;; A resume does not create another 12-hour budget.
       (-> saved
           (assoc :deadline_ms (min deadline (:deadline_ms saved)))
-          (update :held_executions #(into {} (map (fn [[id execution]] [(execution/key-string id) execution]) %)))))))
+          (update :held_executions
+                  #(into {} (map (fn [[id state]]
+                                   [(execution/key-string id)
+                                    (if (unstarted-provisioning? state)
+                                      (let [failures (or (seq (:provisioning_failures state))
+                                                         [{:kind "legacy-creation-failure"
+                                                           :error (get-in state [:feedback :error])}])]
+                                        (cond-> (assoc state :provisioning_failures (vec failures))
+                                          (< (count failures) 2) (assoc :startup_recovery_ready true)))
+                                      state)]) %)))))))
 
 (defn run-selected-worker!
   "Bounded, fail-closed Buddy consumer loop. Model output requests validation;
@@ -1984,10 +2019,12 @@
                           state (assoc state :accepted_count @accepted)
                           task (if (:task_id state)
                                  (tasks/get-task (:task_id state))
-                                 (selected-next-task! worker config (:held_executions state)))
+                                 (or (recover-provisioning-task! (:held_executions state))
+                                     (selected-next-task! worker config (:held_executions state))))
                           prior-held (get (:held_executions state) (:id task))
                           state (if (and task prior-held)
-                                  (merge prior-held (select-keys state [:deadline_ms :cycle :held_executions :accepted_count])
+                                  (merge (dissoc prior-held :startup_recovery_ready)
+                                         (select-keys state [:deadline_ms :cycle :held_executions :accepted_count])
                                          {:claim_revision (:revision task) :phase "implementing"}) state)
                           state (if prior-held (update state :held_executions dissoc (:id task)) state)
                           state (if (and task (not (:task_id state)))
@@ -2032,6 +2069,8 @@
 
                         :else
                         (let [validator (execution/validator-for config (:id task))
+                              state (assoc state :validator_digest (some-> validator execution/validator-digest))
+                              _ (reset! checkpoint state)
                               workspace (or (:workspace state)
                                             (create-iteration-worktree! root (:swarm-id worker) (:id worker) (:cycle state)))
                               state (assoc state :task_id (:id task) :claim_revision (:revision task)
@@ -2115,8 +2154,15 @@
                                 (host-validation-step! worker task state))))))))
                     (catch Exception e
                       (if (:task_id @checkpoint)
-                        (let [state (assoc @checkpoint :feedback {:error (.getMessage e)
-                                                                 :reason (some-> (ex-data e) :reason name)})]
+                        (let [data (ex-data e)
+                              state (cond-> (assoc @checkpoint :feedback {:error (.getMessage e)
+                                                                         :reason (some-> data :reason name)})
+                                      (and (nil? (:workspace @checkpoint))
+                                           (zero? (or (:attempt @checkpoint) 0))
+                                           (:path data) (:dir data) (:branch data))
+                                      (update :provisioning_failures (fnil conj [])
+                                              (assoc (select-keys data [:path :dir :branch :source_commit :result])
+                                                     :kind "creation-failure")))]
                           (if (= :dirty-source (:reason (ex-data e)))
                             {:state state}
                             (hold-selected state :execution-blocked)))

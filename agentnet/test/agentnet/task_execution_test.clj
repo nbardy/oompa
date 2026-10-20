@@ -467,5 +467,75 @@
             (doseq [workspace @workspaces] (fs/delete-tree (:path workspace)))
             (fs/delete-tree root)))))))
 
+(deftest provisioning-failure-advances-independent-work-then-resumes-only-unstarted-claim
+  (let [root (fixture-repo) previous-root (System/getProperty "user.dir")
+        store (atom {"one" (task "one" "open") "two" (task "two" "open")
+                     "parent" (task "parent" "blocked")})
+        calls (atom []) model-calls (atom []) creates (atom 0) workspaces (atom [])
+        gate (validator root) shutdown (var-get #'worker/shutdown-requested?)
+        backend {:type "buddies" :workspace_id "workspace" :buddy_id "buddy"
+                 :task_ids ["one" "two" "parent"]}
+        config {:id "w0" :swarm-id "startup-before" :harness :codex
+                :max-resumes 5 :max-cycles 10 :prompts []
+                :reviewers [{:harness :claude :model "review"}]
+                :task-execution {:wall_time_seconds 20 :attempt_timeout_seconds 2
+                                 :validators {"one" gate "two" gate}}}
+        write-state! runs/write-worker-state!]
+    (try
+      (System/setProperty "user.dir" root) (reset! shutdown false)
+      (tasks/configure! backend)
+      (binding [buddy/*transport* (fixture-transport root store calls gate)]
+        (with-redefs [worker/build-template-tokens (fn [& _] {})
+                      worker/create-iteration-worktree!
+                      (fn [_ _ _ cycle]
+                        (if (= 1 (swap! creates inc))
+                          (throw (ex-info "Cambium creation failed; workspace retained if partially created: partial"
+                                          {:path (str root "/partial") :dir "partial" :branch "partial"
+                                           :result {:exit 124 :timed-out? true}}))
+                          (let [path (str root "-startup-" cycle) branch (str "startup-" cycle)]
+                            (git root "worktree" "add" "-b" branch path)
+                            (let [workspace {:path path :dir branch :name branch :branch branch}]
+                              (swap! workspaces conj workspace) workspace))))
+                      cambium/list-workspaces (fn [_] @workspaces)
+                      cambium/claim-existing! (fn [_ ws] ws)
+                      cambium/remove! (fn [& _] {:removed? false})
+                      runs/write-worker-state!
+                      (fn [swarm id state]
+                        (write-state! swarm id state)
+                        (when (= "waiting" (:status state)) (reset! shutdown true)))
+                      harness/run-command!
+                      (fn [h opts]
+                        (if (= :claude h)
+                          {:exit 0 :out "VERDICT: APPROVED" :err ""}
+                          (let [id (if (empty? @model-calls) "two" "one")]
+                            (swap! model-calls conj {:id id :options opts})
+                            (commit-file! (:cwd opts) (str id ".txt") "repaired\n")
+                            {:exit 0 :err ""
+                             :out (str (json/generate-string {:type "session.started" :sessionId (str id "-session")}) "\n"
+                                       (json/generate-string {:type "text.delta" :text "COMPLETE_AND_READY_FOR_MERGE"}))})))]
+          (worker/run-worker! config)
+          (let [before (:execution (runs/read-worker-state "startup-before" "w0"))
+                held (get-in before [:held_executions :one])]
+            (is (= ["two"] (mapv :id @model-calls)))
+            (is (= "in_progress" (get-in @store ["one" :status])))
+            (is (= "done" (get-in @store ["two" :status])))
+            (is (nil? (:workspace held))) (is (nil? (:session_id held)))
+            (is (zero? (:attempt held)))
+            (is (= (str root "/partial") (get-in held [:provisioning_failures 0 :path])))
+            (reset! shutdown false) (tasks/configure! backend)
+            (worker/run-worker! (assoc config :swarm-id "startup-after" :resume-swarm-id "startup-before"))
+            (let [after (:execution (runs/read-worker-state "startup-after" "w0"))]
+              (is (= ["two" "one"] (mapv :id @model-calls)))
+              (is (= 3 @creates))
+              (is (= (:deadline_ms before) (:deadline_ms after)))
+              (is (= "done" (get-in @store ["one" :status])))
+              (is (= "blocked" (get-in @store ["parent" :status])))
+              (is (= 2 (:accepted_count after)))))))
+      (finally
+        (reset! shutdown false) (tasks/configure! nil)
+        (System/setProperty "user.dir" previous-root)
+        (doseq [workspace @workspaces] (fs/delete-tree (:path workspace)))
+        (fs/delete-tree root)))))
+
 (let [{:keys [fail error]} (run-tests 'agentnet.task-execution-test)]
   (when (pos? (+ fail error)) (System/exit 1)))

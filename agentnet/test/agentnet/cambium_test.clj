@@ -4,13 +4,16 @@
             [cheshire.core :as json]
             [agentnet.worker :as worker]
             [agentnet.harness :as harness]
+            [agentnet.bounded-process :as bounded]
             [agentnet.agent :as agent]
             [agentnet.worktree :as worktree]
             [babashka.process :as process]
+            [babashka.fs :as fs]
             [clojure.java.io :as io]
             [clojure.test :refer [deftest is testing run-tests]]))
 
 (def root "/tmp/oompa-lifecycle-test")
+(def source (apply str (repeat 40 "a")))
 (def workspace {:name "oompa-test" :dir "oompa-test" :branch "oompa/test"
                 :path (cambium/workspace-path root "oompa-test")})
 
@@ -19,6 +22,8 @@
     (swap! calls conj [cmd opts])
     (merge {:exit 0 :out "" :err ""}
            (cond
+             (and (= ["git" "rev-parse"] (take 2 cmd))
+                  (#{"HEAD" "HEAD^{commit}"} (last cmd))) {:out (str source "\n")}
              (= ["git" "symbolic-ref" "--short" "HEAD"] cmd) {:out "oompa/test\n"}
              (= ["git" "rev-parse" "--git-path"] (take 3 cmd))
              {:out (str "/tmp/oompa-nonexistent-marker-" (last cmd))})
@@ -33,19 +38,112 @@
             cmd (ffirst @calls)]
         (is (not= (:path a) (:path b)))
         (is (not (.startsWith (.toPath (io/file (:path a))) (.toPath (io/file root)))))
-        (is (= ["git" "cambium" "add" "-b"] (subvec cmd 0 4)))
-        (is (= ["-name" (:name a) "-ephemeral" (:path a)] (subvec cmd 5)))
-        (is (= 2 (count @calls)))))))
+        (is (= ["git" "rev-parse" "--verify" "HEAD^{commit}"] cmd))
+        (is (= ["-name" (:name a) "-ephemeral" (:path a) source] (subvec (first (second @calls)) 5)))
+        (is (= source (:source_commit a)))
+        (is (= 6 (count @calls)))))))
+
+(deftest linked-root-head-is-explicit-even-when-primary-main-differs
+  (let [parent (str (fs/create-temp-dir {:prefix "oompa-source-"}))
+        primary (str (io/file parent "primary")) linked (str (io/file parent "linked"))
+        actual-sh process/sh commands (atom [])
+        git! (fn [cwd & args]
+               (let [result (actual-sh (into ["git"] args) {:dir cwd :out :string :err :string})]
+                 (when-not (zero? (:exit result)) (throw (ex-info "Fixture git failed" result)))
+                 (clojure.string/trim (:out result))))]
+    (try
+      (.mkdirs (io/file primary))
+      (git! primary "init" "-b" "main")
+      (git! primary "config" "user.name" "Fixture")
+      (git! primary "config" "user.email" "fixture@example.invalid")
+      (spit (io/file primary "source.txt") "primary")
+      (git! primary "add" ".") (git! primary "commit" "-m" "primary")
+      (git! primary "worktree" "add" "-b" "retained" linked)
+      (spit (io/file linked "source.txt") "retained")
+      (git! linked "add" ".") (git! linked "commit" "-m" "retained")
+      (let [expected (git! linked "rev-parse" "HEAD")]
+        (is (not= expected (git! primary "rev-parse" "HEAD")))
+        (with-redefs [process/sh
+                      (fn [argv opts]
+                        (swap! commands conj argv)
+                        (if (= ["git" "cambium" "add"] (take 3 argv))
+                          (do (fs/copy-tree linked (nth argv 8)) {:exit 0 :out "" :err ""})
+                          (actual-sh argv opts)))
+                      cambium/mark-owner! (fn [& _] nil)
+                      cambium/workspace-path (fn [_ name] (str (io/file parent name)))]
+          (let [created (cambium/create! linked "worker" "oompa/")
+                add (first (filter #(= ["git" "cambium" "add"] (take 3 %)) @commands))]
+            (is (= expected (last add)))
+            (is (= expected (:source_commit created)))
+            (is (= expected (git! (:path created) "rev-parse" "HEAD"))))))
+      (finally (fs/delete-tree parent)))))
+
+(deftest unexpected-created-head-refuses-before-model-with-retained-path
+  (let [calls (atom [])]
+    (with-redefs [process/sh (shell-stub calls {["git" "rev-parse" "HEAD"]
+                                              {:out (apply str (repeat 40 "b"))}})
+                  cambium/mark-owner! (fn [& _] nil)]
+      (let [failure (try (cambium/create! root "worker" "oompa/")
+                         (catch clojure.lang.ExceptionInfo error error))]
+        (is (clojure.string/includes? (.getMessage failure) "unexpected source"))
+        (is (= source (:source_commit (ex-data failure))))
+        (is (:path (ex-data failure)))
+        (is (= 3 (count @calls)))))))
 
 (deftest creation-failure-never-falls-back-or-removes
   (let [calls (atom [])]
     (with-redefs [process/sh (fn [cmd opts] (swap! calls conj [cmd opts])
-                              {:exit 1 :err "Cambium unavailable"})
+                              (if (= "rev-parse" (second cmd))
+                                {:exit 0 :out source}
+                                {:exit 1 :err "Cambium unavailable"}))
                   cambium/mark-owner! (fn [& _] nil)]
       (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Cambium creation failed"
                            (cambium/create! root "worker" "oompa/")))
-      (is (= 1 (count @calls)))
-      (is (= ["git" "cambium" "add"] (take 3 (ffirst @calls)))))))
+      (is (= 2 (count @calls)))
+      (is (= ["git" "cambium" "add"] (take 3 (first (second @calls))))))))
+
+(deftest creation-budget-is-scoped-and-clipped-to-original-deadline
+  (let [calls (atom [])
+        run (fn [argv opts timeout]
+              (swap! calls conj {:argv argv :timeout timeout})
+              {:exit 0 :out (str source "\n") :err ""})]
+    (with-redefs [bounded/run! run cambium/mark-owner! (fn [& _] nil)]
+      (binding [cambium/*deadline-ms* (+ (System/currentTimeMillis) 720000)]
+        (cambium/create! root "worker" "oompa/")
+        (cambium/project-root))
+      (is (= [30000 600000 30000 30000] (mapv :timeout @calls)))
+      (reset! calls [])
+      (binding [cambium/*deadline-ms* (+ (System/currentTimeMillis) 10000)]
+        (cambium/create! root "worker" "oompa/"))
+      (is (= 3 (count @calls)))
+      (is (every? #(< 0 (:timeout %) 10001) @calls))
+      (reset! calls [])
+      (binding [cambium/*deadline-ms* (dec (System/currentTimeMillis))]
+        (is (thrown-with-msg? clojure.lang.ExceptionInfo #"Cannot resolve exact Cambium starting source"
+                             (cambium/create! root "worker" "oompa/"))))
+      (is (empty? @calls)))))
+
+(deftest creation-timeout-retains-partial-custody-without-retry
+  (let [marks (atom []) calls (atom [])]
+    (with-redefs [cambium/mark-owner! (fn [& args] (swap! marks conj args))
+                  bounded/run! (fn [argv _ timeout]
+                                 (swap! calls conj [argv timeout])
+                                 (if (= "rev-parse" (second argv))
+                                   {:exit 0 :out source}
+                                   {:exit 124 :out "" :err "partial dependency clone timed out"
+                                    :timed-out? true :duration-ms timeout}))]
+      (binding [cambium/*deadline-ms* (+ (System/currentTimeMillis) 720000)]
+        (let [failure (try (cambium/create! root "worker" "oompa/")
+                           (catch clojure.lang.ExceptionInfo error error))
+              data (ex-data failure)]
+          (is (instance? clojure.lang.ExceptionInfo failure))
+          (is (= 1 (count @marks)))
+          (is (= 2 (count @calls)))
+          (is (= ["git" "cambium" "add"] (take 3 (first (second @calls)))))
+          (is (= 600000 (second (second @calls))))
+          (is (true? (get-in data [:result :timed-out?])))
+          (is (= (cambium/workspace-path root (:dir data)) (:path data)))
+          (is (= (:dir data) (second (first @marks)))))))))
 
 (deftest cleanup-only-removes-clean-integrated-inactive-work
   (doseq [[label additions overrides expected]

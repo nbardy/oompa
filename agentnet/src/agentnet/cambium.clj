@@ -8,10 +8,16 @@
             [clojure.string :as str]))
 
 (def ^:dynamic *deadline-ms* nil)
-(defn- run! [argv opts]
-  (if *deadline-ms*
-    (bounded/run! argv opts (max 1 (min 30000 (- *deadline-ms* (System/currentTimeMillis)))))
-    (process/sh argv opts)))
+(defn- run!
+  ([argv opts] (run! argv opts 30000))
+  ([argv opts operation-limit-ms]
+   (if *deadline-ms*
+     (let [remaining (- *deadline-ms* (System/currentTimeMillis))]
+       (if (pos? remaining)
+         (bounded/run! argv opts (min operation-limit-ms remaining))
+         {:exit 124 :out "" :err "Run deadline exhausted before Cambium command"
+          :timed-out? true :duration-ms 0}))
+     (process/sh argv opts))))
 (defn- git [root & args]
   (run! (into ["git"] args) {:dir root :out :string :err :string}))
 
@@ -70,19 +76,30 @@
 (defn create!
   ([root label branch-prefix] (create! root label branch-prefix nil))
   ([root label branch-prefix start-point]
-  (let [workspace-name (str "oompa-" (str/replace label #"[^A-Za-z0-9_.-]" "-")
+  (let [resolved (git root "rev-parse" "--verify" (str (or start-point "HEAD") "^{commit}"))
+        source (str/trim (:out resolved))
+        _ (when-not (and (zero? (:exit resolved)) (re-matches #"[a-f0-9]{40,64}" source))
+            (throw (ex-info "Cannot resolve exact Cambium starting source" {:result resolved})))
+        workspace-name (str "oompa-" (str/replace label #"[^A-Za-z0-9_.-]" "-")
                             "-" (java.util.UUID/randomUUID))
         path (workspace-path root workspace-name)
         branch (str branch-prefix workspace-name)
         _ (.mkdirs (.getParentFile (io/file path)))
         _ (mark-owner! root workspace-name)
-        result (apply git root (cond-> ["cambium" "add" "-b" branch "-name" workspace-name "-ephemeral" path]
-                                 start-point (conj start-point)))]
+        ;; Creation materializes tracked files and clones dependency layers; it
+        ;; is not a small Git query. Keep the original absolute run deadline.
+        result (run! ["git" "cambium" "add" "-b" branch "-name" workspace-name "-ephemeral" path source]
+                     {:dir root :out :string :err :string} 600000)]
     (when-not (zero? (:exit result))
       (throw (ex-info (str "Cambium creation failed; workspace retained if partially created: "
                            path " (" (str/trim (str (:err result))) ")")
-                      {:dir workspace-name :branch branch :path path :result result})))
-    {:dir workspace-name :name workspace-name :branch branch :path path :project-root root})))
+                      {:dir workspace-name :branch branch :path path :source_commit source :result result})))
+    (let [created (git path "rev-parse" "HEAD")]
+      (when-not (and (zero? (:exit created)) (= source (str/trim (:out created))))
+        (throw (ex-info "Cambium created unexpected source; workspace retained"
+                        {:dir workspace-name :branch branch :path path :source_commit source :result created}))))
+    {:dir workspace-name :name workspace-name :branch branch :path path :project-root root
+     :source_commit source})))
 
 (defn remove!
   "Remove only a clean, inactive Cambium workspace whose branch is integrated.
