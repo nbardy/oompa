@@ -343,8 +343,9 @@ this startup repair.
 
 Only explicit task IDs belonging to the configured Buddy and workspace are
 admitted. Claims compare the observed revision and preserve the accountable
-owner; blocked, paused, in-progress and review tasks are not new work. Explicit
-prerequisites must be in the admitted task set and actually done. The filesystem
+owner; blocked, paused, in-progress and review tasks are not new work. Configured
+`task_ids` order determines selection priority; prerequisite checks still apply.
+Explicit prerequisites must be in the admitted task set and actually done. The filesystem
 planner is disabled in Buddy mode. Workers receive the full task criteria and
 claim results through their prompt rather than finding JSON files themselves.
 

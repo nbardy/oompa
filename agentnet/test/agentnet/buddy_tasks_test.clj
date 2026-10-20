@@ -51,6 +51,25 @@
         (is (= "created" (:id (tasks/create-task! {:summary "new" :acceptance ["passes"]}))))
         (is (= "buddy" (get-in @store ["created" :ownerId])))))))
 
+(deftest explicit-selection-order-controls-claims-without-bypassing-dependencies
+  (tasks/configure! (assoc config :task_ids ["two" "one" "two"] :dependencies {"two" ["one"]}))
+  (let [store (atom {"one" (task "one" "open") "two" (task "two" "open")})
+        calls (atom [])]
+    (binding [buddy/*transport* (fake-transport store calls)]
+      (is (= ["two" "one"] (mapv :id (tasks/list-all))))
+      (is (= ["one"] (mapv :id (tasks/list-pending))))
+      (swap! store assoc-in ["one" :status] "done")
+      (is (= ["two"] (mapv :id (tasks/list-pending))))
+      (is (= "two" (:id (tasks/claim-next!))))
+      (is (= "in_progress" (get-in @store ["two" :status]))))
+    (tasks/configure! (assoc config :task_ids ["two" "one"]))
+    (swap! store assoc-in ["one" :status] "open")
+    (swap! store assoc-in ["two" :status] "open")
+    (binding [buddy/*transport* (fake-transport store calls)]
+      (is (= ["two" "one"] (mapv :id (tasks/list-pending))))
+      (is (= "two" (:id (tasks/claim-next!))))
+      (is (= "open" (get-in @store ["one" :status]))))))
+
 (deftest compare-and-swap-claim-has-exactly-one-winner
   (let [store (atom {"one" (task "one" "open") "two" (task "two" "done")})
         calls (atom [])]

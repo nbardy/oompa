@@ -105,7 +105,9 @@
 
 (defn list-all []
   ;; Get exact IDs instead of a broad list; details carry revision and pause state.
-  (mapv get-task (sort (into (set (:task_ids @settings)) @created))))
+  ;; Explicit selection order is execution priority. Locally created tasks
+  ;; follow deterministically; deduplication must not reorder selected IDs.
+  (mapv get-task (distinct (concat (:task_ids @settings) (sort @created)))))
 
 (defn- dependencies-done? [task]
   ;; Current Buddy Task has no dependency field. Explicit dependencies are admitted only
