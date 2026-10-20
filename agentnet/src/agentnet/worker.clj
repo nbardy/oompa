@@ -51,8 +51,16 @@
 ;; =============================================================================
 
 (def ^:private package-root
-  "Root of the oompa package — set by bin/oompa.js, falls back to cwd."
-  (or (System/getenv "OOMPA_PACKAGE_ROOT") "."))
+  "Root of the installed oompa sources, independent of the target project's cwd.
+   The npm launcher supplies it explicitly; direct/hosted Babashka entry points
+   resolve it from the loaded worker resource on their classpath."
+  (.getCanonicalPath
+    (io/file
+      (or (not-empty (System/getenv "OOMPA_PACKAGE_ROOT"))
+          (some-> (io/resource "agentnet/worker.clj") .toURI io/file
+                  .getCanonicalFile .getParentFile .getParentFile
+                  .getParentFile .getParentFile)
+          "."))))
 
 ;; Serializes merge-to-main! calls across concurrent workers to prevent
 ;; git index corruption from parallel checkout+merge operations.

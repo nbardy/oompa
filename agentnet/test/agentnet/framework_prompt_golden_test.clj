@@ -19,6 +19,10 @@
    Run: bb -cp agentnet/src:agentnet/test -e '(require (quote agentnet.framework-prompt-golden-test))'"
   (:require [agentnet.worker :as worker]
             [clojure.string :as str]
+            [clojure.edn :as edn]
+            [clojure.java.io :as io]
+            [babashka.fs :as fs]
+            [babashka.process :as process]
             [clojure.test :as t]))
 
 (def ^:private load-fw
@@ -194,6 +198,33 @@
     (let [rendered (render name {})]
       (t/is (string? rendered) (str "did not load: " name))
       (t/is (not (str/blank? rendered)) (str "loaded blank: " name)))))
+
+(t/deftest installed-prompts-resolve-from-an-external-project-without-launcher-env
+  (let [root (str (fs/create-temp-dir {:prefix "oompa-external-project-"}))
+        source (io/file (.toURI (io/resource "agentnet/worker.clj")))
+        classpath (.getCanonicalPath (.getParentFile (.getParentFile source)))
+        names ["nudge.md" "worker_default.md" "claim_results.md" "needs_followup.md"
+               "resume.md" "reviewer.md" "merge_conflict_resolve.md"
+               "merge_authorization.md" "fix.md" "planner_tail.md"]
+        code (str "(require 'agentnet.worker) "
+                  "(prn [(mapv (fn [name] (#'agentnet.worker/load-framework-prompt name {})) "
+                  (pr-str names) ") (#'agentnet.worker/load-prompt \"config/prompts/_task_header.md\")])")]
+    (try
+      ;; A separate process exercises namespace initialization with the actual
+      ;; external OS cwd. Merely changing user.dir would leave Java File's cwd
+      ;; unchanged and could hide this deployment failure.
+      (let [{:keys [exit out err]}
+            (process/sh ["bb" "--classpath" classpath "-e" code]
+                        {:dir root :env (dissoc (into {} (System/getenv)) "OOMPA_PACKAGE_ROOT")
+                         :out :string :err :string})]
+        (t/is (zero? exit) err)
+        (when (zero? exit)
+          (let [[framework header] (edn/read-string out)]
+            (t/is (= (mapv #(render % {}) names) framework))
+            (t/is (= (#'worker/load-prompt "config/prompts/_task_header.md") header))
+            (t/is (not (str/blank? header))))))
+      (t/is (not (fs/exists? (fs/path root "config"))) "No templates copied into target project")
+      (finally (fs/delete-tree root)))))
 
 (defn run-tests! []
   (let [{:keys [fail error]} (t/run-tests 'agentnet.framework-prompt-golden-test)]
