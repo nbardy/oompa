@@ -38,6 +38,7 @@
             [agentnet.cambium :as cambium]
             [agentnet.runs :as runs]
             [agentnet.task-execution :as execution]
+            [agentnet.integration-source :as integration-source]
             [agentnet.bounded-process :as bounded]
             [babashka.process :as process]
             [cheshire.core :as json]
@@ -2038,6 +2039,10 @@
                           state (if (and task (not (:task_id state)))
                                   (assoc state :task_id (:id task) :claim_revision (:revision task)) state)
                           _ (when task (reset! selected-active-owner [(:swarm-id worker) (:id worker)]))
+                          state (if (and (:workspace state) (= "in_progress" (:status task))
+                                         (false? (:paused task)) (= (:claim_revision state) (:revision task))
+                                         (not= "awaiting-acceptance" (:phase state)))
+                                  (integration-source/refresh! root state deadline) state)
                           _ (reset! checkpoint state)
                           _ (when (:task_id state) (selected-state! worker state "running" nil))]
                       (cond
@@ -2102,7 +2107,11 @@
                               _ (reset! checkpoint state)
                               _ (selected-state! worker state "running" nil)
                               fresh (tasks/get-task (:id task))
-                              blocked (execution/blocked-result (:output result) (:id task))]
+                              blocked (execution/blocked-result (:output result) (:id task))
+                              refreshed (when (and (:merge? result) (zero? (:exit result)) (nil? blocked)
+                                                   (= "in_progress" (:status fresh)) (false? (:paused fresh))
+                                                   (= (:claim_revision state) (:revision fresh)))
+                                          (integration-source/refresh! root state deadline))]
                           (cond
                             (zero? (execution/remaining-ms deadline)) {:stop :wall-time-exhausted :state state}
                             (= "done" (:status fresh)) {:state state}
@@ -2122,6 +2131,7 @@
                             (not (:merge? result))
                             {:state (assoc state :feedback {:reason "candidate-not-ready"
                                                           :output (snippet (:output result) 2000)})}
+                            (and refreshed (not= state refreshed)) {:state refreshed}
                             :else
                             (let [pin (if validator
                                         (execution/source-pin! (:path workspace) validator deadline)

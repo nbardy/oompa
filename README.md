@@ -367,7 +367,13 @@ review runs before the full consumer; its verdict cannot accept physics.
 Rejected work keeps its native model session and Cambium source. Held work stays
 in the existing run recovery record while independent tasks advance; an empty
 runnable set is polled until the shared deadline. Missing validators permit only
-explicit preparation/review. Final completion requires every selected canonical
+explicit preparation/review. When another accepted chunk advances integration,
+the selected writer merges its current committed HEAD into a clean registered
+candidate from the same recorded starting lineage. It preserves session and
+attempt history, invalidates prior readiness/validation, and reruns review and
+the gate on the combined source. Merge conflicts remain in the same candidate
+for its model to resolve; the framework never resets or rebases that work.
+Final completion requires every selected canonical
 task actually done, including the parent when it is included as an observed gate.
 Workers can return a JSON blocked result with `status: "blocked"`, a nonempty
 `reason`, `taskComplete: false`, `readyForMergeValidation: false`, and optional

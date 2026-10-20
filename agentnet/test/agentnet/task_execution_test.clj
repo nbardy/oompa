@@ -387,7 +387,8 @@
             create-workspace! (fn [cycle]
                                 (let [path (str root "-hold-" cycle) branch (str "hold-" cycle)]
                                   (git root "worktree" "add" "-b" branch path)
-                                  (let [ws {:path path :dir branch :name branch :branch branch}]
+                                  (let [ws {:path path :dir branch :name branch :branch branch
+                                            :source_commit (git root "rev-parse" "HEAD")}]
                                     (swap! workspaces conj ws) ws)))]
         (try
           (System/setProperty "user.dir" root)
