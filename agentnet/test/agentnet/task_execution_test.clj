@@ -321,7 +321,41 @@
           :requiredOwnerAction "Supply authorized CUDA target, replay/funding decision and complete force/Product consumer oracle."
           :taskComplete false :readyForMergeValidation false}
          {:pretty true})
-       "\n```\nPlease retain this candidate pending the owner handoff."))
+       "\n```"))
+
+(def cost-progress-blocked-output
+  ;; Exact attempt-one stdout from runs/a2f61360/workers/w0.json. Progress
+  ;; commentary preceded the pretty-printed final object and caused a retry.
+  "I’ll read the required repo guidance, repair the claimed cost-duration path, and run the narrow controls. I’ll commit the candidate before requesting independent review.\nThe estimator caps observed completion time at 300 seconds, while already preserving longer producer times. I’m checking the sidecar’s timestamp and insert-once behavior so the repair also preserves saved estimates, billed values, and result bytes.\nI’ll remove the cap, describe the estimate as using the maximum of producer and observed completion time, and let reversed timestamps reach the existing invalid-duration refusal. The tests will cover both the estimator and SQLite sidecar, including preservation of saved cost JSON and result artifacts.\nThe patch and required regressions are ready to commit. They check the full 450-second estimate, preservation of a 720-second producer duration, and refusal of malformed or reversed timestamps before insertion. They also check that saved estimates and billed cost JSON remain unchanged.\nThe candidate passed all seven narrow tests and scoped lint. I also found that this provided checkout does not have `d1420c22c` as an ancestor. I’m checking the retained source refs before handoff; I’ll preserve them and leave integration to the framework.\nThe retained source is clean at `8ce835760` and still contains `d1420c22c`. The supplied worker branch diverges from that source, so I’m handing off the committed repair and passing checks with a source-base blocker. The framework needs to reconcile the branch before independent Opus review and validation; I have not merged or reset either source.\n{\n  \"status\": \"blocked\",\n  \"reason\": \"The supplied checkout does not descend from required retained commit d1420c22c. The requested source remains untouched at 8ce835760. Framework source-base reconciliation is needed before independent Opus review and validation; worker merge/reset is prohibited.\",\n  \"taskComplete\": false,\n  \"readyForMergeValidation\": false,\n  \"candidateCommit\": \"b310e8644091e73a70286a82cc4916b0bf3e0629\",\n  \"handoffCommit\": \"f3b7dde5e\",\n  \"checks\": \"All 7 run-cost tests, scoped lint and normal commit hooks passed.\",\n  \"changes\": \"Removed the completion cap, preserved maximum-duration semantics, clarified estimate labels and added invalid-timing/persisted-value preservation controls.\"\n}")
+
+(deftest terminal-blocked-json-after-progress
+  (let [hold {:status "blocked" :reason "Braces { [ } and quote \" with slash \\ remain text."
+              :taskComplete false :readyForMergeValidation false :task_id "one"}
+        compact (json/generate-string hold)
+        pretty (json/generate-string hold {:pretty true})]
+    (is (= "b310e8644091e73a70286a82cc4916b0bf3e0629"
+           (:candidateCommit (execution/blocked-result cost-progress-blocked-output "one"))))
+    (doseq [output [compact pretty (str "Progress paragraph.\nAnother paragraph.\n" pretty)
+                    (str "{\"event\":\"progress\"}\n" pretty)
+                    (str "Progress\n```json\n" pretty "\n```\n")
+                    (str "Progress\n~~~json\n" pretty "\n~~~")]]
+      (is (= hold (execution/blocked-result output "one")) output))
+    (doseq [output [(str compact " trailing prose") (str pretty "\nStill working")
+                    (str "```json\n" pretty "\n```\ntrailing prose")
+                    (str compact "\n{\"status\":\"accepted\"}")
+                    (str compact "\n{\"status\":\"blocked\"}")
+                    (str "Log: " compact)
+                    (str "{\"log\":\n" pretty "\n}")
+                    (str "[\n" pretty "\n]")
+                    (str "```text\n" pretty "\n```")
+                    (str "```json\n" pretty)
+                    (str "{\"log\":\n```json\n" pretty "\n```")
+                    (str "{\"log\":[}\n" pretty)
+                    (str compact " {}")
+                    (subs pretty 0 (dec (count pretty)))
+                    (str/replace pretty "false" "falsE")
+                    (str/replace pretty "\"one\"" "\"other\"")]]
+      (is (nil? (execution/blocked-result output "one")) output))))
 
 (deftest blocked-result-is-explicit-structured-hold-only
   (is (= "blocked" (:status (execution/blocked-result force-blocked-output "one"))))
@@ -337,7 +371,7 @@
 (deftest blocked-return-holds-before-review-and-continues-independent-work-and-survives-restart
   ;; Replay the actual turn-five fenced object, plus races where canonical
   ;; state changes during a model call that even claims merge readiness.
-  (doseq [mode [:structured :canonical-blocked :canonical-paused :canonical-review :canonical-revision :stopped-active]]
+  (doseq [mode [:structured :progress-structured :canonical-blocked :canonical-paused :canonical-review :canonical-revision :stopped-active]]
     (testing (name mode)
       (let [root (fixture-repo) previous-root (System/getProperty "user.dir")
             store (atom {"one" (task "one" "open") "two" (task "two" "open")})
@@ -401,7 +435,9 @@
                                            (json/generate-string {:type "text.delta"
                                                                  :text (cond @reopening? "Working on the explicitly reopened task"
                                                                              (and force? (= :structured mode))
-                                                                             (str force-blocked-output "\nCOMPLETE_AND_READY_FOR_MERGE")
+                                                                             (str "COMPLETE_AND_READY_FOR_MERGE\n" force-blocked-output)
+                                                                             (and force? (= :progress-structured mode))
+                                                                             cost-progress-blocked-output
                                                                              :else "COMPLETE_AND_READY_FOR_MERGE")}))})))]
               (let [result (worker/run-worker! (cond-> config (= :stopped-active mode) (assoc :resume-swarm-id "original")))
                     saved (:execution (runs/read-worker-state "blocked-before" "w0"))
@@ -416,14 +452,16 @@
                 (is (= expected-session (:session_id held)))
                 (is (= (if (= :stopped-active mode) 9 1) (:attempt held)))
                 (is (.isDirectory (io/file (get-in held [:workspace :path]))))
-                (when (= :structured mode)
+                (when (contains? #{:structured :progress-structured} mode)
                   (is (= "model-blocked" (:held_reason held)))
                   (is (= "blocked" (get-in @store ["one" :status])))
-                  (is (= (:reason (execution/blocked-result force-blocked-output "one"))
+                  (is (= (:reason (execution/blocked-result (if (= :progress-structured mode) cost-progress-blocked-output force-blocked-output) "one"))
                          (get-in @store ["one" :blockedReason])))
-                  (is (str/includes? (get-in @store ["one" :nextAction]) "CUDA"))
+                  (if (= :progress-structured mode)
+                    (is (nil? (get-in @store ["one" :nextAction])))
+                    (is (str/includes? (get-in @store ["one" :nextAction]) "CUDA")))
                   (is (= 1 (count (:attempt_history held))))
-                  (is (str/includes? (get-in held [:attempt_history 0 :output]) "CUDA")))
+                  (is (str/includes? (get-in held [:attempt_history 0 :output]) (if (= :progress-structured mode) "source-base" "CUDA"))))
                 (when (= :stopped-active mode)
                   (is (= (:deadline_ms saved) (get-in (runs/read-worker-state "original" "w0") [:execution :deadline_ms])))
                   (is (= 4 (:claim_revision held)))
@@ -438,7 +476,7 @@
                   (is (= saved after))
                   (is (= (if (= :stopped-active mode) 1 2) (count @model-calls)))
                   (is (= 1 (count @review-calls))))
-                (when (= :structured mode)
+                (when (contains? #{:structured :progress-structured} mode)
                   ;; Metadata edits while blocked do not reopen the task.
                   (swap! store update "one" #(-> % (assoc :nextAction "Owner is investigating") (update :revision inc)))
                   (reset! shutdown false)

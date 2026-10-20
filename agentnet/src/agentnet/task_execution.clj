@@ -8,22 +8,74 @@
 (def schema "oompa.task-validation/v1")
 (defn now-ms [] (System/currentTimeMillis))
 (defn remaining-ms [deadline] (max 0 (- deadline (now-ms))))
+(defn- terminal-json-content
+  "Only a terminal JSON fence may supply a result; other fences are logs."
+  [output]
+  (let [lines (str/split-lines (str/trim output))]
+    (loop [i 0 fence nil]
+      (if (= i (count lines))
+        (when-not fence (str/trim output))
+        (let [line (str/trim (nth lines i))]
+          (if fence
+            (if (= line (:delimiter fence))
+              (if (= i (dec (count lines)))
+                (when (:json? fence)
+                  ;; Retain prefix nesting: a fence inside an unfinished log
+                  ;; object must not promote its nested payload to a result.
+                  (str/join "\n" (concat (take (dec (:start fence)) lines)
+                                         (subvec (vec lines) (:start fence) i))))
+                (recur (inc i) nil))
+              (recur (inc i) fence))
+            (if-let [[_ delimiter language] (re-matches #"(`{3,}|~{3,})(.*)" line)]
+              (recur (inc i) {:delimiter delimiter :start (inc i)
+                             :json? (contains? #{"" "json"} (str/trim language))})
+              (recur (inc i) nil))))))))
+
+(defn- terminal-object
+  "Find a line-delimited, top-level JSON object ending at EOF. Track lexical
+   nesting and string escapes so nested/log objects cannot become candidates."
+  [text]
+  (when text
+    (let [text (str/trim text) n (count text)]
+      (loop [i 0 stack [] quoted? false escaped? false start nil eligible? false candidate nil line-start 0]
+        (if (= i n)
+          (when (and (empty? stack) candidate (= (second candidate) n))
+            (subs text (first candidate) n))
+          (let [c (.charAt text i) next-line (if (= c \newline) (inc i) line-start)]
+            (cond
+              quoted?
+              (recur (inc i) stack (if (and (= c \") (not escaped?)) false true)
+                     (and (= c \\) (not escaped?)) start eligible? candidate next-line)
+
+              (and (seq stack) (= c \"))
+              (recur (inc i) stack true false start eligible? candidate next-line)
+
+              (contains? #{\{ \[} c)
+              (recur (inc i) (conj stack c) false false (if (empty? stack) i start)
+                     (if (empty? stack) (and (= c \{) (str/blank? (subs text line-start i))) eligible?)
+                     candidate next-line)
+
+              (and (seq stack) (contains? #{\} \]} c))
+              (when (= (peek stack) (if (= c \}) \{ \[))
+                (let [remaining (pop stack)]
+                  (recur (inc i) remaining false false start eligible?
+                         (if (and (empty? remaining) eligible?) [start (inc i)] candidate) next-line)))
+
+              :else (recur (inc i) stack false false start eligible? candidate next-line))))))))
+
 (defn blocked-result
-  "A selected-task hold signal only. Parse explicit JSON, never prose or an
-   acceptance claim. Supports a whole object, JSON lines, and fenced JSON."
+  "A selected-task hold signal only. Parse terminal structured JSON, never
+   prose or an embedded earlier log. Supports whole objects, JSON lines, and
+   terminal JSON fences, including multiline objects after progress commentary."
   [output task-id]
-  (let [output (or output "")
-        candidates (concat [output] (str/split-lines output)
-                           (map second (re-seq #"(?s)```(?:json)?\s*\n(.*?)```" output)))]
-    (some (fn [candidate]
-            (let [result (try (json/parse-string candidate true) (catch Exception _ nil))]
-              (when (and (map? result) (= "blocked" (:status result))
-                         (string? (:reason result)) (not (str/blank? (:reason result)))
-                         (false? (:taskComplete result)) (false? (:readyForMergeValidation result))
-                         (or (nil? (:requiredOwnerAction result)) (string? (:requiredOwnerAction result)))
-                         (or (nil? (:task_id result)) (= task-id (:task_id result))))
-                result)))
-          candidates)))
+  (let [candidate (terminal-object (terminal-json-content (or output "")))
+        result (when candidate (try (json/parse-string candidate true) (catch Exception _ nil)))]
+    (when (and (map? result) (= "blocked" (:status result))
+               (string? (:reason result)) (not (str/blank? (:reason result)))
+               (false? (:taskComplete result)) (false? (:readyForMergeValidation result))
+               (or (nil? (:requiredOwnerAction result)) (string? (:requiredOwnerAction result)))
+               (or (nil? (:task_id result)) (= task-id (:task_id result))))
+      result)))
 (defn- sha256 [bytes]
   (format "%064x" (java.math.BigInteger. 1 (.digest (java.security.MessageDigest/getInstance "SHA-256") bytes))))
 (defn file-sha256 [path] (sha256 (java.nio.file.Files/readAllBytes (.toPath (io/file path)))))
