@@ -319,6 +319,12 @@ into `tasks/`. Existing filesystem mode remains available for upstream projects.
 Start with `./swarm.bb tasks --config oompa.buddies.json` to check the selected
 canonical tasks without launching a model. Run from the target project with
 `/path/to/oompa/swarm.bb run --config oompa.buddies.json` after that check.
+`./swarm.bb audit --config oompa.buddies.json` emits a read-only executable
+`oompa.task-graph/v1` graph/source-pin audit with no claim, model or validator
+execution. Startup emits this same preflight. Readiness is per selected task:
+a missing/stale parent consumer cannot hide independent ready source work.
+Done tasks retain historical receipts; their old source pins are not checked
+against the current checkout. Unselected validators are never inspected.
 The endpoint and bearer must come from the supported scoped Buddy runtime.
 Never save a bearer in configuration, use the owner's HTTP credentials, or open
 Buddy database files. Missing, expired or denied authority stops explicitly;
@@ -365,8 +371,8 @@ fast-forwards the integration checkout, then CAS-accepts the task. Configured co
 review runs before the full consumer; its verdict cannot accept physics.
 
 Rejected work keeps its native model session and Cambium source. Held work stays
-in the existing run recovery record while independent tasks advance; an empty
-runnable set is polled until the shared deadline. Missing validators permit only
+in the existing run recovery record while independent ready tasks advance.
+Missing validators permit only
 explicit preparation/review. When another accepted chunk advances integration,
 the selected writer merges its current committed HEAD into a clean registered
 candidate from the same recorded starting lineage. It preserves session and
@@ -375,6 +381,42 @@ the gate on the combined source. Merge conflicts remain in the same candidate
 for its model to resolve; the framework never resets or rebases that work.
 Final completion requires every selected canonical
 task actually done, including the parent when it is included as an observed gate.
+An exhausted selected graph now returns `needs-reconciliation` for internal
+source/consumer/prerequisite repairs, or `externally-blocked` for typed external
+and acceptance gates. It does not spend the remainder of the window polling an
+unchanged blocked graph. Existing worker/run outcomes retain `queue_audit` with
+`state`, stable `fingerprint`, per-task `items`, and actionable repair `actions`.
+An unchanged resumed graph reports `queue_audit_changed=false`, performs no model
+attempt/claim and writes only the new run's required terminal receipt. Controllers
+must use the fingerprint to suppress repeated unchanged reconciliation/status
+work; a real graph/source/config change produces new information.
+
+Optional `task_execution.task_readiness` maps canonical IDs to typed owner
+metadata: `role` (`consumer` or `observed`), `blocker_class` (`internal`,
+`external` or `acceptance`), `reason_code`, `required_owner`, and `next_action`.
+Observed nodes are original canonical acceptance gates, never model work.
+Unknown holds require owner classification rather than inference from prose.
+Metadata cannot reopen a task, reset attempts or authorize spending. Register a
+reviewed source prerequisite as an actual canonical child, admit its source-bound
+check through the reviewed config, and retain real dependencies; a local status
+note or validator stub is not a prerequisite or acceptance result.
+
+Delegated renewal retains its original absolute deadline. A separate explicit
+owner launch can resume expired source/history in a new window only with
+host-injected `task_execution.owner_window` metadata (`authorization_id`,
+`expires_at_ms`, `prior_deadline_ms`) matching host environment
+`OOMPA_OWNER_WINDOW_AUTHORIZATION_ID`/`OOMPA_OWNER_WINDOW_EXPIRES_AT_MS`.
+The previous deadline is appended to existing execution history. Attempts,
+sessions, workspaces and scientific/human holds survive; amended config alone
+cannot forge a new window.
+
+A validator may set `reconcile_on_rejection:true` for an expensive consumer.
+One actual rejection then retains its source/session/attempt and executable
+receipt as a `consumer-rejected` hold and returns reconciliation work after other
+ready tasks finish. It does not run another model or consumer at the unchanged
+canonical revision. Reviewed changed-cause/source/check evidence and an explicit
+canonical reopen are required before continuation; delegated config amendment
+cannot remove this checkpoint. Cheap controls retain the normal repair loop.
 Workers can return a JSON blocked result with `status: "blocked"`, a nonempty
 `reason`, `taskComplete: false`, `readyForMergeValidation: false`, and optional
 `requiredOwnerAction`. The framework CAS-holds the canonical task with its reason

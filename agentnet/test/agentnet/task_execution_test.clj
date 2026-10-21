@@ -188,9 +188,9 @@
             (is (every? #(<= 1 (:timeout-ms %) 1000) @model-calls))
             (is (= ["done" "done" "open" "open"]
                    (mapv #(get-in @store [% :status]) ["one" "two" "parent" "a-no-oracle"])))
-            (is (= :wall-time-exhausted (:status result)))
+            (is (= :needs-reconciliation (:status result)))
             (is (= 2 (:completed result)))
-            (is (= "wall-time-exhausted" (:reason saved)))
+            (is (= "needs-reconciliation" (:reason saved)))
             (is (= 3 (count (filter #(= "oompa" (first %)) @calls))))
             (is (not-any? #(= "done" (get-in % [1 :write :changes :status])) @calls))
             (is (= 2 (count @retired))))))
@@ -240,7 +240,7 @@
             (is (= "validator-unconfigured" (:held_reason held)))
             (is (= "preparation-session" (:session_id held)))
             (is (.isDirectory (io/file (get-in held [:workspace :path]))))
-            (is (= :wall-time-exhausted (:status result))))))
+            (is (= :needs-reconciliation (:status result))))))
       (finally
         (tasks/configure! nil)
         (System/setProperty "user.dir" previous-root)
@@ -444,7 +444,7 @@
                     saved (:execution (runs/read-worker-state "blocked-before" "w0"))
                     held (get-in saved [:held_executions :one])
                     expected-session (if (= :stopped-active mode) "01a15311-76ff-7201-a0ab-cd928d984daa" "force-session")]
-                (is (= :interrupted (:status result)))
+                (is (= :needs-reconciliation (:status result)))
                 (is (= "done" (get-in @store ["two" :status])))
                 (is (= 1 (:completed result)))
                 (is (= (if (= :stopped-active mode) 1 2) (count @model-calls)))
@@ -473,8 +473,8 @@
                 (tasks/configure! backend)
                 (let [restarted (worker/run-worker! (assoc config :swarm-id "blocked-after" :resume-swarm-id "blocked-before"))
                       after (:execution (runs/read-worker-state "blocked-after" "w0"))]
-                  (is (= :interrupted (:status restarted)))
-                  (is (= saved after))
+                  (is (= :needs-reconciliation (:status restarted)))
+                  (is (= (dissoc saved :queue_audit_unchanged) (dissoc after :queue_audit_unchanged)))
                   (is (= (if (= :stopped-active mode) 1 2) (count @model-calls)))
                   (is (= 1 (count @review-calls))))
                 (when (contains? #{:structured :progress-structured} mode)

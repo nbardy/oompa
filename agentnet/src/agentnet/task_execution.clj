@@ -82,7 +82,10 @@
 (defn key-string [value] (if (keyword? value) (subs (str value) 1) value))
 (defn validator-for [config id]
   (or (get-in config [:validators id]) (get-in config [:validators (keyword id)])))
-(defn validator-digest [validator] (sha256 (.getBytes (pr-str (into (sorted-map) validator)) "UTF-8")))
+(defn validator-digest [validator]
+  ;; Rejection checkpoint policy can be tightened without pretending the
+  ;; source/command oracle changed. Host config authority forbids weakening it.
+  (sha256 (.getBytes (pr-str (into (sorted-map) (dissoc validator :reconcile_on_rejection))) "UTF-8")))
 
 (defn validate-config!
   [config]
@@ -91,10 +94,18 @@
       (throw (ex-info (str "task_execution requires positive " (name key)) {:field key}))))
   (when-not (map? (:validators config))
     (throw (ex-info "task_execution requires an explicit validators map" {})))
+  (doseq [[id policy] (:task_readiness config)]
+    (when-not (and (map? policy)
+                   (or (nil? (:role policy)) (contains? #{"consumer" "observed"} (:role policy)))
+                   (or (nil? (:blocker_class policy)) (contains? #{"internal" "external" "acceptance"} (:blocker_class policy)))
+                   (every? #(or (nil? (get policy %)) (and (string? (get policy %)) (not (str/blank? (get policy %)))))
+                           [:reason_code :next_action :required_owner]))
+      (throw (ex-info "task_readiness requires typed role/blocker classification and nonempty owner/action metadata" {:task-id id}))))
   (doseq [[id validator] (:validators config)]
     (when-not (and (sequential? (:command validator)) (seq (:command validator))
                    (every? #(and (string? %) (not (str/blank? %))) (:command validator))
                    (integer? (:timeout_seconds validator)) (pos? (:timeout_seconds validator))
+                   (or (nil? (:reconcile_on_rejection validator)) (boolean? (:reconcile_on_rejection validator)))
                    (map? (:source_files validator)) (seq (:source_files validator))
                    (every? (fn [[path digest]]
                              (and (or (string? path) (keyword? path))
@@ -103,6 +114,31 @@
       (throw (ex-info "Each validator requires command argv, timeout_seconds, and pinned source_files SHA-256 map"
                       {:task-id id}))))
   config)
+
+(defn owner-window-environment []
+  {:authorization_id (System/getenv "OOMPA_OWNER_WINDOW_AUTHORIZATION_ID")
+   :expires_at_ms (try (some-> (System/getenv "OOMPA_OWNER_WINDOW_EXPIRES_AT_MS") Long/parseLong)
+                       (catch Exception _ nil))})
+
+(defn resume-budget
+  "Delegated resume never extends a budget. Only matching host-injected metadata
+   for a new explicit owner launch can replace an expired deadline; keep history."
+  [saved config deadline]
+  (if-let [window (:owner_window config)]
+    (let [authority (owner-window-environment)
+          prior (:deadline_ms saved)
+          same? (= (:authorization_id window) (get-in saved [:owner_window :authorization_id]))]
+      (when-not (and (string? (:authorization_id window)) (not (str/blank? (:authorization_id window)))
+                     (= (:authorization_id window) (:authorization_id authority))
+                     (integer? (:expires_at_ms window)) (= (:expires_at_ms window) (:expires_at_ms authority))
+                     (> (:expires_at_ms window) (now-ms))
+                     (if same? (<= prior (:expires_at_ms window)) (= prior (:prior_deadline_ms window))))
+        (throw (ex-info "New owner window lacks matching host authority or exact prior deadline" {:reason :owner-window-unverified})))
+      (cond-> (assoc saved :deadline_ms (min deadline (:expires_at_ms window) (if same? prior Long/MAX_VALUE))
+                           :owner_window window)
+        (not same?) (update :deadline_history (fnil conj [])
+                            {:deadline_ms prior :owner_window (:owner_window saved)})))
+    (assoc saved :deadline_ms (min deadline (:deadline_ms saved)))))
 
 (defn git!
   [cwd deadline & args]

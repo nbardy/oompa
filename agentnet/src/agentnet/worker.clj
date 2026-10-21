@@ -39,6 +39,7 @@
             [agentnet.runs :as runs]
             [agentnet.task-execution :as execution]
             [agentnet.integration-source :as integration-source]
+            [agentnet.task-graph :as task-graph]
             [agentnet.bounded-process :as bounded]
             [babashka.process :as process]
             [cheshire.core :as json]
@@ -1840,17 +1841,25 @@
 (defn- prepare-only? [config id]
   (boolean (some #{id} (:prepare_only_task_ids config))))
 
-(defn- selected-next-task! [worker config held]
+(defn- selected-audit! [worker config held]
+  (task-graph/audit! (System/getProperty "user.dir") config (tasks/list-all)
+                     (tasks/selection-dependencies) held
+                     {:claim-denial #(task-claim-denial worker %)}))
+
+(defn- selected-next-task!
+  ([worker config held] (selected-next-task! worker config held (selected-audit! worker config held)))
+  ([worker config held audit]
   ;; Scan every eligible task. A missing oracle must not hide later runnable work.
   (some (fn [task]
-          (when (and (or (execution/validator-for config (:id task))
+          (when (and (contains? (task-graph/ready-ids audit) (:id task))
+                     (or (execution/validator-for config (:id task))
                          (prepare-only? config (:id task)))
                      (not= (:revision task)
                            (or (:held_task_revision (get held (:id task)))
                                (:claim_revision (get held (:id task)))))
                      (nil? (task-claim-denial worker task)))
             (tasks/claim-task! task)))
-        (tasks/list-pending)))
+        (tasks/list-pending))))
 
 (defn- selected-state! [worker state status reason]
   (runs/write-worker-state! (:swarm-id worker) (:id worker)
@@ -1909,7 +1918,11 @@
       "validating" (do (Thread/sleep (min 1000 (execution/remaining-ms (:deadline_ms state))))
                        {:state (assoc state :phase "validating")})
       "accepted" {:state (assoc state :phase "awaiting-acceptance" :feedback nil)}
-      "rejected" {:state (assoc state :phase "implementing" :feedback receipt)}
+      "rejected" (let [state (assoc state :phase "implementing" :feedback receipt)
+                       validator (execution/validator-for (:task-execution worker) (:id task))]
+                   (if (:reconcile_on_rejection validator)
+                     (hold-selected state :consumer-rejected)
+                     {:state state}))
       "blocked" (hold-selected state :validation-blocked))))
 
 (defn- unstarted-provisioning? [state]
@@ -1959,7 +1972,7 @@
         (when found (cambium/claim-existing! (System/getProperty "user.dir") found)))
       ;; A resume does not create another 12-hour budget.
       (-> saved
-          (assoc :deadline_ms (min deadline (:deadline_ms saved)))
+          (execution/resume-budget config deadline)
           (update :held_executions
                   #(into {} (map (fn [[id state]]
                                    [(execution/key-string id)
@@ -1990,10 +2003,14 @@
         finish (fn [status state & [error]]
                  (when (= [(:swarm-id worker) (:id worker)] @selected-active-owner)
                    (reset! selected-active-owner nil))
+                 ;; Every new run needs its own durable terminal receipt, even
+                 ;; when its predecessor observed this exact same fingerprint.
                  (selected-state! worker state "stopped" status)
                  (cond-> (assoc worker :status status :completed @accepted
                                  :cycles-completed @accepted :claims (if (:task_id state) 1 0)
                                  :merges @accepted :errors (if error 1 0))
+                   (:queue_audit state) (assoc :queue_audit (:queue_audit state)
+                                              :queue_audit_changed (not (:queue_audit_unchanged state)))
                    error (assoc :error error)))
         attempt-cap (or (:max-resumes worker) default-max-resumes)]
     (tasks/with-deadline deadline (fn []
@@ -2026,16 +2043,22 @@
                       {:state state :yield true}
                     (let [state (reconcile-held! root state accepted)
                           state (assoc state :accepted_count @accepted)
+                          audit (when-not (:task_id state) (selected-audit! worker config (:held_executions state)))
+                          state (if audit
+                                  (assoc state :queue_audit audit
+                                         :queue_audit_unchanged (= (:fingerprint audit) (get-in state [:queue_audit :fingerprint])))
+                                  state)
                           task (if (:task_id state)
                                  (tasks/get-task (:task_id state))
                                  (or (recover-provisioning-task! (:held_executions state))
-                                     (selected-next-task! worker config (:held_executions state))))
+                                     (selected-next-task! worker config (:held_executions state) audit)))
                           prior-held (get (:held_executions state) (:id task))
                           state (if (and task prior-held)
                                   (merge (dissoc prior-held :startup_recovery_ready)
                                          (select-keys state [:deadline_ms :cycle :held_executions :accepted_count])
                                          {:claim_revision (:revision task) :phase "implementing"}) state)
                           state (if prior-held (update state :held_executions dissoc (:id task)) state)
+                          state (if task (dissoc state :queue_audit_unchanged) state)
                           state (if (and task (not (:task_id state)))
                                   (assoc state :task_id (:id task) :claim_revision (:revision task)) state)
                           _ (when task (reset! selected-active-owner [(:swarm-id worker) (:id worker)]))
@@ -2047,11 +2070,17 @@
                           _ (when (:task_id state) (selected-state! worker state "running" nil))]
                       (cond
                         (nil? task)
-                        (if (selected-all-accepted?)
-                          {:stop :completed :state state}
-                          (do (selected-state! worker state "waiting" :awaiting-buddy-acceptance)
-                              (Thread/sleep (min 1000 (execution/remaining-ms deadline)))
-                              {:state state :waiting true}))
+                        (if @shutdown-requested?
+                          {:stop :interrupted :state state}
+                          (case (:state audit)
+                          "accepted" {:stop :completed :state state}
+                          "needs-reconciliation" {:stop :needs-reconciliation :state state}
+                          "externally-blocked" {:stop :externally-blocked :state state}
+                          (do
+                            (when-not (:queue_audit_unchanged state)
+                              (selected-state! worker state "waiting" :canonical-execution-running))
+                            (Thread/sleep (min 1000 (execution/remaining-ms deadline)))
+                            {:state state :waiting true :suppress-state-write (:queue_audit_unchanged state)})))
 
                         (= "done" (:status task))
                         (do
@@ -2185,7 +2214,8 @@
                             {:state state}
                             (hold-selected state :execution-blocked)))
                         {:stop :execution-blocked :state @checkpoint :error (.getMessage e)}))))]
-            (selected-state! worker (:state result) (cond (:stop result) "stopped" (:waiting result) "waiting" :else "running") (:stop result))
+            (when-not (or (:stop result) (:suppress-state-write result))
+              (selected-state! worker (:state result) (if (:waiting result) "waiting" "running") nil))
             (when (:yield result) (Thread/sleep (min 1000 (execution/remaining-ms deadline))))
             (if-let [status (:stop result)]
               (finish status (:state result) (:error result))
@@ -2266,6 +2296,8 @@
     (contains? result :rejections) (assoc :rejections (:rejections result))
     (contains? result :recycled) (assoc :recycled (:recycled result))
     (contains? result :claims) (assoc :claims (:claims result))
+    (:queue_audit result) (assoc :queue_audit (:queue_audit result)
+                                :queue_audit_changed (:queue_audit_changed result))
     (:error result) (assoc :error (:error result))))
 
 (defn- stopped-reason
@@ -2279,6 +2311,8 @@
       ;; An expired run grant may no longer permit another task read. Deadline
       ;; exhaustion is already decisive negative evidence and never "completed".
       (and selected? (some #(= :wall-time-exhausted (:status %)) results)) :wall-time-exhausted
+      (and selected? (some #(= :needs-reconciliation (:status %)) results)) :needs-reconciliation
+      (and selected? (some #(= :externally-blocked (:status %)) results)) :externally-blocked
       selected? (if (and any-completed? (selected-all-accepted?)) :completed :awaiting-buddy-acceptance)
       (and (tasks/buddies?) (not (tasks/all-complete?))) :awaiting-buddy-acceptance
       (and (not any-completed?) (pos? pending-count)) :workers-exhausted

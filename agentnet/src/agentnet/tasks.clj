@@ -24,6 +24,7 @@
 (defn list-current [] (if (buddies?) (buddy/list-current) (filesystem/list-current)))
 (defn list-complete [] (if (buddies?) (buddy/list-complete) (filesystem/list-complete)))
 (defn list-all [] (if (buddies?) (buddy/list-all) (filesystem/list-all)))
+(defn selection-dependencies [] (if (buddies?) (buddy/selection-dependencies) {}))
 (defn get-task [id]
   (if (buddies?) (buddy/get-task id) (first (filter #(= id (:id %)) (list-all)))))
 (defn claim-task! [task] (if (buddies?) (buddy/claim-task! task) (filesystem/claim-task! task)))

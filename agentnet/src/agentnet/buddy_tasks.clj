@@ -109,6 +109,8 @@
   ;; follow deterministically; deduplication must not reorder selected IDs.
   (mapv get-task (distinct (concat (:task_ids @settings) (sort @created)))))
 
+(defn selection-dependencies [] (:dependencies @settings))
+
 (defn- dependencies-done? [task]
   ;; Current Buddy Task has no dependency field. Explicit dependencies are admitted only
   ;; through the scoped config; reject unknown incoming dependency formats rather than guess.

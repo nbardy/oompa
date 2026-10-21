@@ -19,6 +19,8 @@
             [agentnet.agent :as agent]
             [agentnet.harness :as harness]
             [agentnet.runs :as runs]
+            [agentnet.task-execution :as execution]
+            [agentnet.task-graph :as task-graph]
             [babashka.process :as process]
             [clojure.string :as str]
             [clojure.java.io :as io]
@@ -1089,6 +1091,12 @@
 
     (let [config (json/parse-string (slurp f) true)
           _ (tasks/configure! (:task_backend config))
+          _ (when-let [selected (:task_execution config)]
+              (execution/validate-config! selected)
+              (println "SELECTED_GRAPH_AUDIT"
+                       (json/generate-string
+                         (task-graph/audit! (System/getProperty "user.dir") selected (tasks/list-all)
+                                            (tasks/selection-dependencies) {}))))
           _ (when (and (tasks/buddies?) (:planner config))
               (throw (ex-info "Buddy mode consumes assigned canonical tasks; filesystem planner is disabled" {})))
           ;; Parse reviewer config — supports legacy + new formats.
@@ -1209,6 +1217,21 @@
 
       ;; Run workers using new worker module
       (worker/run-workers! workers {:force? (:force opts)}))))
+
+(defn cmd-audit
+  "Read-only executable graph/source-pin preflight; no claims, models or writes."
+  [opts args]
+  (let [path (or (:config-file opts) (first args))]
+    (when-not path (throw (ex-info "audit requires --config PATH" {})))
+    (let [config (json/parse-string (slurp path) true)
+          selected (execution/validate-config! (:task_execution config))]
+      (tasks/configure! (:task_backend config))
+      (when-not (tasks/buddies?) (throw (ex-info "Selected graph audit requires canonical Buddy tasks" {})))
+      (let [held (when-let [prior (:resume_swarm_id config)]
+                   (get-in (runs/read-worker-state prior "w0") [:execution :held_executions]))]
+        (println (json/generate-string
+                   (task-graph/audit! (System/getProperty "user.dir") selected (tasks/list-all)
+                                      (tasks/selection-dependencies) held)))))))
 
 (defn cmd-tasks
   "Show task status"
@@ -1332,6 +1355,7 @@
   (println "  loop N           [DEPRECATED] Legacy: N = per-worker max_cycle. Use 'swarm' + oompa.json")
   (println "  swarm [file]     Run multiple worker configs from oompa.json (parallel)")
   (println "  tasks            Show task status (pending/current/complete)")
+  (println "  audit --config X Read-only selected task graph and source-pin readiness JSON")
   (println "  requeue [ids..]  Move current tasks back to pending")
   (println "  prompt \"...\"     Run ad-hoc prompt")
   (println "  status           Show running swarms")
@@ -1756,6 +1780,7 @@
    "loop" cmd-loop
    "swarm" cmd-swarm
    "tasks" cmd-tasks
+   "audit" cmd-audit
    "requeue" cmd-requeue
    "prompt" cmd-prompt
    "status" cmd-status
