@@ -101,9 +101,10 @@
        "\n\nDiff:\n```\n" diff-content "\n```\n"
        merged-section
        history-block
-       "\nYour verdict MUST be on its own line, exactly one of:\n"
+       "\nYour final response MUST start with exactly one of these standalone lines:\n"
        "VERDICT: APPROVED\n"
        "VERDICT: NEEDS_CHANGES\n\n"
+       "Put all explanation after that first line. Do not put prose, headings, quotes or code fences before it. Include exactly one verdict line in the final response; do not quote or repeat verdict markers in the explanation.\n\n"
        "Pick APPROVED if the changes are correct and complete. "
        "Pick NEEDS_CHANGES if there are specific issues to fix.\n"
        "If you pick NEEDS_CHANGES, list every issue as a numbered item with "

@@ -16,10 +16,13 @@
                   harness/run-command! (fn [_ opts] (reset! seen opts)
                                          {:exit 0 :out "VERDICT: APPROVED" :err ""})
                   harness/parse-output (fn [_ out _] {:output out})]
-      (#'worker/run-reviewer! {:id "w0" :swarm-id "test"
-                               :reviewers [{:harness :claude :model "claude-opus-5-5" :reasoning "high"}]}
-                              "/tmp/test-worktree" [])
+      (t/is (#'worker/explicit-approval?
+             (#'worker/run-reviewer! {:id "w0" :swarm-id "test"
+                                      :reviewers [{:harness :claude :model "claude-opus-5-5" :reasoning "high"}]}
+                                     "/tmp/test-worktree" [])))
       (t/is (= "high" (:reasoning @seen)))
+      (t/is (re-find #"Your final response MUST start with exactly one of these standalone lines:" (:prompt @seen)))
+      (t/is (re-find #"Include exactly one verdict line in the final response" (:prompt @seen)))
       (t/is (= "claude-opus-5-5" (:model @seen))))))
 
 (t/deftest review-stream-boundary-keeps-explicit-verdict-gate
@@ -78,6 +81,46 @@
       (t/is (not (contains? @seen :reasoningEffort)))
       (harness/run-command! :codex {:model "gpt-6.1-sol" :reasoning "xhigh" :prompt "Implement"})
       (t/is (= "xhigh" (:reasoningEffort @seen))))))
+
+
+(t/deftest strict-final-verdict-contract-controls
+  (doseq [output ["VERDICT: APPROVED\nVERDICT: APPROVED"
+                  "VERDICT: APPROVED\nVERDICT: NEEDS_CHANGES"
+                  "VERDICT: NEEDS_CHANGES\nVERDICT: APPROVED"
+                  "No verdict." "VERDICT: APPROVED trailing prose"
+                  "```\nVERDICT: APPROVED\n```"
+                  "Prose first.\nVERDICT: APPROVED"]]
+    (t/is (not (#'worker/explicit-approval? {:verdict :approved :exit 0 :output output})) output))
+  (t/is (not (#'worker/explicit-approval? {:verdict :approved :exit 1 :output "VERDICT: APPROVED"})))
+  (t/is (#'worker/explicit-approval? {:verdict :approved :exit 0
+                                    :output "VERDICT: APPROVED\nEvidence follows."})))
+
+(t/deftest last-top-level-final-refusal-wins
+  (let [raw (fn [text parent]
+              (str "[agent-cli raw claude stdout] "
+                   (json/generate-string {:type "assistant" :parent_tool_use_id parent
+                                          :message {:content [{:type "text" :text text}]}})
+                   "\n"))
+        stderr (str (raw "VERDICT: APPROVED" nil)
+                    (raw "VERDICT: NEEDS_CHANGES\nMissing evidence." nil)
+                    (raw "VERDICT: APPROVED" "child-tool")
+                    "[agent-cli raw claude stdout] {broken\n")]
+    (with-redefs [process/sh (fn [& _] {:exit 0 :out "" :err ""})
+                  harness/run-command! (fn [& _] {:exit 0 :out "VERDICT: APPROVED" :err stderr})
+                  harness/parse-output (fn [_ out _] {:output out})]
+      (let [review (#'worker/run-reviewer! {:id "w0" :swarm-id "test"
+                                           :reviewers [{:harness :claude :model "fixture"}]}
+                                          "/tmp/test-worktree" [])]
+        (t/is (= "VERDICT: NEEDS_CHANGES\nMissing evidence." (:output review)))
+        (t/is (not (#'worker/explicit-approval? review)))))))
+
+;; Optional local replay of the original immutable review receipts; no fixture
+;; copies or historical normalization. See the existing overnight owner note.
+(t/deftest retained-review-replay
+  (doseq [path *command-line-args*]
+    (let [review (json/parse-string (slurp path) true)]
+      (t/is (= "approved" (:verdict review)))
+      (t/is (not (#'worker/explicit-approval? (assoc review :verdict :approved :exit 0))) path))))
 
 (let [{:keys [fail error]} (t/run-tests 'agentnet.reviewer-effort-test)]
   (when (pos? (+ fail error)) (throw (ex-info "Reviewer effort tests failed" {}))))
