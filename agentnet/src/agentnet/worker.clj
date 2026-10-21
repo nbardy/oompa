@@ -544,6 +544,34 @@
      :raw-snippet raw-snippet
      :stderr-snippet stderr-snippet}))
 
+(defn- claude-final-review-message
+  "Read Claude's last completed top-level assistant message from agent-cli's
+   raw event mirror. Text deltas have no message boundaries, so concatenating
+   commentary and final response can erase the verdict's required line break."
+  [stderr]
+  (let [prefix "[agent-cli raw claude stdout] "]
+    (->> (str/split-lines (or stderr ""))
+         (keep (fn [line]
+                 (when (str/starts-with? line prefix)
+                   (try
+                     (let [event (json/parse-string (subs line (count prefix)) true)]
+                       (when (and (= "assistant" (:type event))
+                                  (nil? (:parent_tool_use_id event)))
+                         (let [text (->> (get-in event [:message :content])
+                                         (keep #(when (= "text" (:type %)) (:text %)))
+                                         (str/join ""))]
+                           (when-not (str/blank? text) text))))
+                     (catch Exception _ nil)))))
+         last)))
+
+(defn- explicit-approval? [review]
+  (and (= :approved (:verdict review))
+       (zero? (:exit review))
+       (re-find #"\A[ \t\r\n]*VERDICT: APPROVED(?:\r?\n|\z)" (:output review))
+       (= ["APPROVED"]
+          (mapv second (re-seq #"(?m)^VERDICT: (APPROVED|NEEDS_CHANGES|REJECTED)\r?$"
+                               (:output review))))))
+
 (defn- run-reviewer!
   "Run reviewer on worktree changes.
    Uses custom review-prompts when configured, otherwise falls back to default.
@@ -616,6 +644,7 @@
                                res (try
                                         (harness/run-command! harness
                                                               {:cwd abs-wt :model model :reasoning reasoning :prompt review-prompt
+                                                               :debug-raw-events? (= :claude harness)
                                                                :timeout-ms (when timeout-ms
                                                                              (max 1 (if deadline-ms
                                                                                       (min timeout-ms (execution/remaining-ms deadline-ms))
@@ -623,7 +652,9 @@
                                         (catch Exception e
                                           {:exit -1 :out "" :err (.getMessage e)}))
                                parsed (harness/parse-output harness (:out res) nil)
-                               output (or (:output parsed) "")
+                               output (or (when (= :claude harness)
+                                            (claude-final-review-message (:err res)))
+                                          (:output parsed) "")
                                has-verdict? (or (re-find #"VERDICT:\s*APPROVED" output)
                                                 (re-find #"VERDICT:\s*NEEDS_CHANGES" output)
                                                 (re-find #"VERDICT:\s*REJECTED" output)
@@ -2172,9 +2203,7 @@
                                            (run-reviewer! (assoc worker :timeout-ms attempt-ms :deadline-ms deadline :selected-task task
                                                                :review-base (execution/git! root deadline "rev-parse" "HEAD"))
                                                           (:path workspace) (:review_feedback state)))
-                                  approved? (and (= :approved (:verdict review))
-                                                 (zero? (:exit review))
-                                                 (re-find #"(?m)^VERDICT:\s*APPROVED\s*$" (:output review)))
+                                  approved? (explicit-approval? review)
                                   _ (when review
                                       (runs/write-review-log! (:swarm-id worker) (:id worker) (:cycle state) (:attempt state)
                                                               (assoc review :duration-ms (:duration-ms review))))

@@ -285,7 +285,7 @@
                     (and (:session-id opts) (not resume?)) (assoc :sessionId (:session-id opts))
                     (and (:session-id opts) resume?)       (assoc :resumeSessionId (:session-id opts))
                     (:reasoning opts)  (assoc :reasoningEffort (:reasoning opts))
-                    (or (= harness-kw :gemini) (gemini-alias? harness-kw))
+                    (or (:debug-raw-events? opts) (= harness-kw :gemini) (gemini-alias? harness-kw))
                     (assoc :debugRawEvents true))
                   (add-extra-args harness-kw opts)
                   json/generate-string)]
