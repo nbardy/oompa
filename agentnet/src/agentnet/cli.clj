@@ -1067,6 +1067,34 @@
          distinct
          vec)))
 
+(defn configured-worker
+  "Build the worker used by cmd-swarm from its JSON configuration."
+  [idx wc swarm-id config generic-reviewers]
+  (let [{:keys [harness model reasoning]} (parse-model-string (:model wc))
+        all-reviewers (resolve-worker-reviewers wc generic-reviewers)]
+    (worker/create-worker
+      {:id (str "w" idx)
+       :swarm-id swarm-id
+       :harness harness
+       :model model
+       :reasoning reasoning
+       :task-execution (:task_execution config)
+       :resume-swarm-id (:resume_swarm_id config)
+       :role (or (:_role wc) (:role wc))
+       :can-claim-gpu (:can_claim_gpu wc)
+       :task-ids (worker/worker-task-ids wc)
+       :max-cycles (:max_cycle wc)
+       :prompts (:prompt wc)
+       :can-plan (:can_plan wc)
+       :wait-between (:wait_between wc)
+       :max-wait-for-tasks (:max_wait_for_tasks wc)
+       ;; max_working_resumes retired: worker-core folded its nudge into
+       ;; max_resumes. Old configs may still carry the key — it is simply
+       ;; not read here (harmless, no crash, no warning).
+       :max-resumes (:max_resumes wc)
+       :auto-merge-paths (:auto_merge_paths wc)
+       :reviewers all-reviewers})))
+
 (defn cmd-swarm
   "Run multiple worker configs from oompa.json in parallel"
   [opts args]
@@ -1137,29 +1165,7 @@
           ;; Convert to worker format
           workers (map-indexed
                     (fn [idx wc]
-                      (let [{:keys [harness model reasoning]} (parse-model-string (:model wc))
-                            all-reviewers (resolve-worker-reviewers wc generic-reviewers)]
-                        (worker/create-worker
-                          {:id (str "w" idx)
-                           :swarm-id swarm-id
-                           :harness harness
-                           :model model
-                           :reasoning reasoning
-                           :task-execution (:task_execution config)
-                           :resume-swarm-id (:resume_swarm_id config)
-                           :role (or (:_role wc) (:role wc))
-                           :can-claim-gpu (:can_claim_gpu wc)
-                           :max-cycles (:max_cycle wc)
-                           :prompts (:prompt wc)
-                           :can-plan (:can_plan wc)
-                           :wait-between (:wait_between wc)
-                           :max-wait-for-tasks (:max_wait_for_tasks wc)
-                           ;; max_working_resumes retired: worker-core folded its nudge into
-                           ;; max_resumes. Old configs may still carry the key — it is simply
-                           ;; not read here (harmless, no crash, no warning).
-                           :max-resumes (:max_resumes wc)
-                           :auto-merge-paths (:auto_merge_paths wc)
-                           :reviewers all-reviewers})))
+                      (configured-worker idx wc swarm-id config generic-reviewers))
                     expanded-workers)]
 
       ;; Preflight: handle stale worktrees from prior runs before launching workers.

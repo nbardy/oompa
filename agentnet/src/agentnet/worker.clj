@@ -231,6 +231,15 @@
 ;; against an unbounded codex goal, which is why it must never be removed.
 (def ^:private default-max-resumes 7)
 
+(defn worker-task-ids
+  "Parse optional JSON worker task_ids. Missing preserves legacy selection; [] denies all."
+  [config]
+  (when (contains? config :task_ids)
+    (let [ids (:task_ids config)]
+      (when-not (and (vector? ids) (every? #(and (string? %) (not (str/blank? %))) ids))
+        (throw (ex-info "Worker task_ids must be an array of nonempty task IDs" {})))
+      (set ids))))
+
 (defn create-worker
   "Create a worker config.
    :prompts is a string or vector of strings — paths to prompt files.
@@ -248,13 +257,14 @@
   [{:keys [id swarm-id harness model max-cycles prompts can-plan reasoning
            reviewers wait-between
            max-wait-for-tasks max-resumes
-           role can-claim-gpu auto-merge-paths task-execution resume-swarm-id]}]
+           role can-claim-gpu task-ids auto-merge-paths task-execution resume-swarm-id]}]
   {:id id
    :swarm-id swarm-id
    :harness (or harness :codex)
    :model model
    :role role
    :can-claim-gpu (boolean can-claim-gpu)
+   :task-ids task-ids
    :task-execution task-execution
    :resume-swarm-id resume-swarm-id
    :max-cycles (or max-cycles 10)
@@ -348,6 +358,10 @@
         missing-deps (when (seq deps)
                        (vec (remove @complete deps)))]
     (cond
+      (and (some? (:task-ids worker))
+           (not (contains? (:task-ids worker) (:id task))))
+      {:reason "task-ineligible" :task-id (:id task)}
+
       (seq missing-deps)
       {:reason "dependency-missing" :missing-dependencies (str/join "," missing-deps)}
 

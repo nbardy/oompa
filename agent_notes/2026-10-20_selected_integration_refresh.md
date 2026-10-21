@@ -29,3 +29,6 @@ controls check stale readiness/receipt invalidation, retained merge conflicts
 and refusal of unverified source. Existing continuation and selected-worker
 tests retain their original task/force holds. No live host or worktree was
 changed while implementing this source repair.
+
+2026-10-22 eligibility brief: blocker GPU worker can claim source tasks; target canonical per-worker task_ids with missing=legacy, empty=none, typed CLI parsing; check real selected scheduler and explicit CLAIM against local task backend; pass zero ineligible mutations and all source IDs claimable by permitted source worker; stop on backend/authority expansion; no host/provider/GPU launch or domain acceptance.
+Result: eligibility/Buddy 14 tests 102 assertions, existing execution 10/242 and reviewer config 3/3 pass. Status transitions have the same three assertions failing in merge-no-claim-under-cap-does-not-kill-worker on baseline and candidate (29/92); unrelated to eligibility, retained without change.
