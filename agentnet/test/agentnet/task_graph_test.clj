@@ -65,6 +65,20 @@
         (is (= 0 (:exit (process/sh ["git" "status" "--porcelain"] {:dir root})))))
       (finally (fs/delete-tree parent)))))
 
+(deftest observed-owner-led-acceptance-never-requires-selected-execution-custody
+  (let [{:keys [parent root]} (fixture)
+        config {:validators {}
+                :task_readiness {"final" {:role "observed" :blocker_class "acceptance" :reason_code "owner-acceptance"}
+                                 "users" {:role "observed" :blocker_class "external" :reason_code "participants-required"}}}]
+    (try
+      (doseq [dependencies [{} {"final" ["users"]}]]
+        (let [report (graph/audit! root config [(task "final" "in_progress") (task "users" "blocked")]
+                                   dependencies {})]
+          (is (= "externally-blocked" (:state report)))
+          (is (empty? (:actions report)))
+          (is (not-any? #(= "execution-custody-unverified" (:code %)) (mapcat :issues (:items report))))))
+      (finally (fs/delete-tree parent)))))
+
 (deftest typed-graph-detects-cycle-without-hiding-ready-prerequisites
   (let [{:keys [parent root]} (fixture) config {:validators {"repair" (gate root)}}]
     (try

@@ -101,7 +101,7 @@
                                            (if (or (contains? internal-holds (:held_reason prior)) owner-class)
                                              "Reconcile the recorded hold with its accountable owner; preserve its source, session and attempt history."
                                              "Classify the canonical hold through typed owner readiness metadata; never infer retry permission from prose.")))])
-                             (when (and (= "in_progress" (:status task)) (not prior) (not active?))
+                             (when (and (not= role "observed") (= "in_progress" (:status task)) (not prior) (not active?))
                                [(issue "execution-custody-unverified" "internal"
                                        "Reconcile the canonical claim with its actual live or retained execution; never steal or silently recycle it.")])
                              (when (and (not done?) (:paused task))
