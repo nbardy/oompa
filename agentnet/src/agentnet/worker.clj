@@ -1860,6 +1860,28 @@
 ;; One task owns its source workspace/session until a real consumer gate passes.
 (def ^:private selected-writer-lock (Object.))
 (def ^:private selected-active-owner (atom nil))
+;; Host acceptance fast-forwards the shared integration root and refuses a
+;; candidate that does not descend from it, so only one worker may be between
+;; "refresh onto root" and "host verdict" at a time. Implementation runs in
+;; parallel; this owner serializes only that short integration window.
+(def ^:private selected-integration-owner (atom nil))
+
+(defn- selected-exclusive?
+  "GPU-capable workers may run real project writers / GPU consumers and keep
+   the whole cycle under selected-writer-lock. Source-only workers
+   (can_claim_gpu false) implement concurrently in their own Cambium
+   worktrees; they only serialize through selected-integration-owner."
+  [worker]
+  (not (false? (:can-claim-gpu worker))))
+
+(defn- integration-turn! [worker]
+  (let [me [(:swarm-id worker) (:id worker)]]
+    (or (= me @selected-integration-owner)
+        (compare-and-set! selected-integration-owner nil me))))
+
+(defn- release-integration! [worker]
+  (let [me [(:swarm-id worker) (:id worker)]]
+    (swap! selected-integration-owner #(if (= % me) nil %))))
 
 (defn- selected-all-accepted? []
   (every? #(= "done" (:status %)) (tasks/list-all)))
@@ -1936,6 +1958,8 @@
   (let [held (assoc (or (:held_executions state) {}) (:task_id state)
                     (cond-> (assoc (dissoc state :held_executions) :held_reason (name reason))
                       task (assoc :held_task_revision (:revision task))))]
+    ;; Source-only holds also clear this; harmless while at most one worker
+    ;; is GPU-capable (the beta config has exactly one).
     (reset! selected-active-owner nil)
     {:state {:cycle (inc (:cycle state)) :attempt 0 :deadline_ms (:deadline_ms state)
              :accepted_count (:accepted_count state) :held_executions held}}))
@@ -1969,6 +1993,30 @@
                      (hold-selected state :consumer-rejected)
                      {:state state}))
       "blocked" (hold-selected state :validation-blocked))))
+
+(defn- with-selected-cycle-lock [worker f]
+  (if (selected-exclusive? worker)
+    (locking selected-writer-lock (f))
+    (f)))
+
+(defn- serialized-validation-step!
+  "One worker at a time refreshes onto the current integration root and holds
+   the host verdict window. Without this, a concurrent sibling landing first
+   leaves this candidate non-descendant and the host returns `blocked`, which
+   holds the task instead of re-reviewing the merged source."
+  [worker task state root]
+  (if-not (integration-turn! worker)
+    {:state (assoc state :phase "validating") :yield true}
+    (let [refreshed (if (:integration_turn state)
+                      state
+                      (integration-source/refresh! root state (:deadline_ms state)))]
+      (if (not= refreshed state)
+        (do (release-integration! worker) {:state refreshed})
+        (let [out (host-validation-step! worker task (assoc state :integration_turn true))]
+          (if (= "validating" (get-in out [:state :phase]))
+            out
+            (do (release-integration! worker)
+                (update out :state dissoc :integration_turn))))))))
 
 (defn- unstarted-provisioning? [state]
   (and (:task_id state) (:claim_revision state)
@@ -2048,6 +2096,7 @@
         finish (fn [status state & [error]]
                  (when (= [(:swarm-id worker) (:id worker)] @selected-active-owner)
                    (reset! selected-active-owner nil))
+                 (release-integration! worker)
                  ;; Every new run needs its own durable terminal receipt, even
                  ;; when its predecessor observed this exact same fingerprint.
                  (selected-state! worker state "stopped" status)
@@ -2081,9 +2130,10 @@
                 result
                 ;; Serialize real project writers/GPU consumers across workers.
                 ;; A rejected task retains this lock until accepted or blocked.
-                (locking selected-writer-lock
+                ;; Source-only workers skip it; see selected-exclusive?.
+                (with-selected-cycle-lock worker (fn []
                   (try
-                    (if (and @selected-active-owner
+                    (if (and (selected-exclusive? worker) @selected-active-owner
                              (not= [(:swarm-id worker) (:id worker)] @selected-active-owner))
                       {:state state :yield true}
                     (let [state (reconcile-held! root state accepted)
@@ -2106,7 +2156,8 @@
                           state (if task (dissoc state :queue_audit_unchanged) state)
                           state (if (and task (not (:task_id state)))
                                   (assoc state :task_id (:id task) :claim_revision (:revision task)) state)
-                          _ (when task (reset! selected-active-owner [(:swarm-id worker) (:id worker)]))
+                          _ (when (and task (selected-exclusive? worker))
+                              (reset! selected-active-owner [(:swarm-id worker) (:id worker)]))
                           state (if (and (:workspace state) (= "in_progress" (:status task))
                                          (false? (:paused task)) (= (:claim_revision state) (:revision task))
                                          (not= "awaiting-acceptance" (:phase state)))
@@ -2132,7 +2183,7 @@
                           (swap! accepted inc)
                           (when-let [workspace (:workspace state)]
                             (cambium/remove! root workspace))
-                          (reset! selected-active-owner nil)
+                          (when (selected-exclusive? worker) (reset! selected-active-owner nil))
                           {:state {:cycle (inc (:cycle state)) :attempt 0 :deadline_ms deadline
                                    :accepted_count @accepted :held_executions (:held_executions state)}})
 
@@ -2149,7 +2200,7 @@
                         (do (Thread/sleep (min 1000 (execution/remaining-ms deadline))) {:state state})
 
                         (= "validating" (:phase state))
-                        (host-validation-step! worker task state)
+                        (serialized-validation-step! worker task state root)
 
                         (>= (:attempt state) attempt-cap)
                         (hold-selected state :attempt-budget-exhausted)
@@ -2241,8 +2292,10 @@
                                 :else
                                 ;; Host is the single full-oracle owner. Review
                                 ;; remains advisory and cannot mark task done.
-                                (host-validation-step! worker task state))))))))
+                                (serialized-validation-step! worker task state root))))))))
                     (catch Exception e
+                      ;; An exception mid-verdict must not strand siblings.
+                      (release-integration! worker)
                       (if (:task_id @checkpoint)
                         (let [data (ex-data e)
                               state (cond-> (assoc @checkpoint :feedback {:error (.getMessage e)
@@ -2256,7 +2309,7 @@
                           (if (= :dirty-source (:reason (ex-data e)))
                             {:state state}
                             (hold-selected state :execution-blocked)))
-                        {:stop :execution-blocked :state @checkpoint :error (.getMessage e)}))))]
+                        {:stop :execution-blocked :state @checkpoint :error (.getMessage e)})))))]
             (when-not (or (:stop result) (:suppress-state-write result))
               (selected-state! worker (:state result) (if (:waiting result) "waiting" "running") nil))
             (when (:yield result) (Thread/sleep (min 1000 (execution/remaining-ms deadline))))
