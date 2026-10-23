@@ -10,6 +10,7 @@
 (defonce ^:private claims (atom {}))
 (defonce ^:private created (atom #{}))
 (defonce ^:private initialized? (atom false))
+(defonce ^:private scan-cache (atom {})) ; shared per-task scan snapshots, see list-all
 
 (defn configure! [config]
   (doseq [field [:workspace_id :buddy_id]]
@@ -22,6 +23,7 @@
   (reset! claims {})
   (reset! created #{})
   (reset! initialized? false)
+  (reset! scan-cache {})
   nil)
 
 (defn- rpc! [method params]
@@ -48,8 +50,10 @@
                                                 (max 1 (min 30000 (- *deadline-ms* (System/currentTimeMillis))))
                                                 30000)
                                      :throw false :follow-redirects :never})
-                     (catch Exception _
-                       (throw (ex-info "Buddy MCP request failed; check scoped grant and endpoint" {:type :transport-error}))))]
+                     (catch Exception e
+                       (throw (ex-info (str "Buddy MCP request failed (" (.getName (class e)) ": " (.getMessage e)
+                                            "); check scoped grant and endpoint")
+                                       {:type :transport-error}))))]
       (when-not (= 200 (:status response))
         (throw (ex-info "Buddy MCP refused request; check scoped turn grant (never owner credentials)"
                         {:type :transport-error :http-status (:status response)})))
@@ -67,15 +71,33 @@
           (throw (ex-info "Buddy MCP returned an invalid or rejected JSON-RPC response" {:type :protocol-error})))
         (:result message)))))
 
+(def ^:private read-retry-delays-ms [500 1000 2000 4000])
+
+(defn- transport-error? [e] (= :transport-error (:type (ex-data e))))
+
+(defn- rpc-read!
+  "Reads are idempotent, so a transport failure (connection reset, timeout under
+   a burst of parallel workers) is retried with jittered backoff. Writes are never
+   retried here: a lost response could hide an applied CAS write."
+  [method params]
+  (loop [delays read-retry-delays-ms]
+    (let [outcome (try {:value (rpc! method params)}
+                       (catch clojure.lang.ExceptionInfo e
+                         (if (and (transport-error? e) (seq delays)) {:retry e} (throw e))))]
+      (if (contains? outcome :value)
+        (:value outcome)
+        (do (Thread/sleep (+ (first delays) (rand-int (first delays))))
+            (recur (rest delays)))))))
+
 (defn- call! [tool arguments]
   (if *transport*
     (*transport* tool arguments)
     (do
       (when-not @initialized?
-        (rpc! "initialize" {:protocolVersion "2025-03-26" :capabilities {}
+        (rpc-read! "initialize" {:protocolVersion "2025-03-26" :capabilities {}
                              :clientInfo {:name "oompa-buddy-tasks" :version "1"}})
         (reset! initialized? true))
-      (let [result (rpc! "tools/call" {:name tool :arguments arguments})
+      (let [result ((if (= "tasks" tool) rpc-read! rpc!) "tools/call" {:name tool :arguments arguments})
             body (:text (first (:content result)))]
         (when (:isError result)
           (throw (ex-info (str "Buddy " tool " rejected: " body)
@@ -103,11 +125,30 @@
     (throw (ex-info "Task ID is outside the configured Buddy task allowlist" {:type :scope-error :id id})))
   (validate-task (:task (call! "tasks" {:action {:kind "get" :taskId id}}))))
 
+;; Every worker thread scans the whole selection on each loop. Without sharing,
+;; ten workers x forty tasks x (audit + pending scan) hammered the Buddy server
+;; with hundreds of sequential reads per second and bursts failed (swarm
+;; 00733e4f). Scans share one snapshot per task for a short window; claims stay
+;; safe because every write is a CAS on the observed revision, and a stale
+;; read only costs a revision conflict and a rescan.
+(def ^:private scan-ttl-ms 3000)
+
+(defn- remember! [task]
+  (swap! scan-cache assoc (:id task) {:at (System/currentTimeMillis) :task task})
+  task)
+
+(defn- scanned-task [id]
+  (let [{:keys [at task]} (get @scan-cache id)]
+    ;; Injected test transports are in-memory and model instant visibility.
+    (if (and task (nil? *transport*) (< (- (System/currentTimeMillis) at) scan-ttl-ms))
+      task
+      (remember! (get-task id)))))
+
 (defn list-all []
   ;; Get exact IDs instead of a broad list; details carry revision and pause state.
   ;; Explicit selection order is execution priority. Locally created tasks
   ;; follow deterministically; deduplication must not reorder selected IDs.
-  (mapv get-task (distinct (concat (:task_ids @settings) (sort @created)))))
+  (mapv scanned-task (distinct (concat (:task_ids @settings) (sort @created)))))
 
 (defn selection-dependencies [] (:dependencies @settings))
 
@@ -126,10 +167,11 @@
 (defn list-complete [] (filterv #(= "done" (:status %)) (list-all)))
 
 (defn- update! [task changes]
-  (validate-task
+  (remember!
+   (validate-task
     (call! "task_write" {:write {:kind "update" :taskId (:id task)
                                   :baseRevision (:revision task) :changes changes}
-                         :key (str "oompa-" (random-uuid))})))
+                         :key (str "oompa-" (random-uuid))}))))
 
 (defn claim-task! [candidate]
   ;; Keep the revision the caller observed: two claimants can never both win.
