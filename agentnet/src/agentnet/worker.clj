@@ -2077,6 +2077,22 @@
                                           (< (count failures) 2) (assoc :startup_recovery_ready true)))
                                       state)]) %)))))))
 
+;; How long a worker keeps its claim through an unreachable Buddy server before
+;; the ordinary hold/stop path applies. Covers a server restart or overload.
+(def ^:private outage-patience-ms (* 30 60 1000))
+(defn- outage-backoff-ms [] (+ 10000 (rand-int 20000)))
+
+(defn- buddy-outage?
+  "True when the Buddy MCP endpoint itself was unreachable or failing (timeout,
+   refused connection, 5xx), as opposed to a rejected or expired grant."
+  [e]
+  (boolean
+   (some (fn [x]
+           (let [{:keys [type http-status]} (ex-data x)]
+             (and (= :transport-error type)
+                  (not (#{401 403} http-status)))))
+         (take-while some? (iterate ex-cause e)))))
+
 (defn run-selected-worker!
   "Bounded, fail-closed Buddy consumer loop. Model output requests validation;
    only actual canonical done permits the next task. Failed gates resume the
@@ -2299,7 +2315,22 @@
                     (catch Exception e
                       ;; An exception mid-verdict must not strand siblings.
                       (release-integration! worker)
-                      (if (:task_id @checkpoint)
+                      (cond
+                        ;; Buddy server unreachable (restart, overload) is an
+                        ;; outage, not a task failure: keep the claim and wait
+                        ;; it out. Swarm 233859e6 (2026-10-23 12:02 UTC) lost 8
+                        ;; claimed tasks and every worker to one server restart
+                        ;; because timeouts were counted as task/preclaim failures.
+                        (and (buddy-outage? e)
+                             (< (- (System/currentTimeMillis) (or (:outage_since @checkpoint) (System/currentTimeMillis)))
+                                outage-patience-ms))
+                        (let [state (-> @checkpoint
+                                        (update :outage_since #(or % (System/currentTimeMillis)))
+                                        (assoc :outage_error (.getMessage e)))]
+                          (Thread/sleep (min (outage-backoff-ms) (execution/remaining-ms deadline)))
+                          {:state state :outage-wait true})
+
+                        (:task_id @checkpoint)
                         (let [data (ex-data e)
                               state (cond-> (assoc @checkpoint :feedback {:error (.getMessage e)
                                                                          :reason (some-> data :reason name)})
@@ -2312,6 +2343,8 @@
                           (if (= :dirty-source (:reason (ex-data e)))
                             {:state state}
                             (hold-selected state :execution-blocked)))
+
+                        :else
                         ;; Before any claim, a failure (often several workers
                         ;; scanning and claiming the same queue at once) is
                         ;; transient: back off and rescan instead of retiring
@@ -2330,7 +2363,9 @@
             (when (:yield result) (Thread/sleep (min 1000 (execution/remaining-ms deadline))))
             (if-let [status (:stop result)]
               (finish status (:state result) (:error result))
-              (recur (:state result))))))))))))
+              (recur (if (:outage-wait result)
+                       (:state result)
+                       (dissoc (:state result) :outage_since :outage_error)))))))))))))
 
 (defn run-worker! [worker]
   (if (:task-execution worker)

@@ -202,6 +202,58 @@
         (doseq [path @workspaces] (fs/delete-tree path))
         (fs/delete-tree root)))))
 
+(deftest claimed-task-survives-buddy-server-outage
+  ;; Regression: swarm 233859e6 (2026-10-23 12:02 UTC). A Buddy server restart
+  ;; made every task call time out; workers held their claimed tasks as
+  ;; execution-blocked and stopped. An outage must be waited out with the claim kept.
+  (let [root (fixture-repo)
+        previous-root (System/getProperty "user.dir")
+        store (atom {"one" (task "one" "open")})
+        calls (atom []) workspaces (atom [])
+        gate (validator root)
+        outages (atom 3)
+        inner (fixture-transport root store calls gate)
+        flaky (fn [tool args]
+                (if (and (= "oompa" tool) (pos? @outages))
+                  (do (swap! outages dec)
+                      (throw (ex-info "Buddy MCP request failed (java.net.http.HttpTimeoutException: request timed out)"
+                                      {:type :transport-error})))
+                  (inner tool args)))]
+    (try
+      (System/setProperty "user.dir" root)
+      (tasks/configure! {:type "buddies" :workspace_id "workspace" :buddy_id "buddy" :task_ids ["one"]})
+      (binding [buddy/*transport* flaky]
+        (with-redefs [worker/build-template-tokens (fn [& _] {})
+                      worker/outage-backoff-ms (fn [] 10)
+                      worker/create-iteration-worktree!
+                      (fn [_ _ _ cycle]
+                        (let [path (str root "-outage-" cycle) branch (str "outage-" cycle)]
+                          (git root "worktree" "add" "-b" branch path)
+                          (swap! workspaces conj path)
+                          {:path path :dir branch :name branch :branch branch}))
+                      cambium/remove! (fn [_ _] {:removed? false})
+                      harness/run-command!
+                      (fn [h opts]
+                        (if (= :claude h)
+                          {:exit 0 :err "" :out (json/generate-string {:type "text.delta" :text "VERDICT: APPROVED"})}
+                          (do (commit-file! (:cwd opts) "one.txt" "repaired\n")
+                              {:exit 0 :err ""
+                               :out (str (json/generate-string {:type "session.started" :sessionId "s1"}) "\n"
+                                         (json/generate-string {:type "text.delta" :text "COMPLETE_AND_READY_FOR_MERGE"}) "\n")})))]
+          (let [result (worker/run-worker! {:id "w0" :swarm-id "outage-fixture" :harness :codex :model "fixture"
+                                            :max-resumes 4 :max-cycles 10 :prompts [] :can-plan false
+                                            :reviewers [{:harness :claude :model "opus-review-fixture" :reasoning "high"}]
+                                            :task-execution {:wall_time_seconds 20 :attempt_timeout_seconds 5
+                                                             :validators {"one" gate}}})]
+            (is (zero? @outages))
+            (is (= "done" (get-in @store ["one" :status])))
+            (is (= 1 (:completed result))))))
+      (finally
+        (tasks/configure! nil)
+        (System/setProperty "user.dir" previous-root)
+        (doseq [path @workspaces] (fs/delete-tree path))
+        (fs/delete-tree root)))))
+
 (deftest preparation-review-is-held-while-independent-validated-work-continues
   (let [root (fixture-repo) previous-root (System/getProperty "user.dir")
         store (atom {"prep" (task "prep" "open") "two" (task "two" "open")})
