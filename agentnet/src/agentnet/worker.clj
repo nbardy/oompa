@@ -2155,7 +2155,10 @@
                           state (if prior-held (update state :held_executions dissoc (:id task)) state)
                           state (if task (dissoc state :queue_audit_unchanged) state)
                           state (if (and task (not (:task_id state)))
-                                  (assoc state :task_id (:id task) :claim_revision (:revision task)) state)
+                                  (-> state
+                                      (assoc :task_id (:id task) :claim_revision (:revision task))
+                                      (dissoc :preclaim_failures :preclaim_error))
+                                  state)
                           _ (when (and task (selected-exclusive? worker))
                               (reset! selected-active-owner [(:swarm-id worker) (:id worker)]))
                           state (if (and (:workspace state) (= "in_progress" (:status task))
@@ -2309,7 +2312,19 @@
                           (if (= :dirty-source (:reason (ex-data e)))
                             {:state state}
                             (hold-selected state :execution-blocked)))
-                        {:stop :execution-blocked :state @checkpoint :error (.getMessage e)})))))]
+                        ;; Before any claim, a failure (often several workers
+                        ;; scanning and claiming the same queue at once) is
+                        ;; transient: back off and rescan instead of retiring
+                        ;; the worker. Stop only after repeated consecutive
+                        ;; failures, with the last error kept on the record.
+                        (let [failures (inc (or (:preclaim_failures @checkpoint) 0))
+                              state (assoc @checkpoint :preclaim_failures failures
+                                           :preclaim_error (.getMessage e))]
+                          (if (>= failures 5)
+                            {:stop :execution-blocked :state state :error (.getMessage e)}
+                            (do (Thread/sleep (min (* 5000 failures (inc (rand-int 3)))
+                                                   (execution/remaining-ms deadline)))
+                                {:state state}))))))))]
             (when-not (or (:stop result) (:suppress-state-write result))
               (selected-state! worker (:state result) (if (:waiting result) "waiting" "running") nil))
             (when (:yield result) (Thread/sleep (min 1000 (execution/remaining-ms deadline))))
