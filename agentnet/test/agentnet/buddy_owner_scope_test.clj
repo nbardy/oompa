@@ -15,7 +15,9 @@
       (tasks/configure! config)
       (binding [buddy/*transport* (fn [tool args]
                                     (assert (= "tasks" tool))
-                                    {:task (get @rows (get-in args [:action :taskId]))})]
+                                    (if (= "list" (get-in args [:action :kind]))
+                                      (vec (vals @rows))
+                                      {:task (get @rows (get-in args [:action :taskId]))}))]
         (t/is (= ["product-task"] (mapv :id (tasks/list-pending))))
         (t/is (= "science" (:ownerId (tasks/get-task "science-task"))))
         (swap! rows assoc-in ["product-task" :ownerId] "unexpected-owner")

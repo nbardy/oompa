@@ -118,7 +118,9 @@
         shutdown (var-get #'worker/shutdown-requested?)
         transport (fn [tool args]
                     (case tool
-                      "tasks" {:task (get @store (get-in args [:action :taskId]))}
+                      "tasks" (if (= "list" (get-in args [:action :kind]))
+                (vec (vals @store))
+                {:task (get @store (get-in args [:action :taskId]))})
                       "task_write" (let [{:keys [taskId baseRevision changes]} (:write args) old (get @store taskId)]
                                      (is (= baseRevision (:revision old)))
                                      (let [new (merge old changes {:revision (inc baseRevision)})]

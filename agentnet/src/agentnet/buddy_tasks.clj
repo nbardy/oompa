@@ -125,30 +125,49 @@
     (throw (ex-info "Task ID is outside the configured Buddy task allowlist" {:type :scope-error :id id})))
   (validate-task (:task (call! "tasks" {:action {:kind "get" :taskId id}}))))
 
-;; Every worker thread scans the whole selection on each loop. Without sharing,
-;; ten workers x forty tasks x (audit + pending scan) hammered the Buddy server
-;; with hundreds of sequential reads per second and bursts failed (swarm
-;; 00733e4f). Scans share one snapshot per task for a short window; claims stay
-;; safe because every write is a CAS on the observed revision, and a stale
-;; read only costs a revision conflict and a rescan.
+;; Every worker thread scans the whole selection on each loop. Per-task reads
+;; from ten workers x forty tasks hammered the Buddy server and bursts dropped
+;; connections (swarm 00733e4f). A scan is now ONE `tasks list` call shared by
+;; all workers for a short window; claims stay safe because every write is a CAS
+;; on the observed revision, and a stale read only costs a conflict and rescan.
 (def ^:private scan-ttl-ms 3000)
 
 (defn- remember! [task]
-  (swap! scan-cache assoc (:id task) {:at (System/currentTimeMillis) :task task})
+  (swap! scan-cache assoc-in [:tasks (:id task)] task)
   task)
 
-(defn- scanned-task [id]
-  (let [{:keys [at task]} (get @scan-cache id)]
+;; Two server row shapes exist: Buddies >= ee1b1b0 returns full records from the
+;; Oompa-scoped list (one call is the whole scan); older servers return summary
+;; rows without revision/criteria, which need one `get` each. Delete the summary
+;; branch once every Buddies server running Oompa is at or past ee1b1b0.
+(defn- scan-rows [rows]
+  (if (every? :revision rows)
+    (mapv validate-task rows)
+    (mapv #(get-task (:id %)) rows)))
+
+(defn- scan! []
+  (let [rows (call! "tasks" {:action {:kind "list" :scope {:workspace (:workspace_id @settings)}
+                                      :include "all"}})
+        tasks (into {} (map (juxt :id identity)) (scan-rows rows))]
+    (reset! scan-cache {:at (System/currentTimeMillis) :tasks tasks})
+    tasks))
+
+(defn- snapshot []
+  (let [{:keys [at tasks]} @scan-cache]
     ;; Injected test transports are in-memory and model instant visibility.
-    (if (and task (nil? *transport*) (< (- (System/currentTimeMillis) at) scan-ttl-ms))
-      task
-      (remember! (get-task id)))))
+    (if (and at (nil? *transport*) (< (- (System/currentTimeMillis) at) scan-ttl-ms))
+      tasks
+      (scan!))))
 
 (defn list-all []
-  ;; Get exact IDs instead of a broad list; details carry revision and pause state.
   ;; Explicit selection order is execution priority. Locally created tasks
   ;; follow deterministically; deduplication must not reorder selected IDs.
-  (mapv scanned-task (distinct (concat (:task_ids @settings) (sort @created)))))
+  (let [tasks (snapshot)]
+    (mapv (fn [id]
+            (or (get tasks id)
+                (throw (ex-info (str "Selected task " id " is missing from the scoped Buddy scan")
+                                {:type :scope-error :id id}))))
+          (distinct (concat (:task_ids @settings) (sort @created))))))
 
 (defn selection-dependencies [] (:dependencies @settings))
 

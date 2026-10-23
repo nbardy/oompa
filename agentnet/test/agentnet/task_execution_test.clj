@@ -100,7 +100,9 @@
   (fn [tool args]
     (swap! calls conj [tool args])
     (case tool
-      "tasks" {:task (get @store (get-in args [:action :taskId]))}
+      "tasks" (if (= "list" (get-in args [:action :kind]))
+                (vec (vals @store))
+                {:task (get @store (get-in args [:action :taskId]))})
       "task_write"
       (let [{:keys [taskId baseRevision changes]} (:write args)
             old (get @store taskId)]
