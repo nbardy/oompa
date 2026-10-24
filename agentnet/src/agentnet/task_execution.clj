@@ -80,8 +80,13 @@
   (format "%064x" (java.math.BigInteger. 1 (.digest (java.security.MessageDigest/getInstance "SHA-256") bytes))))
 (defn file-sha256 [path] (sha256 (java.nio.file.Files/readAllBytes (.toPath (io/file path)))))
 (defn key-string [value] (if (keyword? value) (subs (str value) 1) value))
-(defn validator-for [config id]
-  (or (get-in config [:validators id]) (get-in config [:validators (keyword id)])))
+(defn validator-for
+  "Explicit per-task validator, else the owner-pinned default_validator. The
+   default is a named config key (never inferred), so absence of both still
+   means \"no oracle\" and the selected loop refuses to claim the task."
+  [config id]
+  (or (get-in config [:validators id]) (get-in config [:validators (keyword id)])
+      (:default_validator config)))
 (defn validator-digest [validator]
   ;; Rejection checkpoint policy can be tightened without pretending the
   ;; source/command oracle changed. Host config authority forbids weakening it.
@@ -101,7 +106,9 @@
                    (every? #(or (nil? (get policy %)) (and (string? (get policy %)) (not (str/blank? (get policy %)))))
                            [:reason_code :next_action :required_owner]))
       (throw (ex-info "task_readiness requires typed role/blocker classification and nonempty owner/action metadata" {:task-id id}))))
-  (doseq [[id validator] (:validators config)]
+  (doseq [[id validator] (cond-> (vec (:validators config))
+                            (contains? config :default_validator)
+                            (conj [:default_validator (:default_validator config)]))]
     (when-not (and (sequential? (:command validator)) (seq (:command validator))
                    (every? #(and (string? %) (not (str/blank? %))) (:command validator))
                    (integer? (:timeout_seconds validator)) (pos? (:timeout_seconds validator))
@@ -114,6 +121,16 @@
       (throw (ex-info "Each validator requires command argv, timeout_seconds, and pinned source_files SHA-256 map"
                       {:task-id id}))))
   config)
+
+(defn require-discovery-validator!
+  "root_task_ids admits tasks that do not exist at launch, so no per-task
+   validators map can cover them. Refuse at startup unless the owner pinned a
+   task_execution.default_validator; never run discovered work unvalidated."
+  [backend execution-config]
+  (when (and (seq (:root_task_ids backend)) (not (map? (:default_validator execution-config))))
+    (throw (ex-info "task_backend.root_task_ids requires task_execution.default_validator (discovered tasks have no explicit validator entry)"
+                    {:type :missing-default-validator :root_task_ids (:root_task_ids backend)})))
+  nil)
 
 (defn owner-window-environment []
   {:authorization_id (System/getenv "OOMPA_OWNER_WINDOW_AUTHORIZATION_ID")

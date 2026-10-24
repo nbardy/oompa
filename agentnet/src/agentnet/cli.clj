@@ -1118,6 +1118,7 @@
     (worker/ensure-single-swarm! (:force opts))
 
     (let [config (json/parse-string (slurp f) true)
+          _ (execution/require-discovery-validator! (:task_backend config) (:task_execution config))
           _ (tasks/configure! (:task_backend config))
           _ (when-let [selected (:task_execution config)]
               (execution/validate-config! selected)
@@ -1231,6 +1232,7 @@
     (when-not path (throw (ex-info "audit requires --config PATH" {})))
     (let [config (json/parse-string (slurp path) true)
           selected (execution/validate-config! (:task_execution config))]
+      (execution/require-discovery-validator! (:task_backend config) selected)
       (tasks/configure! (:task_backend config))
       (when-not (tasks/buddies?) (throw (ex-info "Selected graph audit requires canonical Buddy tasks" {})))
       (let [held (when-let [prior (:resume_swarm_id config)]

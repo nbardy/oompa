@@ -351,7 +351,18 @@ Only explicit task IDs belonging to the configured Buddy and workspace are
 admitted. Claims compare the observed revision and preserve the accountable
 owner; blocked, paused, in-progress and review tasks are not new work. Configured
 `task_ids` order determines selection priority; prerequisite checks still apply.
-Explicit prerequisites must be in the admitted task set and actually done. The filesystem
+Explicit prerequisites must be in the admitted task set and actually done.
+
+To work a whole subtree instead of hand-picking IDs, point the backend at parent tasks:
+
+- `task_backend.root_task_ids` — parent task IDs; every scan re-expands their descendants by canonical `parentId`, so children created or reopened mid-run are picked up.
+- Work item vs container — a root with any child, or a descendant with an open (not done/cancelled) child, is a container and is never claimed; every other descendant is a work item.
+- `task_backend.task_ids` — optional alongside `root_task_ids`; explicit IDs keep first priority, then discovered work items in depth-first order.
+- Discovered tasks use their own canonical `ownerId`; `owner_by_task` applies only to explicit `task_ids`.
+- `task_execution.default_validator` — validator for any selected task without a `validators` entry; required when `root_task_ids` is set (startup refuses otherwise).
+- The Buddy launch grant then carries `oompa.rootTaskIds` and authorizes exactly that subtree (ancestry checked per request), not a frozen ID list.
+
+The filesystem
 planner is disabled in Buddy mode. Workers receive the full task criteria and
 claim results through their prompt rather than finding JSON files themselves.
 

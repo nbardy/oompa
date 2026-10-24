@@ -193,5 +193,76 @@
       (is (thrown-with-msg? Exception #"changed" (tasks/block-task! (tasks/get-task "two") blocked)))
       (is (= "in_progress" (get-in @store ["two" :status]))))))
 
+(defn child [id parent status & {:as extra}]
+  (merge (task id status) {:parentId parent :ownerId (str "owner-" id)} extra))
+
+;; root_task_ids: the owner points a config at a parent task and Oompa works its
+;; descendants. These guard the container/work-item rule and per-scan
+;; re-expansion; a regression would either claim umbrella tasks (wasting a
+;; worker on a whole epic) or freeze the queue at launch-time children.
+(deftest root-task-ids-expand-descendants-on-every-scan
+  (tasks/configure! {:type "buddies" :workspace_id "workspace" :buddy_id "buddy"
+                     :root_task_ids ["root"]})
+  ;; root
+  ;;  +- epic (container: has open child)
+  ;;  |   +- leaf-a open           -> work item, runnable
+  ;;  |   +- leaf-p open, paused   -> work item, not runnable
+  ;;  |   +- leaf-c cancelled      -> work item, closed
+  ;;  +- finished (no open children: its only child is done) -> work item
+  ;;  |   +- leaf-d done           -> work item, closed
+  ;;  +- leaf-b blocked            -> work item, not runnable
+  (let [store (atom (into (array-map)
+                          (map (juxt :id identity))
+                          [(assoc (task "root" "open") :parentId nil)
+                           (child "epic" "root" "open")
+                           (child "leaf-a" "epic" "open")
+                           (child "leaf-p" "epic" "open" :paused true)
+                           (child "leaf-c" "epic" "cancelled")
+                           (child "finished" "root" "open")
+                           (child "leaf-d" "finished" "done")
+                           (child "leaf-b" "root" "blocked")]))
+        calls (atom [])]
+    ;; Eight rows keep array-map (server row) order for the order assertion.
+    (binding [buddy/*transport* (fake-transport store calls)]
+      (is (= ["leaf-a" "leaf-p" "leaf-c" "finished" "leaf-d" "leaf-b"] (mapv :id (tasks/list-all)))
+          "roots and containers are never work items; depth-first child order")
+      (is (= ["leaf-a" "finished"] (mapv :id (tasks/list-pending)))
+          "paused/cancelled/done/blocked use the existing runnable? refusal")
+      (is (= "owner-leaf-a" (:ownerId (tasks/get-task "leaf-a")))
+          "discovered tasks keep their own canonical owner without owner_by_task")
+      (testing "a child created under a container mid-run is picked up at the next scan"
+        (swap! store assoc "leaf-new" (child "leaf-new" "epic" "open"))
+        (is (some #{"leaf-new"} (mapv :id (tasks/list-pending)))))
+      (testing "adding an open child turns a work item into a container"
+        (swap! store assoc "follow-up" (child "follow-up" "finished" "open"))
+        (is (not-any? #{"finished"} (mapv :id (tasks/list-all))))
+        (is (some #{"follow-up"} (mapv :id (tasks/list-pending)))))
+      (testing "a row outside every configured subtree is refused, not silently admitted"
+        (swap! store assoc "stray" (child "stray" "elsewhere" "open"))
+        (is (thrown-with-msg? Exception #"outside the configured" (tasks/list-all)))))))
+
+(deftest root-task-ids-compose-with-explicit-task-ids
+  (tasks/configure! (assoc config :task_ids ["one"] :root_task_ids ["root"]))
+  (let [store (atom (array-map "one" (task "one" "open")
+                               "root" (assoc (task "root" "open") :parentId nil)
+                               "kid" (child "kid" "root" "open")))
+        calls (atom [])]
+    (binding [buddy/*transport* (fake-transport store calls)]
+      (is (= ["one" "kid"] (mapv :id (tasks/list-all))) "explicit priority first")
+      (is (= :claimed (:status (tasks/claim-by-id! "kid"))))))
+  (testing "a root with no children is itself the work item"
+    (tasks/configure! (assoc config :task_ids [] :root_task_ids ["solo"]))
+    (binding [buddy/*transport* (fake-transport (atom {"solo" (assoc (task "solo" "open") :parentId nil)}) (atom []))]
+      (is (= ["solo"] (mapv :id (tasks/list-pending))))))
+  (testing "a configured root missing from the scoped scan is a scope error"
+    (tasks/configure! (assoc config :task_ids [] :root_task_ids ["gone"]))
+    (binding [buddy/*transport* (fake-transport (atom {}) (atom []))]
+      (is (thrown-with-msg? Exception #"missing from the scoped Buddy scan" (tasks/list-all)))))
+  (testing "config must name task_ids and/or a nonempty root_task_ids"
+    (is (thrown-with-msg? Exception #"task_ids and/or root_task_ids"
+                          (tasks/configure! (dissoc config :task_ids))))
+    (is (thrown-with-msg? Exception #"nonempty"
+                          (tasks/configure! (assoc config :root_task_ids []))))))
+
 (let [{:keys [fail error]} (run-tests 'agentnet.buddy-tasks-test)]
   (when (pos? (+ fail error)) (System/exit 1)))

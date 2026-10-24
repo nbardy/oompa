@@ -11,17 +11,33 @@
 (defonce ^:private created (atom #{}))
 (defonce ^:private initialized? (atom false))
 (defonce ^:private scan-cache (atom {})) ; shared per-task scan snapshots, see list-all
+;; Ids under root_task_ids (roots, containers and work items) seen by the latest
+;; scan. Membership is re-derived from canonical parentId on every scan, so a
+;; child created under a root mid-run is admitted at the next scan.
+(defonce ^:private discovered (atom #{}))
+
+(defn- id-list? [value] (and (sequential? value) (every? #(and (string? %) (not (str/blank? %))) value)))
 
 (defn configure! [config]
   (doseq [field [:workspace_id :buddy_id]]
     (when (str/blank? (get config field))
       (throw (ex-info (str "Buddy task backend requires " (name field)) {:field field}))))
-  (when-not (and (sequential? (:task_ids config)) (every? string? (:task_ids config)))
-    (throw (ex-info "Buddy task backend requires explicit task_ids (an empty list admits only tasks created here)" {})))
+  ;; Selection = explicit task_ids (ordered) + work items under root_task_ids.
+  ;; At least one key must be present; an explicit empty task_ids still means
+  ;; "only tasks created here". Neither key is ever guessed.
+  (when-not (or (contains? config :task_ids) (contains? config :root_task_ids))
+    (throw (ex-info "Buddy task backend requires explicit task_ids and/or root_task_ids (an empty task_ids list admits only tasks created here)" {})))
+  (when (and (contains? config :task_ids) (not (id-list? (:task_ids config))))
+    (throw (ex-info "Buddy task backend task_ids must be a list of task IDs" {:field :task_ids})))
+  (when (and (contains? config :root_task_ids)
+             (not (and (id-list? (:root_task_ids config)) (seq (:root_task_ids config)))))
+    (throw (ex-info "Buddy task backend root_task_ids must be a nonempty list of task IDs" {:field :root_task_ids})))
   (reset! settings (merge {:url_env "OOMPA_BUDDY_MCP_URL"
-                          :token_env "OOMPA_BUDDY_MCP_TOKEN"} config))
+                          :token_env "OOMPA_BUDDY_MCP_TOKEN"
+                          :task_ids [] :root_task_ids []} config))
   (reset! claims {})
   (reset! created #{})
+  (reset! discovered #{})
   (reset! initialized? false)
   (reset! scan-cache {})
   nil)
@@ -106,13 +122,29 @@
           (throw (ex-info "Buddy tool response has no primary JSON content" {:type :protocol-error})))
         (json/parse-string body true)))))
 
-(defn- allowed? [id] (contains? (into (set (:task_ids @settings)) @created) id))
+(defn- selection-kind
+  "How a task entered this run's scope: :explicit (task_ids), :created (by this
+   process) or :discovered (under a root_task_id). nil = outside the scope.
+   Explicit wins so owner_by_task still binds a listed task that is also under a root."
+  [id]
+  (cond (some #{id} (:task_ids @settings)) :explicit
+        (contains? @created id) :created
+        (contains? @discovered id) :discovered))
+(defn- allowed? [id] (some? (selection-kind id)))
+(defn- owner-matches? [task]
+  (case (selection-kind (:id task))
+    :explicit (= (or (get-in @settings [:owner_by_task (:id task)])
+                     (get-in @settings [:owner_by_task (keyword (:id task))])
+                     (:buddy_id @settings)) (:ownerId task))
+    :created (= (:buddy_id @settings) (:ownerId task))
+    ;; Discovered tasks carry their own canonical owner; the host grant bounds
+    ;; them by ancestry, not by an owner list.
+    :discovered (and (string? (:ownerId task)) (not (str/blank? (:ownerId task))))
+    nil false))
 (defn- validate-task [task]
   (when-not (and (map? task) (allowed? (:id task))
                  (= (:workspace_id @settings) (:workspaceId task))
-                 (= (or (get-in @settings [:owner_by_task (:id task)])
-                        (get-in @settings [:owner_by_task (keyword (:id task))])
-                        (:buddy_id @settings)) (:ownerId task))
+                 (owner-matches? task)
                  (pos-int? (:revision task))
                  (boolean? (:paused task))
                  (#{"open" "in_progress" "blocked" "review" "done" "cancelled"} (:status task)))
@@ -145,29 +177,74 @@
     (mapv validate-task rows)
     (mapv #(get-task (:id %)) rows)))
 
+(def ^:private closed-statuses #{"done" "cancelled"})
+
+(defn subtree
+  "Pure expansion of root_task_ids over one scan's rows (canonical parentId).
+   Returns {:members #{every id reachable from a root, roots included}
+            :work-items [ids in depth-first pre-order]}.
+   Work-item rule (owner request 2026-10-24, \"point at a parent task and do
+   all of its children\"):
+     - a root is a container if it has any child, else it is itself a work item;
+     - a non-root task with an open (not done/cancelled) child is a container;
+       a non-root task with no open children is a work item.
+   Containers are never claimed. Paused/blocked/done/cancelled work items are
+   still listed; runnable? already refuses them, exactly as for explicit tasks.
+   Child order is the server's row order (creation order), so it is stable."
+  [rows root-ids]
+  (let [by-id (into {} (map (juxt :id identity)) rows)
+        children (group-by :parentId rows)
+        work-item? (fn [id root?]
+                     (let [kids (get children id)]
+                       (if root?
+                         (empty? kids)
+                         (not-any? #(not (closed-statuses (:status %))) kids))))]
+    (loop [stack (mapv (fn [id] [id true]) (reverse root-ids))
+           members #{} items []]
+      (if-let [[id root?] (peek stack)]
+        (do
+          (when-not (contains? by-id id)
+            (throw (ex-info (str "Task " id " under root_task_ids is missing from the scoped Buddy scan")
+                            {:type :scope-error :id id})))
+          ;; A parentId cycle (or a root nested under another root) would revisit;
+          ;; refuse a cycle loudly, but let a nested root count once.
+          (if (contains? members id)
+            (if root?
+              (recur (pop stack) members items)
+              (throw (ex-info "Buddy task parentId graph has a cycle" {:type :scope-error :id id})))
+            (recur (into (pop stack) (map (fn [kid] [(:id kid) false])) (reverse (get children id)))
+                   (conj members id)
+                   (if (work-item? id root?) (conj items id) items))))
+        {:members members :work-items items}))))
+
 (defn- scan! []
   (let [rows (call! "tasks" {:action {:kind "list" :scope {:workspace (:workspace_id @settings)}
                                       :include "all"}})
+        ;; Membership must be known before validation: validate-task admits a
+        ;; discovered row only if it is reachable from a configured root.
+        {:keys [members work-items]} (subtree rows (:root_task_ids @settings))
+        _ (reset! discovered members)
         tasks (into {} (map (juxt :id identity)) (scan-rows rows))]
-    (reset! scan-cache {:at (System/currentTimeMillis) :tasks tasks})
+    (reset! scan-cache {:at (System/currentTimeMillis) :tasks tasks :work-items work-items})
     tasks))
 
 (defn- snapshot []
-  (let [{:keys [at tasks]} @scan-cache]
+  (let [{:keys [at] :as cached} @scan-cache]
     ;; Injected test transports are in-memory and model instant visibility.
     (if (and at (nil? *transport*) (< (- (System/currentTimeMillis) at) scan-ttl-ms))
-      tasks
-      (scan!))))
+      cached
+      (do (scan!) @scan-cache))))
 
 (defn list-all []
-  ;; Explicit selection order is execution priority. Locally created tasks
-  ;; follow deterministically; deduplication must not reorder selected IDs.
-  (let [tasks (snapshot)]
+  ;; Explicit selection order is execution priority, then discovered work items
+  ;; under root_task_ids (depth-first), then locally created tasks.
+  ;; Deduplication must not reorder selected IDs.
+  (let [{:keys [tasks work-items]} (snapshot)]
     (mapv (fn [id]
             (or (get tasks id)
                 (throw (ex-info (str "Selected task " id " is missing from the scoped Buddy scan")
                                 {:type :scope-error :id id}))))
-          (distinct (concat (:task_ids @settings) (sort @created))))))
+          (distinct (concat (:task_ids @settings) work-items (sort @created))))))
 
 (defn selection-dependencies [] (:dependencies @settings))
 

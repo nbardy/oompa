@@ -145,6 +145,27 @@ For large features or multi-day efforts where entropy becomes the dominant failu
 }
 ```
 
+### Pattern: Work a Buddy Parent Task's Subtree
+
+Point the Buddy backend at parent task(s) and the swarm works all of their descendants, including children added during the run.
+
+```json
+{
+  "task_backend": {"type": "buddies", "workspace_id": "ws", "buddy_id": "lead",
+                   "root_task_ids": ["beta-delivery"]},
+  "task_execution": {"wall_time_seconds": 36000, "attempt_timeout_seconds": 3600,
+                     "validators": {},
+                     "default_validator": {"command": ["python3", "tools/check.py"], "timeout_seconds": 1800,
+                                           "source_files": {"tools/check.py": "<sha256>"}}}
+}
+```
+
+- `root_task_ids`: parents to expand; re-expanded on every queue scan via canonical `parentId`.
+- Containers (a root with children, or any task with an open child) are never claimed; leaf-ish tasks are work items.
+- Paused, blocked, review, done and cancelled work items are listed but not claimable.
+- `task_ids`: optional explicit IDs, worked first.
+- `default_validator`: required with `root_task_ids`; used for any task without a `validators` entry.
+- Owners come from each task's own `ownerId`; the Buddy launch grant authorizes only the roots' subtree (`oompa.rootTaskIds`).
 
 ## 3. Creating Good Tasks
 

@@ -630,5 +630,23 @@
         (doseq [workspace @workspaces] (fs/delete-tree (:path workspace)))
         (fs/delete-tree root)))))
 
+(deftest root-task-ids-require-a-default-validator
+  ;; Discovered tasks are created after launch, so a validators map cannot list
+  ;; them. Without this refusal they would silently sit unclaimed forever (no
+  ;; oracle) or, worse, a future change could run them unvalidated.
+  (let [validator {:command ["python3" "check.py"] :timeout_seconds 60 :source_files {"check.py" (apply str (repeat 64 "a"))}}]
+    (is (thrown-with-msg? Exception #"requires task_execution.default_validator"
+                          (execution/require-discovery-validator! {:root_task_ids ["root"]} {:validators {}})))
+    (is (thrown-with-msg? Exception #"requires task_execution.default_validator"
+                          (execution/require-discovery-validator! {:root_task_ids ["root"]} nil)))
+    (is (nil? (execution/require-discovery-validator! {:task_ids ["one"]} {:validators {}})))
+    (let [config {:validators {"one" (assoc validator :timeout_seconds 5)} :default_validator validator}]
+      (is (nil? (execution/require-discovery-validator! {:root_task_ids ["root"]} config)))
+      (is (= 5 (:timeout_seconds (execution/validator-for config "one"))) "explicit entry wins")
+      (is (= validator (execution/validator-for config "discovered"))))
+    (is (thrown-with-msg? Exception #"Each validator requires"
+                          (execution/validate-config! {:wall_time_seconds 1 :attempt_timeout_seconds 1 :validators {}
+                                                       :default_validator {:command []}})))))
+
 (let [{:keys [fail error]} (run-tests 'agentnet.task-execution-test)]
   (when (pos? (+ fail error)) (System/exit 1)))
