@@ -422,6 +422,8 @@
                   (json/generate-string {:status "blocked" :reason "CUDA" :taskComplete false :readyForMergeValidation false :task_id "other"})]]
     (is (nil? (execution/blocked-result output "one")))))
 
+(defn- structured? [mode] (contains? #{:structured :progress-structured} mode))
+
 (deftest blocked-return-holds-before-review-and-continues-independent-work-and-survives-restart
   ;; Replay the actual turn-five fenced object, plus races where canonical
   ;; state changes during a model call that even claims merge readiness.
@@ -502,13 +504,15 @@
                 (is (= "done" (get-in @store ["two" :status])))
                 (is (= 1 (:completed result)))
                 (is (= (if (= :stopped-active mode) 1 2) (count @model-calls)))
-                (is (= 1 (count @review-calls)))
+                ;; A structured block is itself reviewed before it stands.
+                (is (= (if (structured? mode) 2 1) (count @review-calls)))
                 (is (= 1 (count (filter #(= "oompa" (first %)) @calls))))
                 (is (= expected-session (:session_id held)))
                 (is (= (if (= :stopped-active mode) 9 1) (:attempt held)))
                 (is (.isDirectory (io/file (get-in held [:workspace :path]))))
-                (when (contains? #{:structured :progress-structured} mode)
+                (when (structured? mode)
                   (is (= "model-blocked" (:held_reason held)))
+                  (is (= "confirmed" (:block_review held)))
                   (is (= "blocked" (get-in @store ["one" :status])))
                   (is (= (:reason (execution/blocked-result (if (= :progress-structured mode) cost-progress-blocked-output force-blocked-output) "one"))
                          (get-in @store ["one" :blockedReason])))
@@ -530,7 +534,7 @@
                   (is (= :needs-reconciliation (:status restarted)))
                   (is (= (dissoc saved :queue_audit_unchanged) (dissoc after :queue_audit_unchanged)))
                   (is (= (if (= :stopped-active mode) 1 2) (count @model-calls)))
-                  (is (= 1 (count @review-calls))))
+                  (is (= (if (structured? mode) 2 1) (count @review-calls))))
                 (when (contains? #{:structured :progress-structured} mode)
                   ;; Metadata edits while blocked do not reopen the task.
                   (swap! store update "one" #(-> % (assoc :nextAction "Owner is investigating") (update :revision inc)))
@@ -610,7 +614,11 @@
           (let [before (:execution (runs/read-worker-state "startup-before" "w0"))
                 held (get-in before [:held_executions :one])]
             (is (= ["two"] (mapv :id @model-calls)))
-            (is (= "in_progress" (get-in @store ["one" :status])))
+            ;; Worker exit releases its own failed claim (swarm 455987ea left
+            ;; such claims in_progress, unclaimable by anyone).
+            (is (= "open" (get-in @store ["one" :status])))
+            (is (str/includes? (get-in @store ["one" :nextAction]) "[oompa-release]"))
+            (is (= "released" (get-in held [:release :outcome])))
             (is (= "done" (get-in @store ["two" :status])))
             (is (nil? (:workspace held))) (is (nil? (:session_id held)))
             (is (zero? (:attempt held)))

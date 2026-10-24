@@ -39,6 +39,9 @@
 (defn block-task! [task result]
   (if (buddies?) (buddy/block-task! task result)
       (throw (ex-info "Selected-task holds require the Buddy backend" {}))))
+(defn release-abandoned! [task next-action]
+  (if (buddies?) (buddy/release-abandoned! task next-action)
+      (throw (ex-info "Selected-task releases require the Buddy backend" {}))))
 (defn claim-next! []
   (if (buddies?) (some buddy/claim-task! (list-pending)) (filesystem/claim-next!)))
 (defn claim-by-id!
