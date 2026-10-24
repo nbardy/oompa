@@ -372,6 +372,17 @@ An empty runnable set with unfinished canonical tasks reports
 `awaiting-buddy-acceptance`, not beta completion. After process loss, existing
 in-progress tasks stay held until their owner reconciles the original run;
 Oompa must not silently recycle another executor's claim.
+A worker that gives up on its OWN claim releases it explicitly instead
+(swarm 455987ea went idle with such claims stuck `in_progress`): on the attempt
+budget (for example repeated reviewer NEEDS_CHANGES), an attempt timeout, a
+rejected block, or a worker exit other than interrupt, the claim is CAS-set back
+to `open`. Its `nextAction` keeps the owner's text and appends one
+`[oompa-release]` section naming the reason, the retained unmerged branch and
+commit, and the last reviewer findings. The releasing worker keeps a held
+record pinned to the released revision and does not retake it; other workers
+can. An interrupt keeps the claim for `--resume`. Host/policy holds
+(`consumer-rejected`, `validation-blocked`, `reviewer-unconfigured`) and
+canonical revision conflicts are not released.
 
 For deterministic delivery use top-level `task_execution`: `wall_time_seconds`,
 `attempt_timeout_seconds`, `validators` keyed by canonical task ID and optional
@@ -430,8 +441,14 @@ canonical reopen are required before continuation; delegated config amendment
 cannot remove this checkpoint. Cheap controls retain the normal repair loop.
 Workers can return a JSON blocked result with `status: "blocked"`, a nonempty
 `reason`, `taskComplete: false`, `readyForMergeValidation: false`, and optional
-`requiredOwnerAction`. The framework CAS-holds the canonical task with its reason
-and next action before review, retaining its source/session and return history.
+`requiredOwnerAction`. The block is first sent to the configured reviewers
+(`config/prompts/_framework/block_reviewer.md`) with the task's done criteria and
+current `nextAction`, including any CEO DECISION line. `VERDICT: APPROVED`
+confirms it: the framework CAS-holds the canonical task as `blocked` with its
+reason and next action, retaining its source/session and return history. Any
+other verdict rejects it: the task is released to `open` with the reviewer's
+reason in `nextAction`, as above. Without configured reviewers the block stands
+unreviewed (`block_review: "unreviewed"` on the held record).
 Canonical status/revision is also rechecked after every model return. Held work
 resumes only after an explicit canonical `open` transition at a new revision;
 restarting the run or editing blocked-task metadata does not retry it or renew

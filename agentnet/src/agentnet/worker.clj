@@ -586,12 +586,15 @@
           (mapv second (re-seq #"(?m)^VERDICT: (APPROVED|NEEDS_CHANGES|REJECTED)\r?$"
                                (:output review))))))
 
-(defn- run-reviewer!
-  "Run reviewer on worktree changes.
-   Uses custom review-prompts when configured, otherwise falls back to default.
-   prev-feedback: vector of previous review outputs (for multi-round context).
+(defn- run-review!
+  "Shared reviewer core: diff/merged-log context, reviewer fallback chain and
+   verdict parsing. `render-body` receives {:base :diff_content :merged_section}
+   (base = the reviewer's custom prompt plus the canonical task section) and
+   returns the framework prompt body. Candidate review and block review differ
+   ONLY in that body, so both go through the same reviewers and the same
+   explicit-approval? parse.
    Returns {:verdict :approved|:needs-changes, :comments [...], :output string}"
-  [{:keys [id swarm-id reviewers timeout-ms deadline-ms review-base selected-task]} worktree-path prev-feedback]
+  [{:keys [id swarm-id reviewers timeout-ms deadline-ms review-base selected-task]} worktree-path render-body]
   (let [start-ms (System/currentTimeMillis)
         git-run (fn [argv]
                   (let [opts {:dir worktree-path :out :string :err :string}]
@@ -620,19 +623,6 @@
                               merged-log
                               "\n\n"))
 
-        ;; Only include the most recent round's feedback — the worker has already
-        ;; attempted fixes based on it, so the reviewer just needs to verify.
-        history-block (when (seq prev-feedback)
-                        (let [latest (last prev-feedback)
-                              truncated (if (> (count latest) 2000)
-                                          (str (subs latest 0 2000) "\n... [feedback truncated]")
-                                          latest)]
-                          (str "\n## Previous Review (Round " (count prev-feedback) ")\n\n"
-                               "The worker has attempted fixes based on this feedback. "
-                               "Verify the issues below are resolved. Do NOT raise new issues.\n\n"
-                               truncated
-                               "\n\n")))
-
         abs-wt (.getAbsolutePath (io/file worktree-path))
 
         ;; Try each reviewer until one succeeds and returns a verdict
@@ -648,12 +638,9 @@
                                                   (str "\nCanonical task and original done criteria:\n"
                                                        (json/generate-string (dissoc selected-task :_file))
                                                        "\nReview only this committed candidate. Do not modify source, merge, or change task status.\n")))
-                               review-body (load-framework-prompt
-                                             "reviewer.md"
-                                             {:base review-base
-                                              :diff_content diff-content
-                                              :merged_section (or merged-section "")
-                                              :history_block (or history-block "")})
+                               review-body (render-body {:base review-base
+                                                         :diff_content diff-content
+                                                         :merged_section (or merged-section "")})
                                review-prompt (tag-prompt swarm-id id review-body)
                                res (try
                                         (harness/run-command! harness
@@ -703,6 +690,42 @@
                  [(:err result)])
      :output output
      :duration-ms duration-ms}))
+
+(defn- run-reviewer!
+  "Run reviewer on worktree changes.
+   Uses custom review-prompts when configured, otherwise falls back to default.
+   prev-feedback: vector of previous review outputs (for multi-round context).
+   Returns {:verdict :approved|:needs-changes, :comments [...], :output string}"
+  [worker worktree-path prev-feedback]
+  ;; Only include the most recent round's feedback — the worker has already
+  ;; attempted fixes based on it, so the reviewer just needs to verify.
+  (let [history-block (when (seq prev-feedback)
+                        (let [latest (last prev-feedback)
+                              truncated (if (> (count latest) 2000)
+                                          (str (subs latest 0 2000) "\n... [feedback truncated]")
+                                          latest)]
+                          (str "\n## Previous Review (Round " (count prev-feedback) ")\n\n"
+                               "The worker has attempted fixes based on this feedback. "
+                               "Verify the issues below are resolved. Do NOT raise new issues.\n\n"
+                               truncated
+                               "\n\n")))]
+    (run-review! worker worktree-path
+                 (fn [tokens]
+                   (load-framework-prompt "reviewer.md" (assoc tokens :history_block (or history-block "")))))))
+
+(defn- run-block-reviewer!
+  "Gap fixed after swarm 455987ea (2026-10-24): a worker could set its task
+   `blocked` with prose and nothing ever checked it, so plausible-sounding
+   blocks silently drained the queue. A block now goes to the SAME reviewers
+   as a candidate. The reviewer sees the worker's block object (blockedReason,
+   requiredOwnerAction), the canonical task (done criteria and current
+   nextAction, which is where owner/CEO DECISION lines live) and the diff.
+   VERDICT: APPROVED confirms the block; anything else rejects it."
+  [worker worktree-path blocked]
+  (run-review! worker worktree-path
+               (fn [tokens]
+                 (load-framework-prompt "block_reviewer.md"
+                                        (assoc tokens :block_claim (json/generate-string blocked {:pretty true}))))))
 
 (defn- run-fix!
   "Ask worker to fix issues based on reviewer feedback.
@@ -1897,7 +1920,8 @@
        "or claim another task. Follow the repository's AGENTS.md and owning task criteria.\n\n"
        "If progress requires missing external evidence, access or authority, return a JSON object "
        "with status=\"blocked\", reason (a nonempty string), taskComplete=false and "
-       "readyForMergeValidation=false. The framework retains this source/session pending an owner handoff.\n\n"
+       "readyForMergeValidation=false. An independent reviewer checks every block against the done criteria and nextAction; "
+       "a confirmed block is held for its owner, a rejected one reopens the task for another worker with the reviewer's reason.\n\n"
        (when (seq (:prompts worker))
          (str/join "\n\n" (keep load-prompt (:prompts worker))))
        (when feedback
@@ -1963,6 +1987,118 @@
     (reset! selected-active-owner nil)
     {:state {:cycle (inc (:cycle state)) :attempt 0 :deadline_ms (:deadline_ms state)
              :accepted_count (:accepted_count state) :held_executions held}}))
+
+;; -----------------------------------------------------------------------------
+;; Abandoned-claim release. Swarm 455987ea (2026-10-24) went idle: workers gave
+;; up on claimed tasks (attempt budget, timeout) and the Buddy task stayed
+;; `in_progress`, which every other worker's graph audit correctly refuses to
+;; steal ("execution-custody-unverified"). The giving-up worker now releases its
+;; own claim to `open` itself, as data on the task, so another worker can take
+;; it. The CAS in buddy/release-abandoned! makes a live claim unstealable.
+;; -----------------------------------------------------------------------------
+
+(def ^:private release-marker "[oompa-release]")
+
+(defn release-next-action
+  "nextAction written when a claim is given back. Owner text already on the
+   task (for example a CEO DECISION line) is kept verbatim above the marker;
+   only a previous Oompa release section is replaced, so repeated requeues do
+   not grow the field."
+  [prior {:keys [reason worker swarm attempt source findings]}]
+  (let [owner (str/trimr (first (str/split (or prior "")
+                                           (re-pattern (java.util.regex.Pattern/quote release-marker)) 2)))]
+    (str (when-not (str/blank? owner) (str owner "\n\n"))
+         release-marker " Released to open by Oompa swarm " swarm " worker " worker
+         " after attempt " attempt " (" reason "). Retained unmerged source: " source
+         ". Inspect or reuse it; it is not accepted work.\n"
+         "Last findings: " (snippet findings 1500))))
+
+(defn- workspace-head [workspace]
+  (try (execution/git! (:path workspace) (+ (execution/now-ms) 10000) "rev-parse" "HEAD")
+       (catch Exception e (str "unreadable (" (.getMessage e) ")"))))
+
+(defn- retained-source [state]
+  (if-let [workspace (:workspace state)]
+    (str "branch " (:branch workspace) " at commit " (workspace-head workspace)
+         " in workspace " (:path workspace))
+    "none (no workspace was provisioned)"))
+
+(defn- last-findings [state]
+  (cond (seq (:review_feedback state)) (last (:review_feedback state))
+        (:feedback state) (json/generate-string (:feedback state))
+        :else "none recorded"))
+
+(defn- release-claim!
+  "Release THIS execution's claim to canonical `open`. Returns
+   {:execution e :task t}: e records the outcome under :release; t is the
+   released task, or nil when nothing was released (claim not owned by this
+   process, or the CAS/transport failed — the old hold then stands, recorded)."
+  [worker execution reason findings]
+  (let [record {:reason (name reason)}
+        outcome (try
+                  ;; Own short deadline: exit releases run after the run budget.
+                  (tasks/with-deadline (+ (execution/now-ms) 30000)
+                    #(let [task (tasks/get-task (:task_id execution))]
+                       (tasks/release-abandoned!
+                         task (release-next-action (:nextAction task)
+                                                   {:reason (name reason) :worker (:id worker)
+                                                    :swarm (:swarm-id worker) :attempt (or (:attempt execution) 0)
+                                                    :source (retained-source execution) :findings findings}))))
+                  (catch Exception e {:kind :release-failed :error (.getMessage e)}))]
+    (case (:kind outcome)
+      :released {:execution (assoc execution :release (assoc record :outcome "released"
+                                                             :revision (:revision (:task outcome))
+                                                             :next_action (:nextAction (:task outcome))))
+                 :task (:task outcome)}
+      :not-owned {:execution (assoc execution :release (assoc record :outcome "not-owned")) :task nil}
+      :release-failed {:execution (assoc execution :release (assoc record :outcome "failed" :error (:error outcome)))
+                       :task nil})))
+
+(defn- release-selected!
+  "Give up the active claim: release it and keep the execution as a held record
+   pinned to the released revision. That pin means THIS worker never retakes
+   the revision it abandoned (no budget-exhausted churn loop); every other
+   worker sees a plain open task, whose nextAction points at this source."
+  [worker state reason findings]
+  (let [{:keys [execution task]} (release-claim! worker state reason findings)]
+    (hold-selected execution reason task)))
+
+;; Exits that keep claims: an operator interrupt is resumed with --resume,
+;; whose contract restores the exact claim, workspace and session.
+(def ^:private claim-retaining-exits #{:interrupted})
+;; Held reasons released at exit: worker-side failures that only this worker can
+;; resume. Host/policy holds (consumer-rejected, validation-blocked,
+;; reviewer-unconfigured) and canonical revision conflicts stay for their owner.
+(def ^:private exit-released-holds #{"execution-blocked"})
+;; Host custody phases: the run-owned host may still accept this candidate.
+(def ^:private host-custody-phases #{"validating" "awaiting-acceptance"})
+
+(defn- release-on-exit
+  "Worker exit (other than interrupt) releases this worker's own unfinished
+   claims, so a finished swarm never leaves tasks `in_progress` for the next
+   run to find unverifiable."
+  [worker status state]
+  (if (contains? claim-retaining-exits status)
+    state
+    (let [state (if (and (:task_id state) (not (contains? host-custody-phases (:phase state))))
+                  (let [reason (keyword (str "worker-exit-" (name status)))
+                        {:keys [execution task]} (release-claim! worker state reason (last-findings state))]
+                    ;; Released: held WITHOUT a revision pin, so a resumed run
+                    ;; of this same worker may retake it and reuse its
+                    ;; workspace/session (exits do not churn; in-run gives do).
+                    ;; Unreleased (not owned / failed): keep the active record
+                    ;; exactly as before so resume can still restore its claim.
+                    (if task
+                      (merge (select-keys state [:queue_audit :queue_audit_unchanged])
+                             (:state (hold-selected execution reason)))
+                      (assoc state :exit_release (:release execution))))
+                  state)]
+      (reduce (fn [state [id held]]
+                (if (and (contains? exit-released-holds (:held_reason held)) (nil? (:release held)))
+                  (assoc-in state [:held_executions id]
+                            (:execution (release-claim! worker held :worker-exit (last-findings held))))
+                  state))
+              state (:held_executions state)))))
 
 (defn- reconcile-held! [root state accepted]
   (reduce (fn [state [id held]]
@@ -2110,6 +2246,7 @@
         deadline (or (:deadline_ms initial) deadline)
         accepted (atom (or (:accepted_count initial) 0))
         finish (fn [status state & [error]]
+                 (let [state (release-on-exit worker status state)]
                  (when (= [(:swarm-id worker) (:id worker)] @selected-active-owner)
                    (reset! selected-active-owner nil))
                  (release-integration! worker)
@@ -2121,7 +2258,7 @@
                                  :merges @accepted :errors (if error 1 0))
                    (:queue_audit state) (assoc :queue_audit (:queue_audit state)
                                               :queue_audit_changed (not (:queue_audit_unchanged state)))
-                   error (assoc :error error)))
+                   error (assoc :error error))))
         attempt-cap (or (:max-resumes worker) default-max-resumes)]
     (tasks/with-deadline deadline (fn []
     (binding [cambium/*deadline-ms* deadline]
@@ -2165,7 +2302,7 @@
                                      (selected-next-task! worker config (:held_executions state) audit)))
                           prior-held (get (:held_executions state) (:id task))
                           state (if (and task prior-held)
-                                  (merge (dissoc prior-held :startup_recovery_ready)
+                                  (merge (dissoc prior-held :startup_recovery_ready :release :exit_release)
                                          (select-keys state [:deadline_ms :cycle :held_executions :accepted_count])
                                          {:claim_revision (:revision task) :phase "implementing"}) state)
                           state (if prior-held (update state :held_executions dissoc (:id task)) state)
@@ -2221,8 +2358,11 @@
                         (= "validating" (:phase state))
                         (serialized-validation-step! worker task state root)
 
+                        ;; Giving up after the attempt budget (e.g. repeated
+                        ;; reviewer NEEDS_CHANGES) requeues the claim for
+                        ;; another worker instead of stranding it in_progress.
                         (>= (:attempt state) attempt-cap)
-                        (hold-selected state :attempt-budget-exhausted)
+                        (release-selected! worker state :attempt-budget-exhausted (last-findings state))
 
                         :else
                         (let [validator (execution/validator-for config (:id task))
@@ -2263,12 +2403,32 @@
                             (hold-selected state :canonical-task-blocked fresh)
                             (not= (:claim_revision state) (:revision fresh))
                             (hold-selected state :canonical-revision-conflict fresh)
+                            ;; block -> review -> (confirmed: canonical blocked |
+                            ;; rejected: released to open with the reviewer's
+                            ;; reason). Only a reviewer-less config keeps the
+                            ;; unreviewed block, recorded as such.
                             blocked
                             (let [state (assoc state :blocked_result blocked :feedback blocked)
                                   _ (reset! checkpoint state)
-                                  held-task (tasks/block-task! fresh blocked)]
-                              (hold-selected state :model-blocked held-task))
-                            (= 124 (:exit result)) (hold-selected state :attempt-timeout)
+                                  review (when (seq (:reviewers worker))
+                                           (run-block-reviewer! (assoc worker :timeout-ms attempt-ms :deadline-ms deadline :selected-task fresh
+                                                                       :review-base (execution/git! root deadline "rev-parse" "HEAD"))
+                                                                (:path workspace)
+                                                                {:block blocked
+                                                                 :earlier_review_findings (some-> (last (:review_feedback state)) (snippet 2000))}))
+                                  _ (when review
+                                      (runs/write-review-log! (:swarm-id worker) (:id worker) (:cycle state) (:attempt state)
+                                                              (assoc review :kind "block")))]
+                              (cond
+                                (nil? review)
+                                (hold-selected (assoc state :block_review "unreviewed") :model-blocked (tasks/block-task! fresh blocked))
+                                (explicit-approval? review)
+                                (hold-selected (assoc state :block_review "confirmed") :model-blocked (tasks/block-task! fresh blocked))
+                                :else
+                                (release-selected! worker (assoc state :block_review "rejected") :block-rejected (:output review))))
+                            (= 124 (:exit result))
+                            (release-selected! worker state :attempt-timeout
+                                               (str "attempt " (:attempt state) " timed out; " (last-findings state)))
                             (not (zero? (:exit result)))
                             {:state (assoc state :feedback {:reason "model-attempt-failed" :exit (:exit result)
                                                           :stderr (:stderr-snippet result)})}

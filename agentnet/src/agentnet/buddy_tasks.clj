@@ -320,6 +320,25 @@
                             (not (str/blank? (:requiredOwnerAction result)))
                             (assoc :nextAction (:requiredOwnerAction result)))))
 
+(defn release-abandoned!
+  "Explicit requeue of a claim this process is giving up (attempt budget,
+   timeout, execution failure, rejected block, run exit). Swarm 455987ea
+   (2026-10-24) went idle because abandoned claims stayed `in_progress`, which
+   the selected graph audit correctly refuses to steal (execution-custody-
+   unverified). The release is canonical data on the task: status `open` plus a
+   nextAction naming the retained source and last findings.
+
+   Only this process's own claim at its exact claimed revision is released
+   (release! re-reads and CASes). A claim held by anyone else is reported as
+   :not-owned and left untouched, so a live worker's claim is never stolen.
+   Returns {:kind :released :task t} | {:kind :not-owned}."
+  [task next-action]
+  (when (str/blank? next-action)
+    (throw (ex-info "An abandoned-claim release requires a nonempty nextAction" {:id (:id task)})))
+  (if (contains? @claims (:id task))
+    {:kind :released :task (release! task "open" {:nextAction next-action})}
+    {:kind :not-owned}))
+
 (defn restore-claim!
   "Restore only an explicitly selected persisted execution at its exact revision.
    No scan/recycle of foreign in-progress tasks is permitted."
