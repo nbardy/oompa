@@ -101,6 +101,57 @@
     {:dir workspace-name :name workspace-name :branch branch :path path :project-root root
      :source_commit source})))
 
+(def harvested-output-dir
+  "Ignored run output that must outlive the workspace (wave_sim convention)."
+  "output")
+
+(defn- same-bytes? [^java.io.File a ^java.io.File b]
+  (and (= (.length a) (.length b))
+       (= -1 (java.nio.file.Files/mismatch (.toPath a) (.toPath b)))))
+
+(defn harvest-ignored-output!
+  "Move git-ignored files under the workspace's output/ into the primary
+   checkout's output/ at the same relative path, so cited paths stay valid.
+
+   Why: `git status --porcelain` omits ignored files, so a workspace whose only
+   new files were ignored run output looked clean and `cambium remove` deleted
+   them. Swarm 455987ea lost the raw gauges of a paid WC1 GPU run this way
+   (2026-10-24). Identical files are deduplicated; a destination with
+   different bytes is a conflict and nothing is moved, so the caller keeps
+   the workspace. Returns {:moved n :deduplicated n :conflicts [...]} or
+   {:error result} when git cannot list the files."
+  [path]
+  (let [listed (git path "ls-files" "-z" "--others" "--ignored" "--exclude-standard"
+                    "--" harvested-output-dir)
+        relatives (remove str/blank? (str/split (:out listed) #"\u0000"))
+        common (when (seq relatives)
+                 (git path "rev-parse" "--path-format=absolute" "--git-common-dir"))]
+    (cond
+      (not (zero? (:exit listed))) {:error listed}
+      (empty? relatives) {:moved 0 :deduplicated 0 :conflicts []}
+      (not (zero? (:exit common))) {:error common}
+      :else
+      (let [primary (.getCanonicalFile (.getParentFile (io/file (str/trim (:out common)))))
+            pairs (for [relative relatives]
+                    [relative (io/file path relative) (io/file primary relative)])
+            files (filter (fn [[_ ^java.io.File from]] (.isFile from)) pairs)
+            conflicts (vec (for [[relative from ^java.io.File to] files
+                                 :when (and (.exists to) (not (same-bytes? from to)))]
+                             relative))]
+        (if (or (seq conflicts)
+                (= primary (.getCanonicalFile (io/file path))))
+          {:moved 0 :deduplicated 0 :conflicts conflicts}
+          (reduce (fn [summary [_ ^java.io.File from ^java.io.File to]]
+                    (if (.exists to)
+                      (do (io/delete-file from) (update summary :deduplicated inc))
+                      (do (io/make-parents to)
+                          (java.nio.file.Files/move (.toPath from) (.toPath to)
+                                                    (into-array java.nio.file.CopyOption
+                                                                [java.nio.file.LinkOption/NOFOLLOW_LINKS]))
+                          (update summary :moved inc))))
+                  {:moved 0 :deduplicated 0 :conflicts []}
+                  files))))))
+
 (defn remove!
   "Remove only a clean, inactive Cambium workspace whose branch is integrated.
    Keep the branch (Cambium's default), even after successful removal."
@@ -130,7 +181,12 @@
                      (or (not (zero? (:exit checked-out)))
                          (not= branch (str/trim (:out checked-out)))) :branch-changed
                      operation? :in-progress
-                     (not (zero? (:exit merged))) :unmerged)))]
+                     (not (zero? (:exit merged))) :unmerged
+                     :else
+                     (let [harvest (harvest-ignored-output! path)]
+                       (cond
+                         (:error harvest) :output-unreadable
+                         (seq (:conflicts harvest)) :output-conflict)))))]
     (if reason
       (do (println (str "[worktree] Preserved " path " (" branch "): " (clojure.core/name reason)))
           {:removed? false :reason reason :workspace workspace})

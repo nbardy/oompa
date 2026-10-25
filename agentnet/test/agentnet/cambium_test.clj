@@ -252,3 +252,40 @@
         (is (some #{["git" "merge-base" "--is-ancestor" "oompa/test" "HEAD"]} @calls))))))
 
 (run-tests)
+
+(defn- sh! [dir & argv]
+  (let [r (process/sh (vec argv) {:dir dir :out :string :err :string})]
+    (assert (zero? (:exit r)) (pr-str argv r))
+    r))
+
+(deftest ignored-run-output-survives-workspace-removal
+  ;; Regression: swarm 455987ea (2026-10-24) removed an accepted workspace and
+  ;; with it the ignored output/ of a paid WC1 GPU run, because ignored files do
+  ;; not appear in `git status --porcelain`. Real repository, no stubs.
+  (let [tmp (fs/file (fs/create-temp-dir {:prefix "oompa-harvest-"}))
+        primary (io/file tmp "primary")
+        linked (io/file tmp "linked")]
+    (try
+      (.mkdirs primary)
+      (sh! primary "git" "init" "-q" "-b" "main")
+      (spit (io/file primary ".gitignore") "output/\n")
+      (sh! primary "git" "add" ".gitignore")
+      (sh! primary "git" "-c" "user.name=t" "-c" "user.email=t@t" "commit" "-q" "-m" "init")
+      (sh! primary "git" "worktree" "add" "-q" "-b" "oompa/h" (.getPath linked))
+      (let [out (fn [base rel text] (let [f (io/file base "output" rel)] (io/make-parents f) (spit f text) f))]
+        (out linked "run/gauges.csv" "t,eta\n0,0.1\n")
+        (out linked "shared/same.json" "{}")
+        (out primary "shared/same.json" "{}")
+        (testing "moves new files to the same path in the primary checkout"
+          (is (= {:moved 1 :deduplicated 1 :conflicts []}
+                 (cambium/harvest-ignored-output! (.getPath linked))))
+          (is (= "t,eta\n0,0.1\n" (slurp (io/file primary "output/run/gauges.csv"))))
+          (is (not (.exists (io/file linked "output/run/gauges.csv")))))
+        (testing "a destination with different bytes blocks removal and moves nothing"
+          (out linked "run/gauges.csv" "different")
+          (out linked "run/new.csv" "new")
+          (is (= ["output/run/gauges.csv"]
+                 (:conflicts (cambium/harvest-ignored-output! (.getPath linked)))))
+          (is (.exists (io/file linked "output/run/new.csv")))
+          (is (= "t,eta\n0,0.1\n" (slurp (io/file primary "output/run/gauges.csv"))))))
+      (finally (fs/delete-tree tmp)))))

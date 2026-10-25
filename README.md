@@ -249,7 +249,12 @@ can share files through copy-on-write. Creation fails if Cambium fails.
 `cambium remove NAME` after checking that the owner process is inactive,
 the workspace is clean, no Git operation is in progress, and its branch is
 integrated into the project checkout. Dirty, active, unmerged, and legacy
-unregistered worktrees are preserved; branches are retained. Workers can
+unregistered worktrees are preserved; branches are retained. Before removal,
+git-ignored files under the workspace's `output/` move to the same path in the
+primary checkout (identical files are deduplicated); a differing destination
+keeps the workspace with reason `output-conflict`. `git status` does not show
+ignored files, so without this a paid run's output was deleted with its
+workspace (wave_sim swarm 455987ea, 2026-10-24). Workers can
 retire their own completed workspace. Cambium also carries dependency
 folders when supported; follow project bootstrap policy for anything else.
 
