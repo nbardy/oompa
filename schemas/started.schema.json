@@ -10,11 +10,12 @@
     "started-at": { "type": "string", "format": "date-time" },
     "pid": { "type": "integer", "description": "Orchestrator process ID for liveness checks" },
     "config-file": { "type": "string" },
+    "continuation-control-dir": { "type": ["string", "null"], "description": "OOMPA_CONTINUATION_CONTROL_DIR at start, when a host continuation channel is attached" },
     "workers": {
       "type": "array",
       "items": {
         "type": "object",
-        "required": ["id", "harness", "model", "max-cycles", "can-plan", "prompts"],
+        "required": ["id", "harness", "model", "max-cycles", "can-plan", "prompts", "reviewers"],
         "properties": {
           "id": { "type": "string" },
           "harness": {
@@ -28,7 +29,27 @@
           "max-cycles": { "type": "integer", "minimum": 1, "description": "Max completed cycles (terminal outcomes) before worker stops" },
           "max-resumes": { "type": "integer", "minimum": 1, "description": "Max attempts/resumes within a single cycle (default 7)" },
           "can-plan": { "type": "boolean" },
-          "prompts": { "type": "array", "items": { "type": "string" } }
+          "prompts": { "type": "array", "items": { "type": "string" } },
+          "reviewers": {
+            "type": "array",
+            "description": "Resolved reviewers for this worker (worker-level plus inherited top-level); empty when review is disabled. Salvage rebuilds its review gate from this list.",
+            "items": {
+              "type": "object",
+              "required": ["harness", "model", "reasoning", "prompts"],
+              "properties": {
+                "harness": {
+                  "oneOf": [
+                    { "type": "string", "enum": ["codex", "claude", "opencode", "gemini"] },
+                    { "type": "string", "pattern": "^gemini\\d+$" }
+                  ]
+                },
+                "model": { "type": "string" },
+                "reasoning": { "type": ["string", "null"] },
+                "prompts": { "type": "array", "items": { "type": "string" } }
+              },
+              "additionalProperties": false
+            }
+          }
         },
         "additionalProperties": false
       }
@@ -47,20 +68,6 @@
         "max-pending": { "type": "integer", "minimum": 1 }
       },
       "required": ["harness", "model", "prompts", "max-pending"]
-    },
-    "reviewer": {
-      "type": ["object", "null"],
-      "properties": {
-        "harness": {
-          "oneOf": [
-            { "type": "string", "enum": ["codex", "claude", "opencode", "gemini"] },
-            { "type": "string", "pattern": "^gemini\\d+$" }
-          ]
-        },
-        "model": { "type": "string" },
-        "prompts": { "type": "array", "items": { "type": "string" } }
-      },
-      "required": ["harness", "model", "prompts"]
     }
   },
   "additionalProperties": false

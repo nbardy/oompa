@@ -16,7 +16,7 @@
         reviewers (#'agentnet.cli/resolve-worker-reviewers
                    {:model "gemini:gemini-3.1-pro-preview"}
                    generic)]
-    (t/is (= [{:harness :codex :model "gpt-5.4"}]
+    (t/is (= [{:harness :codex :model "gpt-5.4" :prompts []}]
              reviewers))))
 
 (t/deftest worker-needs-review-false-overrides-inherited-reviewers

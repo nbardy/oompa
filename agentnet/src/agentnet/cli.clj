@@ -1001,7 +1001,7 @@
   [entry]
   (cond
     (string? entry)
-    (parse-model-string entry)
+    (assoc (parse-model-string entry) :prompts [])
 
     (map? entry)
     (let [model (:model entry)]
@@ -1209,7 +1209,6 @@
       (runs/write-started! swarm-id
                            {:workers workers
                             :planner-config planner-parsed
-                            :reviewer-configs generic-reviewers
                             :config-file config-file})
       (println (format "\nStarted event written to runs/%s/started.json" swarm-id))
 
@@ -1676,6 +1675,21 @@
                          worker-id (:attempts review-result)))
         {:outcome :rejected :attempts (:attempts review-result)}))))
 
+(defn started-worker-reviewers
+  "Rebuild a worker's reviewer list from its started.json entry (the resolved
+   list written by runs/write-started!). Missing key means the run predates
+   this field: refuse loudly rather than salvage unreviewed."
+  [worker-entry]
+  (when-not (contains? worker-entry :reviewers)
+    (throw (ex-info "started.json worker entry has no :reviewers; cannot salvage with the original review gate"
+                    {:worker (:id worker-entry)})))
+  (mapv (fn [r]
+          {:harness (keyword (:harness r))
+           :model (:model r)
+           :reasoning (:reasoning r)
+           :prompts (vec (:prompts r))})
+        (:reviewers worker-entry)))
+
 (defn cmd-salvage
   "Salvage dead/errored workers from a previous swarm.
    Discovers surviving worktrees and branches with unmerged changes,
@@ -1701,13 +1715,7 @@
         model (:model first-worker-config)
         prompts (or (:prompts first-worker-config) [])
 
-        ;; Build reviewer configs from started.json
-        reviewer-config (:reviewer started)
-        reviewers (if reviewer-config
-                    [(-> (parse-model-string (str (name (keyword (:harness reviewer-config)))
-                                                  ":" (:model reviewer-config)))
-                         (assoc :prompts (or (:prompts reviewer-config) [])))]
-                    [])
+        reviewers (started-worker-reviewers first-worker-config)
 
         swarm-config {:harness harness-kw :model model :prompts prompts :reviewers reviewers}
 

@@ -56,7 +56,7 @@
 (defn write-started!
   "Write the started event when a swarm begins.
    Contains: start time, PID, worker configs, planner output, swarm metadata."
-  [swarm-id {:keys [workers planner-config reviewer-config config-file]}]
+  [swarm-id {:keys [workers planner-config config-file]}]
   (ensure-run-dirs! swarm-id)
   (write-json! (str (run-dir swarm-id) "/started.json")
                {:swarm-id swarm-id
@@ -72,21 +72,38 @@
                                   :max-cycles (:max-cycles w)
                                   :max-resumes (:max-resumes w)
                                   :can-plan (:can-plan w)
-                                  :prompts (:prompts w)})
+                                  :prompts (:prompts w)
+                                  ;; Each worker's RESOLVED reviewers (worker-level
+                                  ;; plus inherited top-level). Salvage rebuilds its
+                                  ;; review loop from this. Bug fixed 2026-11-01: the
+                                  ;; writer, cmd-swarm and salvage used three different
+                                  ;; keys (:reviewer-configs / :reviewer-config /
+                                  ;; :reviewer), so no reviewer ever reached
+                                  ;; started.json and salvaged workers ran unreviewed.
+                                  :reviewers (mapv (fn [r]
+                                                     {:harness (name (:harness r))
+                                                      :model (:model r)
+                                                      :reasoning (:reasoning r)
+                                                      :prompts (vec (:prompts r))})
+                                                   (:reviewers w))})
                                workers)
                 :planner (when planner-config
                            {:harness (name (:harness planner-config))
                             :model (:model planner-config)
                             :prompts (:prompts planner-config)
-                            :max-pending (:max-pending planner-config)})
-                :reviewer (when reviewer-config
-                            {:harness (name (:harness reviewer-config))
-                             :model (:model reviewer-config)
-                             :prompts (:prompts reviewer-config)})}))
+                            :max-pending (:max-pending planner-config)})}))
 
 ;; =============================================================================
 ;; Stopped Event — written at swarm end
 ;; =============================================================================
+
+(def stop-reasons
+  "Every reason stopped.json may carry. schemas/stopped.schema.json `reason`
+   enum must equal this set (tested). The schema drifted once: the selected
+   path added four reasons the schema never listed."
+  #{:completed :workers-exhausted :interrupted :error
+    :wall-time-exhausted :needs-reconciliation :externally-blocked
+    :awaiting-buddy-acceptance})
 
 (defn write-stopped!
   "Write the stopped event when a swarm exits.
@@ -99,6 +116,9 @@
    \"completed\"/error nil even when every worker died in an error state, so
    dead runs went unnoticed for ~20h."
   [swarm-id reason & {:keys [error worker-outcomes pending-count]}]
+  (when-not (contains? stop-reasons reason)
+    (throw (ex-info "Unknown stop reason; add it to stop-reasons and stopped.schema.json"
+                    {:reason reason})))
   (write-json! (str (run-dir swarm-id) "/stopped.json")
                (cond-> {:swarm-id swarm-id
                         :stopped-at (str (java.time.Instant/now))

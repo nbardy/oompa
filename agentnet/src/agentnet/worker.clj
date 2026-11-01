@@ -578,13 +578,22 @@
                      (catch Exception _ nil)))))
          last)))
 
+(defn- explicit-approval-text?
+  "True only when the reviewer's final text OPENS with the standalone line
+   `VERDICT: APPROVED` and contains no other verdict line. This is the single
+   approval parse for every review path (queue candidate, selected candidate,
+   block review)."
+  [output]
+  (boolean
+    (and (re-find #"\A[ \t\r\n]*VERDICT: APPROVED(?:\r?\n|\z)" output)
+         (= ["APPROVED"]
+            (mapv second (re-seq #"(?m)^VERDICT: (APPROVED|NEEDS_CHANGES|REJECTED)\r?$"
+                                 output))))))
+
 (defn- explicit-approval? [review]
   (and (= :approved (:verdict review))
        (zero? (:exit review))
-       (re-find #"\A[ \t\r\n]*VERDICT: APPROVED(?:\r?\n|\z)" (:output review))
-       (= ["APPROVED"]
-          (mapv second (re-seq #"(?m)^VERDICT: (APPROVED|NEEDS_CHANGES|REJECTED)\r?$"
-                               (:output review))))))
+       (explicit-approval-text? (:output review))))
 
 (defn- run-review!
   "Shared reviewer core: diff/merged-log context, reviewer fallback chain and
@@ -656,10 +665,10 @@
                                output (or (when (= :claude harness)
                                             (claude-final-review-message (:err res)))
                                           (:output parsed) "")
-                               has-verdict? (or (re-find #"VERDICT:\s*APPROVED" output)
-                                                (re-find #"VERDICT:\s*NEEDS_CHANGES" output)
-                                                (re-find #"VERDICT:\s*REJECTED" output)
-                                                (re-find #"(?i)\bAPPROVED\b" output))]
+                               ;; Fallback trigger only: a reviewer that names no
+                               ;; verdict at all is skipped for the next one. A bare
+                               ;; "approved" word is NOT a verdict (see below).
+                               has-verdict? (re-find #"VERDICT:\s*(APPROVED|NEEDS_CHANGES|REJECTED)" output)]
                            (if (and (= (:exit res) 0) has-verdict?)
                              (reduced (assoc res :parsed-output output))
                              (do
@@ -670,13 +679,14 @@
 
         output (or (:parsed-output result) (:out result) "")
 
-        ;; Parse verdict
-        verdict (cond
-                  (re-find #"VERDICT:\s*APPROVED" output) :approved
-                  (re-find #"VERDICT:\s*NEEDS_CHANGES" output) :needs-changes
-                  (re-find #"VERDICT:\s*REJECTED" output) :needs-changes
-                  (re-find #"(?i)\bAPPROVED\b" output) :approved
-                  :else :needs-changes)
+        ;; Parse verdict. Bug fixed 2026-11-01: this used to accept any
+        ;; case-insensitive `\bAPPROVED\b` (and `VERDICT: APPROVED` anywhere),
+        ;; so "NOT APPROVED" or a quoted example verdict merged work on the
+        ;; queue path. Approval now uses the same strict parse as the selected
+        ;; path; anything else asks for changes.
+        verdict (if (and (= 0 (:exit result)) (explicit-approval-text? output))
+                  :approved
+                  :needs-changes)
         duration-ms (- (System/currentTimeMillis) start-ms)]
 
     (println (format "[%s] Reviewer verdict: %s" id (name verdict)))
