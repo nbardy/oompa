@@ -81,7 +81,13 @@ merge, recycle, event-not-projection run log).
 - **Token-budget dimension** — add a token budget alongside the per-cycle
   attempt budget cap.
 
-## Pre-existing bug found in review (separate fix, NOT part of this branch)
+## Pre-existing bug found in review (FIXED 2026-11-01 on `fix/review-key-and-approval`)
+
+Fix: one key, `:reviewers`. Each worker entry in `started.json` now carries its
+resolved reviewer list (`runs/write-started!`), and salvage rebuilds the review
+loop from it (`cli/started-worker-reviewers`), refusing a pre-fix `started.json`
+that lacks the key rather than salvaging unreviewed. The original finding:
+
 
 Salvaged workers may run WITHOUT review due to a singular/plural key mismatch
 across the started-event boundary:

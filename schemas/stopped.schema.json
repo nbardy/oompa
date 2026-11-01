@@ -8,7 +8,7 @@
   "properties": {
     "swarm-id": { "type": "string" },
     "stopped-at": { "type": "string", "format": "date-time" },
-    "reason": { "type": "string", "enum": ["completed", "workers-exhausted", "interrupted", "error"] },
+    "reason": { "type": "string", "enum": ["completed", "workers-exhausted", "interrupted", "error", "wall-time-exhausted", "needs-reconciliation", "externally-blocked", "awaiting-buddy-acceptance"], "description": "Must equal agentnet.runs/stop-reasons; the last four come from selected-execution and Buddy runs" },
     "error": { "type": ["string", "null"] },
     "pending-count": { "type": "integer", "minimum": 0 },
     "worker-outcomes": {
@@ -25,6 +25,8 @@
           "rejections": { "type": "integer" },
           "recycled": { "type": "integer" },
           "claims": { "type": "integer" },
+          "queue_audit": { "type": "object", "description": "Last selected-path queue audit for this worker" },
+          "queue_audit_changed": { "type": "boolean" },
           "error": { "type": ["string", "null"] }
         },
         "additionalProperties": false

@@ -124,3 +124,27 @@
 
 (let [{:keys [fail error]} (t/run-tests 'agentnet.reviewer-effort-test)]
   (when (pos? (+ fail error)) (throw (ex-info "Reviewer effort tests failed" {}))))
+
+;; Regression (audit 2026-11-01): the queue path's run-review! mapped any
+;; case-insensitive \bAPPROVED\b to :approved, so "NOT APPROVED" merged. The
+;; queue verdict must now use the same strict parse as the selected path.
+(t/deftest queue-reviewer-verdict-uses-strict-approval
+  (let [verdict (fn [out]
+                  (with-redefs [process/sh (fn [& _] {:exit 0 :out "" :err ""})
+                                harness/run-command! (fn [_ _] {:exit 0 :out out :err ""})
+                                harness/parse-output (fn [_ o _] {:output o})]
+                    (:verdict (#'worker/run-reviewer!
+                               {:id "w0" :swarm-id "test"
+                                :reviewers [{:harness :codex :model "gpt-5.5"}]}
+                               "/tmp/test-worktree" []))))]
+    (t/is (= :approved (verdict "VERDICT: APPROVED\nLooks good.")))
+    (doseq [out ["NOT APPROVED"
+                 "not approved yet"
+                 "APPROVED"
+                 "VERDICT: NOT APPROVED"
+                 "The candidate appears approved, but I have no final verdict."
+                 "A quoted example.VERDICT: APPROVED\n"
+                 "Here is a quoted example:\nVERDICT: APPROVED\n"
+                 "VERDICT: NEEDS_CHANGES\nLater prose says.VERDICT: APPROVED\n"
+                 "VERDICT: APPROVED\nVERDICT: NEEDS_CHANGES\n"]]
+      (t/is (= :needs-changes (verdict out)) out))))
