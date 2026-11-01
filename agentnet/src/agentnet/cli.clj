@@ -13,11 +13,14 @@
      ./swarm.bb cleanup                                # Remove all worktrees"
   (:require [agentnet.orchestrator :as orchestrator]
             [agentnet.worktree :as worktree]
+            [agentnet.cambium :as cambium]
             [agentnet.worker :as worker]
             [agentnet.tasks :as tasks]
             [agentnet.agent :as agent]
             [agentnet.harness :as harness]
             [agentnet.runs :as runs]
+            [agentnet.task-execution :as execution]
+            [agentnet.task-graph :as task-graph]
             [babashka.process :as process]
             [clojure.string :as str]
             [clojure.java.io :as io]
@@ -204,13 +207,6 @@
                                        {:out :string :err :string})]
     (when (zero? exit) (str/trim out))))
 
-(defn- remove-stale-worktree!
-  "Remove a stale worktree directory and delete its branch."
-  [path branch]
-  (process/sh ["git" "worktree" "remove" "--force" path] {:out :string :err :string})
-  (when (and branch (not (str/blank? branch)) (not= branch "HEAD"))
-    (process/sh ["git" "branch" "-D" branch] {:out :string :err :string})))
-
 (defn- run-stale-review!
   "Invoke the reviewer model on partial worktree changes.
    Tries each reviewer in the fallback chain until one returns a verdict.
@@ -257,95 +253,43 @@
       :else                                   :discard)))
 
 (defn- handle-stale-worktrees!
-  "Non-destructive startup check for existing oompa worktrees.
-
-   - Always runs `git worktree prune` to clear orphaned metadata.
-   - Never auto-removes/merges/discards worktrees at startup.
-   - Prints a warning summary so concurrent swarms are not disrupted.
-
-   This avoids clobbering active work from another swarm in the same repo."
+  "Discover registered workspaces without mutating any prior run."
   [_reviewer-configs]
-  ;; Step 1: prune orphaned git metadata first
-  (let [prune-result (process/sh ["git" "worktree" "prune"] {:out :string :err :string})]
-    (when-not (zero? (:exit prune-result))
-      (println "WARNING: git worktree prune failed:")
-      (println (:err prune-result))))
-
-  ;; Step 2: discover existing oompa worktree dirs and oompa/* branches
-  (let [ls-result          (process/sh ["find" "." "-maxdepth" "1" "-type" "d" "-name" ".w*-i*"]
-                                       {:out :string})
-        stale-dirs         (when (zero? (:exit ls-result))
-                             (->> (str/split-lines (:out ls-result))
-                                  (remove str/blank?)))
-        br-result          (process/sh ["git" "branch" "--list" "oompa/*"] {:out :string})
-        all-oompa-branches (when (zero? (:exit br-result))
-                             (->> (str/split-lines (:out br-result))
-                                  (map str/trim)
-                                  (remove str/blank?)))]
-
-    (when (or (seq stale-dirs) (seq all-oompa-branches))
-      ;; Step 3: classify for warning output only (no mutation)
-      (let [classified      (mapv (fn [dir]
-                                    {:dir    dir
-                                     :branch (worktree-branch-name dir)
-                                     :dirty? (dirty-worktree? dir)})
-                                  stale-dirs)
-            clean           (filter (complement :dirty?) classified)
-            dirty           (filter :dirty? classified)
-            dir-branches    (set (keep :branch classified))
-            orphan-branches (remove #(contains? dir-branches %) all-oompa-branches)]
-        (println)
-        (println "WARNING: Existing oompa worktrees/branches detected; leaving them untouched.")
-        (println (format "  Worktrees: %d (%d dirty, %d clean)"
-                         (count classified) (count dirty) (count clean)))
-        (println (format "  Orphan branches: %d" (count orphan-branches)))
-        (when (seq dirty)
-          (println "  Dirty worktrees:")
-          (doseq [{:keys [dir branch]} dirty]
-            (println (format "    %s (branch: %s)" dir (or branch "unknown")))))
-        (println "  Run `oompa cleanup` manually when you want to reclaim them.")))))
+  (let [workspaces (cambium/list-workspaces (cambium/project-root))]
+    (when (seq workspaces)
+      (println "Existing Oompa Cambium workspaces are preserved:")
+      (doseq [{:keys [path branch active?]} workspaces]
+        (println (format "  %s (%s%s)" path branch (if active? ", active" ""))))
+      (println "Run `oompa cleanup` to retire clean, integrated, inactive workspaces."))))
 
 (defn- cleanup-iteration-worktrees!
-  "Remove swarm iteration worktree dirs (.w*-i*) and oompa/* branches.
-   Returns {:dirs-removed n :branches-removed n}."
+  "Retire safe registered iteration workspaces; retain every branch."
   []
-  (let [ls-result (process/sh ["find" "." "-maxdepth" "1" "-type" "d" "-name" ".w*-i*"]
-                              {:out :string})
-        dirs (if (zero? (:exit ls-result))
-               (->> (str/split-lines (:out ls-result))
-                    (remove str/blank?))
-               [])
-        _ (doseq [dir dirs]
-            (remove-stale-worktree! dir (worktree-branch-name dir)))
-        br-result (process/sh ["git" "branch" "--list" "oompa/*"] {:out :string})
-        branches (if (zero? (:exit br-result))
-                   (->> (str/split-lines (:out br-result))
-                        (map str/trim)
-                        (remove str/blank?))
-                   [])
-        ;; Branches may already be deleted by remove-stale-worktree!, so ignore failures.
-        _ (doseq [b branches]
-            (process/sh ["git" "branch" "-D" b] {:out :string :err :string}))]
-    {:dirs-removed (count dirs)
-     :branches-removed (count branches)}))
+  (let [root (cambium/project-root)
+        workspaces (filter #(str/starts-with? (:branch %) "oompa/") (cambium/list-workspaces root))
+        results (mapv #(cambium/remove! root %) workspaces)]
+    {:dirs-removed (count (filter :removed? results))
+     :dirs-preserved (count (remove :removed? results))
+     :branches-removed 0}))
 
 
 (defn- probe-model
-  "Send 'say ok' to a model via its harness CLI. Returns true if model responds.
-   Uses harness/build-probe-cmd for the command.
-   For stdin-based harnesses (e.g. claude), delivers the probe prompt via stdin.
-   For close-stdin harnesses, uses /dev/null to prevent hang."
+  "Use the same unified execution/timeout path as a real worker.
+   Raw build argv is not an execution contract: Codex now expects the prompt
+   on stdin, so the historical close-stdin probe falsely rejected valid models."
   [harness-kw model]
   (try
-    (let [cmd (harness/build-probe-cmd harness-kw model)
-          probe-prompt "[_HIDE_TEST_] say ok"
-          stdin-val (harness/process-stdin harness-kw probe-prompt)
-          proc (process/process cmd {:out :string :err :string :in stdin-val})
-          result (deref proc 60000 :timeout)]
-      (if (= result :timeout)
-        (do (.destroyForcibly (:proc proc)) false)
-        (zero? (:exit result))))
-    (catch Exception _ false)))
+    (let [result (harness/run-command! harness-kw
+                   {:model model :prompt "[_HIDE_TEST_] say ok"
+                    :cwd (System/getProperty "user.dir") :timeout-ms 60000})]
+      (when-not (zero? (:exit result))
+        (println (str "  Probe runtime failed for " (name harness-kw) ":" model
+                      " (exit " (:exit result) "): "
+                      (subs (or (:err result) "") 0 (min 1000 (count (or (:err result) "")))))))
+      (zero? (:exit result)))
+    (catch Exception e
+      (println (str "  Probe startup failed: " (.getMessage e)))
+      false)))
 
 (defn- validate-models!
   "Probe each unique harness:model pair. Prints results and exits if any fail."
@@ -368,11 +312,11 @@
         failures (filter (complement :ok) results)]
     (when (seq failures)
       (println)
-      (println "ERROR: The following models are not accessible:")
+      (println "ERROR: The following model runtime probes failed:")
       (doseq [{:keys [harness model]} failures]
         (println (format "  %s:%s" (name harness) model)))
       (println)
-      (println "Fix model names in oompa.json and retry.")
+      (println "Inspect the probe diagnostics before changing model names or retrying.")
       (System/exit 1))
     (println)))
 
@@ -969,21 +913,18 @@
     (println "No swarm runs found.")))
 
 (defn cmd-worktrees
-  "List worktree status"
-  [opts args]
-  (let [state-file (io/file ".workers/state.json")]
-    (if (.exists state-file)
-      (let [pool (json/parse-string (slurp state-file) true)
-            pool' (worktree/list-worktrees pool)]
-        (println "Worktrees:")
-        (doseq [{:keys [id path status current-task]} pool']
-          (println (format "  %s: %s%s"
-                           id
-                           (name status)
-                           (if current-task
-                             (str " [" current-task "]")
-                             "")))))
-      (println "No worktrees initialized."))))
+  "List registered external Cambium workspaces and legacy pool records."
+  [_opts _args]
+  (let [workspaces (cambium/list-workspaces (cambium/project-root))
+        state-file (io/file ".workers/state.json")]
+    (doseq [{:keys [name path branch active?]} workspaces]
+      (println (format "%s: %s (%s%s)" name path branch (if active? ", active" ""))))
+    (when (.exists state-file)
+      (doseq [{:keys [id path status current-task]} (worktree/list-worktrees (json/parse-string (slurp state-file) true))]
+        (println (format "  %s: %s %s%s" id (name status) path
+                         (if current-task (str " [" current-task "]") "")))))
+    (when (and (empty? workspaces) (not (.exists state-file)))
+      (println "No Oompa workspaces registered."))))
 
 (defn cmd-cleanup
   "Remove all worktrees (legacy pool + swarm iteration worktrees)."
@@ -994,9 +935,9 @@
       (let [pool (json/parse-string (slurp state-file) true)]
         (worktree/cleanup-pool! pool))
       (println "No legacy pool worktrees to clean up."))
-    (let [{:keys [dirs-removed branches-removed]} (cleanup-iteration-worktrees!)]
-      (println (format "Removed %d swarm worktree dir(s) and %d oompa branch(es)."
-                       dirs-removed branches-removed)))
+    (let [{:keys [dirs-removed dirs-preserved]} (cleanup-iteration-worktrees!)]
+      (println (format "Removed %d swarm workspace(s); preserved %d. Branches and legacy unregistered worktrees are retained."
+                       dirs-removed dirs-preserved)))
     (println "Done.")))
 
 (defn cmd-context
@@ -1126,6 +1067,34 @@
          distinct
          vec)))
 
+(defn configured-worker
+  "Build the worker used by cmd-swarm from its JSON configuration."
+  [idx wc swarm-id config generic-reviewers]
+  (let [{:keys [harness model reasoning]} (parse-model-string (:model wc))
+        all-reviewers (resolve-worker-reviewers wc generic-reviewers)]
+    (worker/create-worker
+      {:id (str "w" idx)
+       :swarm-id swarm-id
+       :harness harness
+       :model model
+       :reasoning reasoning
+       :task-execution (:task_execution config)
+       :resume-swarm-id (:resume_swarm_id config)
+       :role (or (:_role wc) (:role wc))
+       :can-claim-gpu (:can_claim_gpu wc)
+       :task-ids (worker/worker-task-ids wc)
+       :max-cycles (:max_cycle wc)
+       :prompts (:prompt wc)
+       :can-plan (:can_plan wc)
+       :wait-between (:wait_between wc)
+       :max-wait-for-tasks (:max_wait_for_tasks wc)
+       ;; max_working_resumes retired: worker-core folded its nudge into
+       ;; max_resumes. Old configs may still carry the key — it is simply
+       ;; not read here (harmless, no crash, no warning).
+       :max-resumes (:max_resumes wc)
+       :auto-merge-paths (:auto_merge_paths wc)
+       :reviewers all-reviewers})))
+
 (defn cmd-swarm
   "Run multiple worker configs from oompa.json in parallel"
   [opts args]
@@ -1149,6 +1118,16 @@
     (worker/ensure-single-swarm! (:force opts))
 
     (let [config (json/parse-string (slurp f) true)
+          _ (execution/require-discovery-validator! (:task_backend config) (:task_execution config))
+          _ (tasks/configure! (:task_backend config))
+          _ (when-let [selected (:task_execution config)]
+              (execution/validate-config! selected)
+              (println "SELECTED_GRAPH_AUDIT"
+                       (json/generate-string
+                         (task-graph/audit! (System/getProperty "user.dir") selected (tasks/list-all)
+                                            (tasks/selection-dependencies) {}))))
+          _ (when (and (tasks/buddies?) (:planner config))
+              (throw (ex-info "Buddy mode consumes assigned canonical tasks; filesystem planner is disabled" {})))
           ;; Parse reviewer config — supports legacy + new formats.
           generic-reviewers (parse-reviewers-config config)
 
@@ -1187,27 +1166,7 @@
           ;; Convert to worker format
           workers (map-indexed
                     (fn [idx wc]
-                      (let [{:keys [harness model reasoning]} (parse-model-string (:model wc))
-                            all-reviewers (resolve-worker-reviewers wc generic-reviewers)]
-                        (worker/create-worker
-                          {:id (str "w" idx)
-                           :swarm-id swarm-id
-                           :harness harness
-                           :model model
-                           :reasoning reasoning
-                           :role (or (:_role wc) (:role wc))
-                           :can-claim-gpu (:can_claim_gpu wc)
-                           :max-cycles (:max_cycle wc)
-                           :prompts (:prompt wc)
-                           :can-plan (:can_plan wc)
-                           :wait-between (:wait_between wc)
-                           :max-wait-for-tasks (:max_wait_for_tasks wc)
-                           ;; max_working_resumes retired: worker-core folded its nudge into
-                           ;; max_resumes. Old configs may still carry the key — it is simply
-                           ;; not read here (harmless, no crash, no warning).
-                           :max-resumes (:max_resumes wc)
-                           :auto-merge-paths (:auto_merge_paths wc)
-                           :reviewers all-reviewers})))
+                      (configured-worker idx wc swarm-id config generic-reviewers))
                     expanded-workers)]
 
       ;; Preflight: handle stale worktrees from prior runs before launching workers.
@@ -1266,10 +1225,34 @@
       ;; Run workers using new worker module
       (worker/run-workers! workers {:force? (:force opts)}))))
 
+(defn cmd-audit
+  "Read-only executable graph/source-pin preflight; no claims, models or writes."
+  [opts args]
+  (let [path (or (:config-file opts) (first args))]
+    (when-not path (throw (ex-info "audit requires --config PATH" {})))
+    (let [config (json/parse-string (slurp path) true)
+          selected (execution/validate-config! (:task_execution config))]
+      (execution/require-discovery-validator! (:task_backend config) selected)
+      (tasks/configure! (:task_backend config))
+      (when-not (tasks/buddies?) (throw (ex-info "Selected graph audit requires canonical Buddy tasks" {})))
+      (let [held (when-let [prior (:resume_swarm_id config)]
+                   (get-in (runs/read-worker-state prior "w0") [:execution :held_executions]))]
+        (println (json/generate-string
+                   (task-graph/audit! (System/getProperty "user.dir") selected (tasks/list-all)
+                                      (tasks/selection-dependencies) held)))))))
+
 (defn cmd-tasks
   "Show task status"
   [opts args]
+  (when-let [path (:config-file opts)]
+    (tasks/configure! (:task_backend (json/parse-string (slurp path) true))))
   (tasks/ensure-dirs!)
+  (when (tasks/buddies?)
+    (println "Canonical Buddy tasks (not a local queue):")
+    (doseq [task (tasks/list-all)]
+      (println (format "  %s [%s%s] %s — owner %s, revision %s"
+                       (:id task) (:status task) (if (:paused task) ", paused" "")
+                       (:title task) (:ownerId task) (:revision task)))))
   (let [status (tasks/status-summary)]
     (println "Task Status:")
     (println (format "  Pending:  %d" (:pending status)))
@@ -1380,6 +1363,7 @@
   (println "  loop N           [DEPRECATED] Legacy: N = per-worker max_cycle. Use 'swarm' + oompa.json")
   (println "  swarm [file]     Run multiple worker configs from oompa.json (parallel)")
   (println "  tasks            Show task status (pending/current/complete)")
+  (println "  audit --config X Read-only selected task graph and source-pin readiness JSON")
   (println "  requeue [ids..]  Move current tasks back to pending")
   (println "  prompt \"...\"     Run ad-hoc prompt")
   (println "  status           Show running swarms")
@@ -1450,7 +1434,7 @@
    Returns {:swarm-token :worker-id :iteration} or nil."
   [dir-name]
   (when-let [[_ swarm-token worker-id iteration]
-             (re-matches #"\.?\.?ws?([a-f0-9]+)-(w\d+)-i(\d+)" dir-name)]
+             (re-matches #"(?:\.?\.?ws?|oompa-s)([a-f0-9]+)-(w\d+)-i(\d+)(?:-[a-f0-9-]{36})?" (.getName (io/file dir-name)))]
     {:swarm-token swarm-token
      :worker-id worker-id
      :iteration (Integer/parseInt iteration)}))
@@ -1459,13 +1443,15 @@
   "Find oompa/* branches that have commits ahead of main.
    Returns seq of {:branch :worker-id :swarm-token :ahead-count}."
   []
-  (let [br-result (process/sh ["git" "branch" "--list" "oompa/*"] {:out :string})
+  (let [active-branches (set (map :branch (filter :active? (cambium/list-workspaces (cambium/project-root)))))
+        br-result (process/sh ["git" "branch" "--list" "oompa/*"] {:out :string})
         branches (when (zero? (:exit br-result))
                    (->> (str/split-lines (:out br-result))
                         (map str/trim)
                         (remove str/blank?)
                         (remove #(= % "*"))))]
     (->> branches
+         (remove active-branches)
          (keep (fn [branch]
                  (let [ahead (process/sh ["git" "rev-list" "--count" (str "main.." branch)]
                                          {:out :string :err :string})
@@ -1473,7 +1459,7 @@
                                   (catch Exception _ 0))
                        ;; Parse branch name: oompa/s{swarm-token}-{worker-id}-i{iteration}
                        parts (when-let [[_ swarm-token worker-id iteration]
-                                        (re-matches #"oompa/s([a-f0-9]+)-(w\d+)-i(\d+)" branch)]
+                                        (re-matches #"oompa/(?:oompa-)?s([a-f0-9]+)-(w\d+)-i(\d+)(?:-[a-f0-9-]{36})?" branch)]
                                {:swarm-token swarm-token
                                 :worker-id worker-id
                                 :iteration (Integer/parseInt iteration)})]
@@ -1490,7 +1476,7 @@
         dirs (when (zero? (:exit ls-result))
                (->> (str/split-lines (:out ls-result))
                     (remove str/blank?)))]
-    (->> dirs
+    (->> (distinct (concat dirs (map :path (remove :active? (cambium/list-workspaces (cambium/project-root))))))
          (keep (fn [dir]
                  (let [parts (parse-worktree-name dir)
                        branch (worktree-branch-name dir)
@@ -1598,17 +1584,17 @@
   [salvage-info swarm-config]
   (let [{:keys [branch worker-id swarm-token]} salvage-info
         swarm-id (str swarm-token)
-        ;; Try worktree dir first, create one from branch if needed
-        wt-path (or (:dir salvage-info)
-                    (let [wt-dir (format ".wsalvage-%s-%s" swarm-token worker-id)
-                          _ (process/sh ["git" "worktree" "remove" wt-dir "--force"])
-                          result (process/sh ["git" "worktree" "add" wt-dir branch]
-                                             {:out :string :err :string})]
-                      (when (zero? (:exit result))
-                        wt-dir)))
-        _ (when-not wt-path
-            (println (format "[salvage:%s] Cannot create worktree for %s" worker-id branch))
-            (throw (ex-info "Cannot create worktree" {:branch branch})))
+        ;; Preserve the original branch; a new Cambium branch starts at it.
+        restored (when-not (:dir salvage-info)
+                   (cambium/create! (cambium/project-root)
+                                    (format "salvage-%s-%s" swarm-token worker-id)
+                                    "oompa/" branch))
+        wt-path (or (:dir salvage-info) (:path restored))
+        branch (or (:branch restored) branch)
+        _ (when-not restored
+            (when-let [workspace (first (filter #(= wt-path (:path %))
+                                                (cambium/list-workspaces (cambium/project-root))))]
+              (cambium/claim-existing! (cambium/project-root) workspace)))
 
         ;; Load cycle + review context
         last-cycle (last-cycle-for-worker swarm-id worker-id)
@@ -1676,6 +1662,11 @@
             (when-let [task-ids (seq (:claimed-task-ids last-cycle))]
               (let [completed (tasks/complete-by-ids! (set task-ids))]
                 (println (format "[salvage:%s] Completed %d task(s)" worker-id (count completed)))))
+            ;; The integrator retires the workspace in the same successful step.
+            ;; Legacy unregistered directories remain untouched.
+            (when-let [workspace (first (filter #(= wt-path (:path %))
+                                                (cambium/list-workspaces project-root)))]
+              (cambium/remove! project-root workspace))
             {:outcome :merged :sha (:sha merge-result)})
           (do
             (println (format "[salvage:%s] Merge failed: %s" worker-id (:message merge-result)))
@@ -1797,6 +1788,7 @@
    "loop" cmd-loop
    "swarm" cmd-swarm
    "tasks" cmd-tasks
+   "audit" cmd-audit
    "requeue" cmd-requeue
    "prompt" cmd-prompt
    "status" cmd-status

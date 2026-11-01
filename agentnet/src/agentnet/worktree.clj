@@ -8,15 +8,16 @@
      1. init-pool!     - Create N worktrees at startup
      2. acquire!       - Claim a worktree for a task
      3. (agent works)  - Agent modifies files, commits
-     4. release!       - Mark worktree available, optionally reset
+     4. release!       - Mark worktree available, without discarding work
      5. cleanup-pool!  - Remove all worktrees at shutdown
 
    Design:
-     - Worktrees live in .workers/ directory
-     - Each worktree has its own branch: work/<worktree-id>
+     - Worktrees live outside the project; .workers/ stores pool state
+     - Each worktree has its own unique work/oompa-* branch
      - State tracked in .workers/state.json
-     - All git operations are idempotent"
+     - Existing, dirty, busy and unmerged work is preserved"
   (:require [agentnet.schema :as schema]
+            [agentnet.cambium :as cambium]
             [babashka.process :as process]
             [cheshire.core :as json]
             [clojure.java.io :as io]
@@ -27,13 +28,13 @@
 ;; =============================================================================
 
 ;; init-pool! : OrchestratorConfig -> WorktreePool
-;; Creates N worktrees in .workers/ directory, returns pool state
+;; Creates N external Cambium workspaces, returns pool state
 
 ;; acquire! : WorktreePool, TaskId -> [WorktreePool, Worktree | nil]
 ;; Claims first available worktree for task, returns updated pool + worktree
 
 ;; release! : WorktreePool, WorktreeId, {:reset? bool} -> WorktreePool
-;; Releases worktree back to pool, optionally resets to main
+;; Releases worktree back to pool without discarding work
 
 ;; sync-to-main! : Worktree -> Worktree
 ;; Rebases worktree branch onto main, returns updated worktree
@@ -42,7 +43,7 @@
 ;; Gets current state of worktree
 
 ;; cleanup-pool! : WorktreePool -> nil
-;; Removes all worktrees and their branches
+;; Retires safe workspaces and retains their branches
 
 ;; =============================================================================
 ;; Constants
@@ -94,17 +95,6 @@
   ([] (git! "rev-parse" "HEAD"))
   ([dir] (git-in! dir "rev-parse" "HEAD")))
 
-(defn- branch-exists?
-  "Check if branch exists"
-  [branch]
-  (zero? (:exit (git "rev-parse" "--verify" branch))))
-
-(defn- worktree-exists?
-  "Check if worktree path exists"
-  [path]
-  (let [{:keys [out]} (git "worktree" "list" "--porcelain")]
-    (str/includes? out path)))
-
 ;; =============================================================================
 ;; State Persistence
 ;; =============================================================================
@@ -129,66 +119,38 @@
 ;; Worktree CRUD
 ;; =============================================================================
 
-(defn- worktree-path [worktree-id]
-  (str WORKERS_DIR "/" worktree-id))
-
-(defn- worktree-branch [worktree-id]
-  (str BRANCH_PREFIX worktree-id))
-
 (defn- create-worktree!
-  "Create a single worktree with its branch"
+  "Create a unique Cambium workspace, never replacing earlier work."
   [worktree-id]
-  (let [path (worktree-path worktree-id)
-        branch (worktree-branch worktree-id)]
-    (ensure-workers-dir!)
-    ;; Remove stale worktree if exists
-    (when (worktree-exists? path)
-      (git! "worktree" "remove" "--force" path))
-    ;; Remove stale branch if exists
-    (when (branch-exists? branch)
-      (git! "branch" "-D" branch))
-    ;; Create fresh worktree with new branch from HEAD
-    (git! "worktree" "add" "-b" branch path "HEAD")
-    {:id worktree-id
-     :path path
-     :branch branch
-     :status :available
-     :current-task nil
-     :created-at (now-ms)
-     :last-used nil}))
+  (merge (cambium/create! (cambium/project-root) worktree-id BRANCH_PREFIX)
+         {:id worktree-id :status :available :current-task nil
+          :created-at (now-ms) :last-used nil}))
 
-(defn- remove-worktree!
-  "Remove a single worktree and its branch"
-  [worktree]
-  (let [{:keys [path branch]} worktree]
-    (when (worktree-exists? path)
-      (git "worktree" "remove" "--force" path))
-    (when (branch-exists? branch)
-      (git "branch" "-D" branch))
-    nil))
+(defn- remove-worktree! [worktree]
+  (cambium/remove! (or (:project-root worktree) (cambium/project-root)) worktree))
 
 (defn- reset-worktree!
-  "Reset worktree to match main branch"
+  "Refresh a released workspace without resetting or discarding any work."
   [worktree]
-  (let [{:keys [path branch]} worktree
-        main-branch (current-branch)]
-    ;; Fetch latest main
-    (git-in! path "fetch" "." (str main-branch ":" main-branch))
-    ;; Hard reset to main
-    (git-in! path "reset" "--hard" main-branch)
-    ;; Clean untracked files
-    (git-in! path "clean" "-fd")
-    (assoc worktree
-           :status :available
-           :current-task nil
-           :last-used (now-ms))))
+  (let [path (:path worktree)
+        main-branch (current-branch)
+        status (git-in path "status" "--porcelain")
+        integrated (git "merge-base" "--is-ancestor" (:branch worktree) main-branch)
+        safe? (and (zero? (:exit status)) (str/blank? (:out status))
+                   (zero? (:exit integrated)))
+        synced (when safe? (git-in path "merge" "--ff-only" main-branch))]
+    (assoc worktree :current-task nil :last-used (now-ms)
+           :status (cond
+                     (not (zero? (:exit status))) :stale
+                     (not (str/blank? (:out status))) :dirty
+                     (and safe? (zero? (:exit synced))) :available
+                     :else :stale))))
 
 (defn- worktree-dirty?
-  "Check if worktree has uncommitted changes"
-  [worktree]
-  (let [{:keys [path]} worktree
-        {:keys [out]} (git-in path "status" "--porcelain")]
-    (not (str/blank? out))))
+  "Unreadable workspaces must never be handed to another agent."
+  [{:keys [path]}]
+  (let [{:keys [exit out]} (git-in path "status" "--porcelain")]
+    (or (not (zero? exit)) (not (str/blank? out)))))
 
 (defn- refresh-worktree-status
   "Update worktree status based on git state"
@@ -203,6 +165,9 @@
 
       (:current-task worktree)
       (assoc worktree :status :busy)
+
+      (not (zero? (:exit (git "merge-base" "--is-ancestor" (:branch worktree) "HEAD"))))
+      (assoc worktree :status :stale)
 
       :else
       (assoc worktree :status :available))))
@@ -226,7 +191,7 @@
                            refresh-worktree-status)
                        (create-worktree! id)))
                    needed-ids)]
-    (save-state! pool)))
+    (save-state! (into pool (remove #(some #{(:id %)} needed-ids) existing)))))
 
 (defn acquire!
   "Claim an available worktree for a task. Returns [pool worktree] or [pool nil]."
@@ -255,9 +220,7 @@
     (let [worktree (get pool idx)
           updated (if reset?
                     (reset-worktree! worktree)
-                    (assoc worktree
-                           :status :available
-                           :current-task nil))
+                    (refresh-worktree-status (assoc worktree :current-task nil)))
           new-pool (assoc pool idx updated)]
       (save-state! new-pool))
     pool))
@@ -285,12 +248,14 @@
     (refresh-worktree-status worktree)))
 
 (defn cleanup-pool!
-  "Remove all worktrees and clean up state"
+  "Remove only safe inactive workspaces; retain state for every preserved lane."
   [pool]
-  (doseq [worktree pool]
-    (remove-worktree! worktree))
-  (when (.exists (io/file STATE_FILE))
-    (io/delete-file STATE_FILE))
+  (let [retained (filterv (fn [workspace]
+                           (not (:removed? (remove-worktree! workspace)))) pool)]
+    (if (seq retained)
+      (save-state! retained)
+      (when (.exists (io/file STATE_FILE))
+        (io/delete-file STATE_FILE))))
   nil)
 
 (defn list-worktrees
@@ -316,7 +281,8 @@
         (let [result (f worktree)]
           [(release! pool' (:id worktree) {:reset? false}) result])
         (catch Exception e
-          [(release! pool' (:id worktree) {:reset? true}) nil]))
+          (release! pool' (:id worktree) {:reset? false})
+          (throw e)))
       (throw (ex-info "No available worktrees" {:pool pool :task-id task-id})))))
 
 (defn commit-in-worktree!

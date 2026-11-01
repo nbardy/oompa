@@ -35,7 +35,12 @@
             [agentnet.core :as core]
             [agentnet.harness :as harness]
             [agentnet.worktree :as worktree]
+            [agentnet.cambium :as cambium]
             [agentnet.runs :as runs]
+            [agentnet.task-execution :as execution]
+            [agentnet.integration-source :as integration-source]
+            [agentnet.task-graph :as task-graph]
+            [agentnet.bounded-process :as bounded]
             [babashka.process :as process]
             [cheshire.core :as json]
             [clojure.java.io :as io]
@@ -48,8 +53,16 @@
 ;; =============================================================================
 
 (def ^:private package-root
-  "Root of the oompa package — set by bin/oompa.js, falls back to cwd."
-  (or (System/getenv "OOMPA_PACKAGE_ROOT") "."))
+  "Root of the installed oompa sources, independent of the target project's cwd.
+   The npm launcher supplies it explicitly; direct/hosted Babashka entry points
+   resolve it from the loaded worker resource on their classpath."
+  (.getCanonicalPath
+    (io/file
+      (or (not-empty (System/getenv "OOMPA_PACKAGE_ROOT"))
+          (some-> (io/resource "agentnet/worker.clj") .toURI io/file
+                  .getCanonicalFile .getParentFile .getParentFile
+                  .getParentFile .getParentFile)
+          "."))))
 
 ;; Serializes merge-to-main! calls across concurrent workers to prevent
 ;; git index corruption from parallel checkout+merge operations.
@@ -118,7 +131,10 @@
     (when (nil? resolved)
       (throw (ex-info (str "Framework prompt not found: " path)
                       {:name name :path path :package-root package-root})))
-    (agent/tokenize (slurp resolved) tokens)))
+    (let [body (agent/tokenize (slurp resolved) tokens)]
+      (if (tasks/buddies?)
+        (str/replace body "tasks/pending/" "the canonical Buddy task service (through the accountable Buddy)")
+        body))))
 
 (defn- tag-prompt
   "Prefix a prompt with its run-identity tag: \"[oompa:<swarm-id>:<id>] \".
@@ -188,8 +204,11 @@
   [cwd]
   (let [cwd-file (io/file cwd)
         local-tasks (io/file cwd-file "tasks")
+        project-tasks (io/file (System/getProperty "user.dir") "tasks")
         parent-tasks (some-> cwd-file .getParentFile (io/file "tasks"))]
     (cond
+      (.exists project-tasks) (str (.relativize (.toPath (.getCanonicalFile cwd-file))
+                                              (.toPath (.getCanonicalFile project-tasks))))
       (and parent-tasks (.exists parent-tasks)) "../tasks"
       (.exists local-tasks) "tasks"
       :else "tasks")))
@@ -212,6 +231,15 @@
 ;; against an unbounded codex goal, which is why it must never be removed.
 (def ^:private default-max-resumes 7)
 
+(defn worker-task-ids
+  "Parse optional JSON worker task_ids. Missing preserves legacy selection; [] denies all."
+  [config]
+  (when (contains? config :task_ids)
+    (let [ids (:task_ids config)]
+      (when-not (and (vector? ids) (every? #(and (string? %) (not (str/blank? %))) ids))
+        (throw (ex-info "Worker task_ids must be an array of nonempty task IDs" {})))
+      (set ids))))
+
 (defn create-worker
   "Create a worker config.
    :prompts is a string or vector of strings — paths to prompt files.
@@ -229,13 +257,16 @@
   [{:keys [id swarm-id harness model max-cycles prompts can-plan reasoning
            reviewers wait-between
            max-wait-for-tasks max-resumes
-           role can-claim-gpu auto-merge-paths]}]
+           role can-claim-gpu task-ids auto-merge-paths task-execution resume-swarm-id]}]
   {:id id
    :swarm-id swarm-id
    :harness (or harness :codex)
    :model model
    :role role
    :can-claim-gpu (boolean can-claim-gpu)
+   :task-ids task-ids
+   :task-execution task-execution
+   :resume-swarm-id resume-swarm-id
    :max-cycles (or max-cycles 10)
    :prompts (cond
               (vector? prompts) prompts
@@ -277,7 +308,9 @@
     {:pending_count (count pending)
      :current_count (count current)
      :complete_count (count complete)
-     :pending_tasks (str/join "\n" (map #(str "- " (:id %) ": " (:summary %)) pending))
+     :pending_tasks (str/join "\n" (map #(if (tasks/buddies?)
+                                             (json/generate-string (dissoc % :_file))
+                                             (str "- " (:id %) ": " (:summary %))) pending))
      :task_status (format "Pending: %d, In Progress: %d, Complete: %d"
                           (count pending) (count current) (count complete))}))
 
@@ -325,6 +358,10 @@
         missing-deps (when (seq deps)
                        (vec (remove @complete deps)))]
     (cond
+      (and (some? (:task-ids worker))
+           (not (contains? (:task-ids worker) (:id task))))
+      {:reason "task-ineligible" :task-id (:id task)}
+
       (seq missing-deps)
       {:reason "dependency-missing" :missing-dependencies (str/join "," missing-deps)}
 
@@ -358,7 +395,12 @@
                             failed)
         context (build-context)
         claimed-line (if (seq claimed-ids)
-                       (str "Claimed: " (str/join ", " claimed-ids) "\n")
+                       (str "Claimed: " (str/join ", " claimed-ids) "\n"
+                            (when (tasks/buddies?)
+                              (str "Canonical claimed task criteria:\n"
+                                   (json/generate-string
+                                     (filterv #(some #{(:id %)} claimed-ids)
+                                              (tasks/list-current))) "\n")))
                        "No tasks were successfully claimed.\n")
         failed-line (if (seq failed-labels)
                       (str "Rejected, already taken, or not found: "
@@ -437,7 +479,7 @@
    resume-prompt-override: when non-nil, replaces the default resume prompt
    (used to inject CLAIM results). All harness-specific CLI knowledge
    is delegated to harness/build-cmd."
-  [{:keys [id swarm-id harness model prompts reasoning]} worktree-path context session-id resume?
+  [{:keys [id swarm-id harness model prompts reasoning timeout-ms]} worktree-path context session-id resume?
    & {:keys [resume-prompt-override]}]
   (let [session-id (or session-id (harness/make-session-id harness))
         template-tokens (build-template-tokens context worktree-path)
@@ -463,18 +505,22 @@
                  ;; replaced here. Without this, raw {var} placeholders leak
                  ;; into the agent prompt verbatim.
                  :else
-                 (let [task-header (render-task-header
-                                     (load-prompt "config/prompts/_task_header.md")
-                                     worktree-path)
+                 (let [task-header (if (tasks/buddies?)
+                                     (load-prompt "config/prompts/_buddy_task_header.md")
+                                     (render-task-header
+                                       (load-prompt "config/prompts/_task_header.md")
+                                       worktree-path))
                        user-prompts (if (seq prompts)
                                       (->> prompts
                                            (map load-prompt)
                                            (remove nil?)
                                            (map #(agent/tokenize % template-tokens))
                                            (str/join "\n\n"))
-                                      (or (some-> (load-prompt "config/prompts/worker.md")
+                                      (if (tasks/buddies?)
+                                        "Execute the claimed Buddy task through its original done criteria."
+                                        (or (some-> (load-prompt "config/prompts/worker.md")
                                                   (agent/tokenize template-tokens))
-                                          (load-framework-prompt "worker_default.md" {})))]
+                                          (load-framework-prompt "worker_default.md" {}))))]
                    (str task-header "\n"
                         "Task Status: " (:task_status context) "\n"
                         "Pending: " (:pending_tasks context) "\n\n"
@@ -488,7 +534,7 @@
                                        {:cwd abs-worktree :model model :reasoning reasoning
                                         :session-id session-id :resume? resume?
                                         :drive (turn-drive id harness resume?)
-                                        :prompt tagged-prompt :format? true})
+                                        :prompt tagged-prompt :format? true :timeout-ms timeout-ms})
                  (catch Exception e
                    (println (format "[%s] Agent exception: %s" id (.getMessage e)))
                    {:exit -1 :out "" :err (.getMessage e)}))
@@ -512,20 +558,56 @@
      :raw-snippet raw-snippet
      :stderr-snippet stderr-snippet}))
 
-(defn- run-reviewer!
-  "Run reviewer on worktree changes.
-   Uses custom review-prompts when configured, otherwise falls back to default.
-   prev-feedback: vector of previous review outputs (for multi-round context).
+(defn- claude-final-review-message
+  "Read Claude's last completed top-level assistant message from agent-cli's
+   raw event mirror. Text deltas have no message boundaries, so concatenating
+   commentary and final response can erase the verdict's required line break."
+  [stderr]
+  (let [prefix "[agent-cli raw claude stdout] "]
+    (->> (str/split-lines (or stderr ""))
+         (keep (fn [line]
+                 (when (str/starts-with? line prefix)
+                   (try
+                     (let [event (json/parse-string (subs line (count prefix)) true)]
+                       (when (and (= "assistant" (:type event))
+                                  (nil? (:parent_tool_use_id event)))
+                         (let [text (->> (get-in event [:message :content])
+                                         (keep #(when (= "text" (:type %)) (:text %)))
+                                         (str/join ""))]
+                           (when-not (str/blank? text) text))))
+                     (catch Exception _ nil)))))
+         last)))
+
+(defn- explicit-approval? [review]
+  (and (= :approved (:verdict review))
+       (zero? (:exit review))
+       (re-find #"\A[ \t\r\n]*VERDICT: APPROVED(?:\r?\n|\z)" (:output review))
+       (= ["APPROVED"]
+          (mapv second (re-seq #"(?m)^VERDICT: (APPROVED|NEEDS_CHANGES|REJECTED)\r?$"
+                               (:output review))))))
+
+(defn- run-review!
+  "Shared reviewer core: diff/merged-log context, reviewer fallback chain and
+   verdict parsing. `render-body` receives {:base :diff_content :merged_section}
+   (base = the reviewer's custom prompt plus the canonical task section) and
+   returns the framework prompt body. Candidate review and block review differ
+   ONLY in that body, so both go through the same reviewers and the same
+   explicit-approval? parse.
    Returns {:verdict :approved|:needs-changes, :comments [...], :output string}"
-  [{:keys [id swarm-id reviewers]} worktree-path prev-feedback]
+  [{:keys [id swarm-id reviewers timeout-ms deadline-ms review-base selected-task]} worktree-path render-body]
   (let [start-ms (System/currentTimeMillis)
+        git-run (fn [argv]
+                  (let [opts {:dir worktree-path :out :string :err :string}]
+                    (if timeout-ms
+                      (bounded/run! argv opts (max 1 (min timeout-ms
+                                                        (if deadline-ms (execution/remaining-ms deadline-ms) timeout-ms))))
+                      (process/sh argv opts))))
         ;; -U10 gives 10 lines of context (vs default 3) so reviewer sees more
         ;; surrounding code without needing to shell out and read files.
         ;; -W extends hunks to show the enclosing function for each change.
         ;; 24000 char limit gives ~500-600 lines of diff — enough for most PRs
         ;; to be reviewed without tool calls to read files.
-        diff-result (process/sh ["git" "diff" "-U10" "-W" "main"]
-                                {:dir worktree-path :out :string :err :string})
+        diff-result (git-run ["git" "diff" "-U10" "-W" (or review-base "main")])
         diff-content (let [d (:out diff-result)]
                        (if (> (count d) 24000)
                          (str (subs d 0 24000) "\n... [diff truncated at 24000 chars]")
@@ -534,64 +616,59 @@
         ;; Recently MERGED subject lines on main (not the worker's own branch
         ;; commits — use the `main` ref). This gives the reviewer pacing context
         ;; so it can flag a diff that duplicates or churns work already merged.
-        merged-log (-> (process/sh ["git" "log" "-n" "10" "--format=%s" "main"]
-                                   {:dir worktree-path :out :string :err :string})
+        merged-log (-> (git-run ["git" "log" "-n" "10" "--format=%s" (or review-base "main")])
                        :out str/trim)
         merged-section (when (seq merged-log)
                          (str "\n## Recently merged work on main (last 10)\n\n"
                               merged-log
                               "\n\n"))
 
-        ;; Only include the most recent round's feedback — the worker has already
-        ;; attempted fixes based on it, so the reviewer just needs to verify.
-        history-block (when (seq prev-feedback)
-                        (let [latest (last prev-feedback)
-                              truncated (if (> (count latest) 2000)
-                                          (str (subs latest 0 2000) "\n... [feedback truncated]")
-                                          latest)]
-                          (str "\n## Previous Review (Round " (count prev-feedback) ")\n\n"
-                               "The worker has attempted fixes based on this feedback. "
-                               "Verify the issues below are resolved. Do NOT raise new issues.\n\n"
-                               truncated
-                               "\n\n")))
-
         abs-wt (.getAbsolutePath (io/file worktree-path))
 
         ;; Try each reviewer until one succeeds and returns a verdict
-        result (reduce (fn [_ {:keys [harness model prompts]}]
+        result (reduce (fn [_ {:keys [harness model reasoning prompts]}]
                          (let [custom-prompt (when (seq prompts)
                                                (->> prompts
                                                     (map load-prompt)
                                                     (remove nil?)
                                                     (str/join "\n\n")))
-                               review-base (or custom-prompt
-                                                "Review the changes in this worktree.\nFocus on architecture and design, not style.\n")
-                               review-body (load-framework-prompt
-                                             "reviewer.md"
-                                             {:base review-base
-                                              :diff_content diff-content
-                                              :merged_section (or merged-section "")
-                                              :history_block (or history-block "")})
+                               review-base (str (or custom-prompt
+                                                    "Review the changes in this worktree.\nFocus on architecture and design, not style.\n")
+                                                (when selected-task
+                                                  (str "\nCanonical task and original done criteria:\n"
+                                                       (json/generate-string (dissoc selected-task :_file))
+                                                       "\nReview only this committed candidate. Do not modify source, merge, or change task status.\n")))
+                               review-body (render-body {:base review-base
+                                                         :diff_content diff-content
+                                                         :merged_section (or merged-section "")})
                                review-prompt (tag-prompt swarm-id id review-body)
                                res (try
-                                        (harness/run-command! harness {:cwd abs-wt :model model :prompt review-prompt})
+                                        (harness/run-command! harness
+                                                              {:cwd abs-wt :model model :reasoning reasoning :prompt review-prompt
+                                                               :debug-raw-events? (= :claude harness)
+                                                               :timeout-ms (when timeout-ms
+                                                                             (max 1 (if deadline-ms
+                                                                                      (min timeout-ms (execution/remaining-ms deadline-ms))
+                                                                                      timeout-ms)))})
                                         (catch Exception e
                                           {:exit -1 :out "" :err (.getMessage e)}))
                                parsed (harness/parse-output harness (:out res) nil)
-                               output (or (:output parsed) "")
+                               output (or (when (= :claude harness)
+                                            (claude-final-review-message (:err res)))
+                                          (:output parsed) "")
                                has-verdict? (or (re-find #"VERDICT:\s*APPROVED" output)
                                                 (re-find #"VERDICT:\s*NEEDS_CHANGES" output)
                                                 (re-find #"VERDICT:\s*REJECTED" output)
                                                 (re-find #"(?i)\bAPPROVED\b" output))]
                            (if (and (= (:exit res) 0) has-verdict?)
-                             (reduced res)
+                             (reduced (assoc res :parsed-output output))
                              (do
                                (println (format "[%s] Reviewer %s failed or returned no verdict, falling back..." id model))
                                res))))
                        {:exit -1 :out "" :err "No reviewers configured or no verdict returned"}
                        reviewers)
 
-        output (:out result)
+        output (or (:parsed-output result) (:out result) "")
 
         ;; Parse verdict
         verdict (cond
@@ -608,10 +685,47 @@
                        (if (> (count output) 300) "..." ""))))
 
     {:verdict verdict
+     :exit (:exit result)
      :comments (when (not= (:exit result) 0)
                  [(:err result)])
      :output output
      :duration-ms duration-ms}))
+
+(defn- run-reviewer!
+  "Run reviewer on worktree changes.
+   Uses custom review-prompts when configured, otherwise falls back to default.
+   prev-feedback: vector of previous review outputs (for multi-round context).
+   Returns {:verdict :approved|:needs-changes, :comments [...], :output string}"
+  [worker worktree-path prev-feedback]
+  ;; Only include the most recent round's feedback — the worker has already
+  ;; attempted fixes based on it, so the reviewer just needs to verify.
+  (let [history-block (when (seq prev-feedback)
+                        (let [latest (last prev-feedback)
+                              truncated (if (> (count latest) 2000)
+                                          (str (subs latest 0 2000) "\n... [feedback truncated]")
+                                          latest)]
+                          (str "\n## Previous Review (Round " (count prev-feedback) ")\n\n"
+                               "The worker has attempted fixes based on this feedback. "
+                               "Verify the issues below are resolved. Do NOT raise new issues.\n\n"
+                               truncated
+                               "\n\n")))]
+    (run-review! worker worktree-path
+                 (fn [tokens]
+                   (load-framework-prompt "reviewer.md" (assoc tokens :history_block (or history-block "")))))))
+
+(defn- run-block-reviewer!
+  "Gap fixed after swarm 455987ea (2026-10-24): a worker could set its task
+   `blocked` with prose and nothing ever checked it, so plausible-sounding
+   blocks silently drained the queue. A block now goes to the SAME reviewers
+   as a candidate. The reviewer sees the worker's block object (blockedReason,
+   requiredOwnerAction), the canonical task (done criteria and current
+   nextAction, which is where owner/CEO DECISION lines live) and the diff.
+   VERDICT: APPROVED confirms the block; anything else rejects it."
+  [worker worktree-path blocked]
+  (run-review! worker worktree-path
+               (fn [tokens]
+                 (load-framework-prompt "block_reviewer.md"
+                                        (assoc tokens :block_claim (json/generate-string blocked {:pretty true}))))))
 
 (defn- run-fix!
   "Ask worker to fix issues based on reviewer feedback.
@@ -678,11 +792,9 @@
   5)
 
 (defn- abort-any-merge!
-  "Ensure no merge is in progress. Tries --abort first, falls back to hard reset."
+  "Abort only Git's merge operation; never reset unrelated or dirty work."
   [dir]
-  (let [abort (process/sh ["git" "merge" "--abort"] {:dir dir :out :string :err :string})]
-    (when-not (zero? (:exit abort))
-      (process/sh ["git" "reset" "--hard" "HEAD"] {:dir dir}))))
+  (process/sh ["git" "merge" "--abort"] {:dir dir :out :string :err :string}))
 
 (defn- try-merge-main!
   "Try `git merge main` in a worktree. Returns {:ok? bool :error string}.
@@ -757,43 +869,12 @@
         (pos? ahead-count))))
 
 (defn- create-iteration-worktree!
-  "Create a fresh worktree for an iteration. Returns {:dir :branch :path}.
-   Force-removes stale worktree+branch from previous failed runs first."
+  "Create a unique ephemeral Cambium workspace outside the project checkout."
   [project-root swarm-id worker-id iteration]
-  (let [swarm-token (or swarm-id (subs (str (java.util.UUID/randomUUID)) 0 8))
-        work-id (format "s%s-%s-i%d" swarm-token worker-id iteration)
-        wt-dir (format ".w%s" work-id)
-        wt-branch (format "oompa/%s" work-id)
-        wt-path (str project-root "/" wt-dir)]
-    ;; Clean stale worktree/branch from previous failed runs
-    (process/sh ["git" "worktree" "remove" wt-dir "--force"] {:dir project-root})
-    (process/sh ["git" "branch" "-D" wt-branch] {:dir project-root})
-    ;; Prefer simgit (`sg`) — it creates a REAL git linked worktree but clones
-    ;; the tree copy-on-write (APFS clonefile / btrfs-xfs reflink), so N agent
-    ;; worktrees cost ~1x the disk instead of N x. Measured on this repo
-    ;; 2026-08-15: 2.9s, mode "cow-clone", ~0 bytes physical vs 345MB for a
-    ;; plain checkout — 124 accumulated plain worktrees had eaten the disk down
-    ;; to 9.7Gi mid-run. Falls back to plain `git worktree add` (announced, not
-    ;; silent) when sg is absent or CoW is unavailable on this filesystem.
-    ;; NB: sg's argument order is BRANCH then PATH, the reverse of git's.
-    (let [sg? (zero? (:exit (process/sh ["which" "sg"] {:out :string :err :string})))
-          sg-result (when sg?
-                      (process/sh ["sg" "worktree" "add" "--require-cow" wt-branch wt-dir]
-                                  {:dir project-root :out :string :err :string}))
-          result (if (and sg? (zero? (:exit sg-result)))
-                   sg-result
-                   (do
-                     (when sg?
-                       (println (str "[worktree] simgit CoW unavailable; using plain git worktree "
-                                     "(full-size checkout): " (str/trim (:err sg-result)))))
-                     (process/sh ["git" "worktree" "add" wt-dir "-b" wt-branch]
-                                 {:dir project-root :out :string :err :string})))]
-      (when-not sg?
-        (println "[worktree] simgit (sg) not found; using plain git worktree (full-size checkout)"))
-      (when-not (zero? (:exit result))
-        (throw (ex-info (str "Failed to create worktree: " (:err result))
-                        {:dir wt-dir :branch wt-branch
-                         :via (if (and sg? (zero? (:exit sg-result))) "sg" "git")}))))
+  (let [work-id (format "s%s-%s-i%d" (or swarm-id "local") worker-id iteration)
+        workspace (cambium/create! project-root work-id "oompa/")
+        wt-dir (:dir workspace)
+        wt-path (:path workspace)]
     ;; Deterministic worktree setup: if the repo ships scripts/worktree-bootstrap.sh,
     ;; the FRAMEWORK runs it here — before the agent ever starts — instead of
     ;; trusting every model to obey a "STEP ZERO: run this" prompt line. A missed
@@ -805,12 +886,15 @@
     ;; WORKTREE_ROOT to the primary checkout and silently no-op.
     (let [bootstrap (str wt-path "/scripts/worktree-bootstrap.sh")]
       (when (.exists (java.io.File. bootstrap))
-        (let [result (process/sh [bootstrap] {:dir wt-path :out :string :err :string})]
+        (let [result (if cambium/*deadline-ms*
+                       (bounded/run! [bootstrap] {:dir wt-path :out :string :err :string}
+                                     (max 1 (execution/remaining-ms cambium/*deadline-ms*)))
+                       (process/sh [bootstrap] {:dir wt-path :out :string :err :string}))]
           (when-not (zero? (:exit result))
             (throw (ex-info (str "worktree bootstrap failed (exit " (:exit result) "): "
                                  (str/trim (str (:err result) " " (:out result))))
                             {:dir wt-dir :script bootstrap}))))))
-    {:dir wt-dir :branch wt-branch :path wt-path}))
+    workspace))
 
 (defn- detect-claimed-tasks
   "Do not infer ownership from shared current/ diffs.
@@ -1021,10 +1105,10 @@
 
 
 (defn- cleanup-worktree!
-  "Remove worktree and branch."
+  "Retire integrated clean workspaces through Cambium; preserve other work."
   [project-root wt-dir wt-branch]
-  (process/sh ["git" "worktree" "remove" wt-dir "--force"] {:dir project-root})
-  (process/sh ["git" "branch" "-D" wt-branch] {:dir project-root}))
+  (cambium/remove! project-root {:dir wt-dir :branch wt-branch
+                                 :path (cambium/workspace-path project-root wt-dir)}))
 
 (defn- preserve-merge-failure-salvage!
   "On merge failure, keep the approved work reachable instead of destroying it.
@@ -1033,8 +1117,7 @@
    art-direction doc + four visual fixes, 2.5h of work) ended outcome
    merge-failed and its worktree was cleaned up unconditionally — the content
    exists in no git ref today. Never cleanup on merge failure; pin the branch
-   head under a salvage ref (create-iteration-worktree! force-deletes stale
-   oompa/* branches on restart, so the worktree branch alone is not safe) and
+   head under a salvage ref and
    leave the worktree in place.
 
    Creates refs/heads/salvage/{swarm-id}-{worker-id}-c{cycle} at the worktree
@@ -1168,6 +1251,21 @@
                          {:project_root project-root
                           :wt_branch wt-branch}))
 
+(defn- verified-merge?
+  "An agent signal is advisory; Git must prove the delivered branch is integrated."
+  [wt-path wt-branch project-root sha]
+  (let [run (fn [dir & args]
+              (process/sh (into ["git"] args) {:dir dir :out :string :err :string}))
+        status (run wt-path "status" "--porcelain")
+        checked-out (run wt-path "symbolic-ref" "--short" "HEAD")
+        target (run project-root "symbolic-ref" "--short" "HEAD")
+        integrated (run project-root "merge-base" "--is-ancestor" wt-branch "HEAD")
+        receipt (run project-root "merge-base" "--is-ancestor" sha "HEAD")]
+    (and (zero? (:exit status)) (str/blank? (:out status))
+         (zero? (:exit checked-out)) (= wt-branch (str/trim (:out checked-out)))
+         (zero? (:exit target)) (= "main" (str/trim (:out target)))
+         (zero? (:exit integrated)) (zero? (:exit receipt)))))
+
 (defn run-merge-agent!
   "Resume the original worker session and instruct it to merge its branch to main.
    Serialized via merge-lock so concurrent workers don't corrupt the git index.
@@ -1195,8 +1293,11 @@
             gave-up? (agent/needs-followup-signal? output)]
         (cond
           sha
-          (do (println (format "[%s] Merged → %s" worker-id sha))
-              {:ok? true :sha sha :message (str "merged → " sha)})
+          (if (verified-merge? wt-path wt-branch project-root sha)
+            (do (println (format "[%s] Merged → %s (Git verified)" worker-id sha))
+                {:ok? true :sha sha :message (str "merged → " sha)})
+            (do (println (format "[%s] MERGE_COMPLETE rejected: Git does not prove a clean integrated branch" worker-id))
+                {:ok? false :sha nil :message "MERGE_COMPLETE failed Git verification; workspace preserved"}))
 
           gave-up?
           (do (println (format "[%s] Merge agent gave up" worker-id))
@@ -1358,7 +1459,7 @@
     (println (format "[%s] Sleeping %ds before next iteration" worker-id wait-between))
     (Thread/sleep (* wait-between 1000))))
 
-(defn run-worker!
+(defn- run-queue-worker!
   "Run worker loop with persistent sessions.
 
    A cycle is one complete unit of work: claim → implement → review → merge/reject.
@@ -1778,6 +1879,659 @@
                       (recur cycle (inc attempt) completed 0 metrics new-session-id wt-state
                              active-claimed-ids (when penultimate? (nudge-prompt)) signals)))))))))))))
 
+;; Selected Buddy executions deliberately bypass the model-driven queue protocol.
+;; One task owns its source workspace/session until a real consumer gate passes.
+(def ^:private selected-writer-lock (Object.))
+(def ^:private selected-active-owner (atom nil))
+;; Host acceptance fast-forwards the shared integration root and refuses a
+;; candidate that does not descend from it, so only one worker may be between
+;; "refresh onto root" and "host verdict" at a time. Implementation runs in
+;; parallel; this owner serializes only that short integration window.
+(def ^:private selected-integration-owner (atom nil))
+
+(defn- selected-exclusive?
+  "GPU-capable workers may run real project writers / GPU consumers and keep
+   the whole cycle under selected-writer-lock. Source-only workers
+   (can_claim_gpu false) implement concurrently in their own Cambium
+   worktrees; they only serialize through selected-integration-owner."
+  [worker]
+  (not (false? (:can-claim-gpu worker))))
+
+(defn- integration-turn! [worker]
+  (let [me [(:swarm-id worker) (:id worker)]]
+    (or (= me @selected-integration-owner)
+        (compare-and-set! selected-integration-owner nil me))))
+
+(defn- release-integration! [worker]
+  (let [me [(:swarm-id worker) (:id worker)]]
+    (swap! selected-integration-owner #(if (= % me) nil %))))
+
+(defn- selected-all-accepted? []
+  (every? #(= "done" (:status %)) (tasks/list-all)))
+
+(defn- selected-prompt [worker task feedback]
+  (str "Execute only this already-claimed canonical Buddy task:\n"
+       (json/generate-string (dissoc task :_file)) "\n\n"
+       "Keep this workspace and session. Commit the candidate before requesting validation. "
+       "Signal COMPLETE_AND_READY_FOR_MERGE when ready for the executable consumer gate. "
+       "A completion token or review does not accept the task. The framework owns task status, "
+       "validation and integration. Do not merge, change task status, bypass checks, weaken a validator, "
+       "start paid/GPU/deployment/account operations without existing project authorization, "
+       "or claim another task. Follow the repository's AGENTS.md and owning task criteria.\n\n"
+       "If progress requires missing external evidence, access or authority, return a JSON object "
+       "with status=\"blocked\", reason (a nonempty string), taskComplete=false and "
+       "readyForMergeValidation=false. An independent reviewer checks every block against the done criteria and nextAction; "
+       "a confirmed block is held for its owner, a rejected one reopens the task for another worker with the reviewer's reason.\n\n"
+       (when (seq (:prompts worker))
+         (str/join "\n\n" (keep load-prompt (:prompts worker))))
+       (when feedback
+         (str "\n\nThe independently executed gate has not accepted this task. "
+              "Repair the same candidate and commit; then request validation again.\n"
+              (json/generate-string feedback)))))
+
+(defn- prepare-only? [config id]
+  (boolean (some #{id} (:prepare_only_task_ids config))))
+
+(defn- selected-audit! [worker config held]
+  (task-graph/audit! (System/getProperty "user.dir") config (tasks/list-all)
+                     (tasks/selection-dependencies) held
+                     {:claim-denial #(task-claim-denial worker %)}))
+
+(defn- selected-next-task!
+  ([worker config held] (selected-next-task! worker config held (selected-audit! worker config held)))
+  ([worker config held audit]
+  ;; Scan every eligible task. A missing oracle must not hide later runnable work.
+  (some (fn [task]
+          (when (and (contains? (task-graph/ready-ids audit) (:id task))
+                     (or (execution/validator-for config (:id task))
+                         (prepare-only? config (:id task)))
+                     (not= (:revision task)
+                           (or (:held_task_revision (get held (:id task)))
+                               (:claim_revision (get held (:id task)))))
+                     (nil? (task-claim-denial worker task)))
+            (tasks/claim-task! task)))
+        (tasks/list-pending))))
+
+(defn- selected-state! [worker state status reason]
+  (runs/write-worker-state! (:swarm-id worker) (:id worker)
+                            {:status status :reason (when reason (name reason))
+                             :cycle (:cycle state) :attempt (:attempt state)
+                             :execution state}))
+
+(defn- continuation-control-dir []
+  (System/getenv "OOMPA_CONTINUATION_CONTROL_DIR"))
+
+(defn- host-continuation-request [control-dir]
+  ;; Read only the exact host-owned request, never neighbouring authority files.
+  ;; Removal races are normal; malformed/unreadable requests must fail closed.
+  (when control-dir
+    (when-not (and (not (str/blank? control-dir)) (.isDirectory (io/file control-dir)))
+      (throw (ex-info "Continuation control directory is unavailable" {})))
+    (when-let [contents (try
+                         (java.nio.file.Files/readString
+                          (.toPath (io/file control-dir "continuation-request.json")))
+                         (catch java.nio.file.NoSuchFileException _ nil))]
+      (let [request (json/parse-string contents true)]
+        (when-not (and (map? request) (string? (:id request)) (not (str/blank? (:id request))))
+          (throw (ex-info "Continuation request requires a nonempty string id" {})))
+        request))))
+
+(defn- hold-selected [state reason & [task]]
+  ;; This is execution recovery inside the existing run record, not another
+  ;; task queue. Canonical Buddy status still decides what is eligible.
+  (let [held (assoc (or (:held_executions state) {}) (:task_id state)
+                    (cond-> (assoc (dissoc state :held_executions) :held_reason (name reason))
+                      task (assoc :held_task_revision (:revision task))))]
+    ;; Source-only holds also clear this; harmless while at most one worker
+    ;; is GPU-capable (the beta config has exactly one).
+    (reset! selected-active-owner nil)
+    {:state {:cycle (inc (:cycle state)) :attempt 0 :deadline_ms (:deadline_ms state)
+             :accepted_count (:accepted_count state) :held_executions held}}))
+
+;; -----------------------------------------------------------------------------
+;; Abandoned-claim release. Swarm 455987ea (2026-10-24) went idle: workers gave
+;; up on claimed tasks (attempt budget, timeout) and the Buddy task stayed
+;; `in_progress`, which every other worker's graph audit correctly refuses to
+;; steal ("execution-custody-unverified"). The giving-up worker now releases its
+;; own claim to `open` itself, as data on the task, so another worker can take
+;; it. The CAS in buddy/release-abandoned! makes a live claim unstealable.
+;; -----------------------------------------------------------------------------
+
+(def ^:private release-marker "[oompa-release]")
+
+(defn release-next-action
+  "nextAction written when a claim is given back. Owner text already on the
+   task (for example a CEO DECISION line) is kept verbatim above the marker;
+   only a previous Oompa release section is replaced, so repeated requeues do
+   not grow the field."
+  [prior {:keys [reason worker swarm attempt source findings]}]
+  (let [owner (str/trimr (first (str/split (or prior "")
+                                           (re-pattern (java.util.regex.Pattern/quote release-marker)) 2)))]
+    (str (when-not (str/blank? owner) (str owner "\n\n"))
+         release-marker " Released to open by Oompa swarm " swarm " worker " worker
+         " after attempt " attempt " (" reason "). Retained unmerged source: " source
+         ". Inspect or reuse it; it is not accepted work.\n"
+         "Last findings: " (snippet findings 1500))))
+
+(defn- workspace-head [workspace]
+  (try (execution/git! (:path workspace) (+ (execution/now-ms) 10000) "rev-parse" "HEAD")
+       (catch Exception e (str "unreadable (" (.getMessage e) ")"))))
+
+(defn- retained-source [state]
+  (if-let [workspace (:workspace state)]
+    (str "branch " (:branch workspace) " at commit " (workspace-head workspace)
+         " in workspace " (:path workspace))
+    "none (no workspace was provisioned)"))
+
+(defn- last-findings [state]
+  (cond (seq (:review_feedback state)) (last (:review_feedback state))
+        (:feedback state) (json/generate-string (:feedback state))
+        :else "none recorded"))
+
+(defn- release-claim!
+  "Release THIS execution's claim to canonical `open`. Returns
+   {:execution e :task t}: e records the outcome under :release; t is the
+   released task, or nil when nothing was released (claim not owned by this
+   process, or the CAS/transport failed — the old hold then stands, recorded)."
+  [worker execution reason findings]
+  (let [record {:reason (name reason)}
+        outcome (try
+                  ;; Own short deadline: exit releases run after the run budget.
+                  (tasks/with-deadline (+ (execution/now-ms) 30000)
+                    #(let [task (tasks/get-task (:task_id execution))]
+                       (tasks/release-abandoned!
+                         task (release-next-action (:nextAction task)
+                                                   {:reason (name reason) :worker (:id worker)
+                                                    :swarm (:swarm-id worker) :attempt (or (:attempt execution) 0)
+                                                    :source (retained-source execution) :findings findings}))))
+                  (catch Exception e {:kind :release-failed :error (.getMessage e)}))]
+    (case (:kind outcome)
+      :released {:execution (assoc execution :release (assoc record :outcome "released"
+                                                             :revision (:revision (:task outcome))
+                                                             :next_action (:nextAction (:task outcome))))
+                 :task (:task outcome)}
+      :not-owned {:execution (assoc execution :release (assoc record :outcome "not-owned")) :task nil}
+      :release-failed {:execution (assoc execution :release (assoc record :outcome "failed" :error (:error outcome)))
+                       :task nil})))
+
+(defn- release-selected!
+  "Give up the active claim: release it and keep the execution as a held record
+   pinned to the released revision. That pin means THIS worker never retakes
+   the revision it abandoned (no budget-exhausted churn loop); every other
+   worker sees a plain open task, whose nextAction points at this source."
+  [worker state reason findings]
+  (let [{:keys [execution task]} (release-claim! worker state reason findings)]
+    (hold-selected execution reason task)))
+
+;; Exits that keep claims: an operator interrupt is resumed with --resume,
+;; whose contract restores the exact claim, workspace and session.
+(def ^:private claim-retaining-exits #{:interrupted})
+;; Held reasons released at exit: worker-side failures that only this worker can
+;; resume. Host/policy holds (consumer-rejected, validation-blocked,
+;; reviewer-unconfigured) and canonical revision conflicts stay for their owner.
+(def ^:private exit-released-holds #{"execution-blocked"})
+;; Host custody phases: the run-owned host may still accept this candidate.
+(def ^:private host-custody-phases #{"validating" "awaiting-acceptance"})
+
+(defn- release-on-exit
+  "Worker exit (other than interrupt) releases this worker's own unfinished
+   claims, so a finished swarm never leaves tasks `in_progress` for the next
+   run to find unverifiable."
+  [worker status state]
+  (if (contains? claim-retaining-exits status)
+    state
+    (let [state (if (and (:task_id state) (not (contains? host-custody-phases (:phase state))))
+                  (let [reason (keyword (str "worker-exit-" (name status)))
+                        {:keys [execution task]} (release-claim! worker state reason (last-findings state))]
+                    ;; Released: held WITHOUT a revision pin, so a resumed run
+                    ;; of this same worker may retake it and reuse its
+                    ;; workspace/session (exits do not churn; in-run gives do).
+                    ;; Unreleased (not owned / failed): keep the active record
+                    ;; exactly as before so resume can still restore its claim.
+                    (if task
+                      (merge (select-keys state [:queue_audit :queue_audit_unchanged])
+                             (:state (hold-selected execution reason)))
+                      (assoc state :exit_release (:release execution))))
+                  state)]
+      (reduce (fn [state [id held]]
+                (if (and (contains? exit-released-holds (:held_reason held)) (nil? (:release held)))
+                  (assoc-in state [:held_executions id]
+                            (:execution (release-claim! worker held :worker-exit (last-findings held))))
+                  state))
+              state (:held_executions state)))))
+
+(defn- reconcile-held! [root state accepted]
+  (reduce (fn [state [id held]]
+            (if (= "done" (:status (tasks/get-task id)))
+              (do (swap! accepted inc)
+                  (when-let [workspace (:workspace held)] (cambium/remove! root workspace))
+                  (update state :held_executions dissoc id))
+              state))
+          state (:held_executions state)))
+
+(defn- host-validation-step! [worker task state]
+  (let [result (tasks/request-acceptance! task (:workspace state)
+                                           (get-in state [:candidate_pin :source_commit]))
+        receipt (:validation result)
+        state (assoc state :validation receipt)]
+    (when receipt
+      (runs/write-cycle-log! (:swarm-id worker) (:id worker) (:cycle state)
+                             {:attempt (:attempt state) :outcome (keyword (:kind result))
+                              :claimed-task-ids [(:id task)] :session-id (:session_id state)
+                              :worktree-path (get-in state [:workspace :path]) :validation receipt}))
+    (case (:kind result)
+      "validating" (do (Thread/sleep (min 1000 (execution/remaining-ms (:deadline_ms state))))
+                       {:state (assoc state :phase "validating")})
+      "accepted" {:state (assoc state :phase "awaiting-acceptance" :feedback nil)}
+      "rejected" (let [state (assoc state :phase "implementing" :feedback receipt)
+                       validator (execution/validator-for (:task-execution worker) (:id task))]
+                   (if (:reconcile_on_rejection validator)
+                     (hold-selected state :consumer-rejected)
+                     {:state state}))
+      "blocked" (hold-selected state :validation-blocked))))
+
+(defn- with-selected-cycle-lock [worker f]
+  (if (selected-exclusive? worker)
+    (locking selected-writer-lock (f))
+    (f)))
+
+(defn- serialized-validation-step!
+  "One worker at a time refreshes onto the current integration root and holds
+   the host verdict window. Without this, a concurrent sibling landing first
+   leaves this candidate non-descendant and the host returns `blocked`, which
+   holds the task instead of re-reviewing the merged source."
+  [worker task state root]
+  (if-not (integration-turn! worker)
+    {:state (assoc state :phase "validating") :yield true}
+    (let [refreshed (if (:integration_turn state)
+                      state
+                      (integration-source/refresh! root state (:deadline_ms state)))]
+      (if (not= refreshed state)
+        (do (release-integration! worker) {:state refreshed})
+        (let [out (host-validation-step! worker task (assoc state :integration_turn true))]
+          (if (= "validating" (get-in out [:state :phase]))
+            out
+            (do (release-integration! worker)
+                (update out :state dissoc :integration_turn))))))))
+
+(defn- unstarted-provisioning? [state]
+  (and (:task_id state) (:claim_revision state)
+       (zero? (or (:attempt state) 0)) (nil? (:workspace state))
+       (nil? (:session_id state)) (empty? (:attempt_history state))
+       (= "execution-blocked" (:held_reason state))
+       (or (seq (:provisioning_failures state))
+           ;; Older journals lost exception metadata before the first model.
+           (str/starts-with? (or (get-in state [:feedback :error]) "")
+                             "Cambium creation failed; workspace retained if partially created:"))))
+
+(defn- recover-provisioning-task! [held]
+  (some (fn [[id state]]
+          (when (:startup_recovery_ready state)
+            (let [task (tasks/get-task (execution/key-string id))]
+              (when (and (= "in_progress" (:status task)) (false? (:paused task))
+                         (= (:claim_revision state) (:revision task)))
+                (tasks/restore-claim! (:id task) (:revision task))
+                task))))
+        held))
+
+(defn- resume-selected-state [worker config deadline]
+  (when-let [resume-id (:resume-swarm-id worker)]
+    (let [saved (:execution (runs/read-worker-state resume-id (:id worker)))
+          registered (cambium/list-workspaces (System/getProperty "user.dir"))]
+      (when-not saved (throw (ex-info "No selected execution exists in the requested run" {})))
+      (doseq [execution (cond-> (vals (:held_executions saved)) (:task_id saved) (conj saved))
+              :let [workspace (:workspace execution)
+                    found (some #(when (= (:path workspace) (:path %)) %) registered)
+                    task (tasks/get-task (:task_id execution))]]
+        (when-not (or (and (unstarted-provisioning? execution)
+                          ;; No source or model existed to resume. A nonnil
+                          ;; recorded oracle identity still must match.
+                          (or (nil? (:validator_digest execution))
+                              (= (:validator_digest execution)
+                                 (some-> (execution/validator-for config (:task_id execution)) execution/validator-digest))))
+                     (and found
+                          (= (:validator_digest execution)
+                             (some-> (execution/validator-for config (:task_id execution)) execution/validator-digest))))
+          (throw (ex-info "Selected execution resume lacks the exact registered source or validator pin" {})))
+        ;; Held executions are retained, not reclaimed on startup. A canonical
+        ;; open transition goes through claim-task! before their source is reused.
+        (when (and (= execution saved) (= "in_progress" (:status task))
+                   (not= "awaiting-acceptance" (:phase execution)))
+          (tasks/restore-claim! (:task_id execution) (:claim_revision execution)))
+        (when found (cambium/claim-existing! (System/getProperty "user.dir") found)))
+      ;; A resume does not create another 12-hour budget.
+      (-> saved
+          (execution/resume-budget config deadline)
+          (update :held_executions
+                  #(into {} (map (fn [[id state]]
+                                   [(execution/key-string id)
+                                    (if (unstarted-provisioning? state)
+                                      (let [failures (or (seq (:provisioning_failures state))
+                                                         [{:kind "legacy-creation-failure"
+                                                           :error (get-in state [:feedback :error])}])]
+                                        (cond-> (assoc state :provisioning_failures (vec failures))
+                                          (< (count failures) 2) (assoc :startup_recovery_ready true)))
+                                      state)]) %)))))))
+
+;; How long a worker keeps its claim through an unreachable Buddy server before
+;; the ordinary hold/stop path applies. Covers a server restart or overload.
+(def ^:private outage-patience-ms (* 30 60 1000))
+(defn- outage-backoff-ms [] (+ 10000 (rand-int 20000)))
+
+(defn- buddy-outage?
+  "True when the Buddy MCP endpoint itself was unreachable or failing (timeout,
+   refused connection, 5xx), as opposed to a rejected or expired grant."
+  [e]
+  (boolean
+   (some (fn [x]
+           (let [{:keys [type http-status]} (ex-data x)]
+             (and (= :transport-error type)
+                  (not (#{401 403} http-status)))))
+         (take-while some? (iterate ex-cause e)))))
+
+(defn run-selected-worker!
+  "Bounded, fail-closed Buddy consumer loop. Model output requests validation;
+   only actual canonical done permits the next task. Failed gates resume the
+   same native session in the same workspace. Existing run state owns recovery."
+  [worker]
+  (when-not (tasks/buddies?)
+    (throw (ex-info "task_execution requires the canonical Buddy task backend" {})))
+  (let [config (execution/validate-config! (:task-execution worker))
+        control-dir (continuation-control-dir)
+        root (System/getProperty "user.dir")
+        deadline (min (or (:deadline_ms config) Long/MAX_VALUE)
+                      (+ (execution/now-ms) (* 1000 (:wall_time_seconds config))))
+        initial (tasks/with-deadline deadline #(binding [cambium/*deadline-ms* deadline]
+                                               (resume-selected-state worker config deadline)))
+        deadline (or (:deadline_ms initial) deadline)
+        accepted (atom (or (:accepted_count initial) 0))
+        finish (fn [status state & [error]]
+                 (let [state (release-on-exit worker status state)]
+                 (when (= [(:swarm-id worker) (:id worker)] @selected-active-owner)
+                   (reset! selected-active-owner nil))
+                 (release-integration! worker)
+                 ;; Every new run needs its own durable terminal receipt, even
+                 ;; when its predecessor observed this exact same fingerprint.
+                 (selected-state! worker state "stopped" status)
+                 (cond-> (assoc worker :status status :completed @accepted
+                                 :cycles-completed @accepted :claims (if (:task_id state) 1 0)
+                                 :merges @accepted :errors (if error 1 0))
+                   (:queue_audit state) (assoc :queue_audit (:queue_audit state)
+                                              :queue_audit_changed (not (:queue_audit_unchanged state)))
+                   error (assoc :error error))))
+        attempt-cap (or (:max-resumes worker) default-max-resumes)]
+    (tasks/with-deadline deadline (fn []
+    (binding [cambium/*deadline-ms* deadline]
+    (loop [state (or initial {:cycle 1 :attempt 0 :accepted_count 0 :deadline_ms deadline})]
+      (let [deadline (:deadline_ms state)
+            control (try (host-continuation-request control-dir)
+                         (catch Exception e {:invalid (.getMessage e)}))
+            state (if (:id control) state (dissoc state :host_continuation_id))]
+        (cond
+          @shutdown-requested? (finish :interrupted state)
+          (zero? (execution/remaining-ms deadline)) (finish :wall-time-exhausted state)
+          (:invalid control) (finish :continuation-control-invalid state (:invalid control))
+          (and (:id control) (nil? (:task_id state)))
+          (let [state (assoc state :host_continuation_id (:id control))]
+            (selected-state! worker state "waiting" :host-continuation)
+            (Thread/sleep (min 1000 (execution/remaining-ms deadline)))
+            (recur state))
+          (>= @accepted (or (:max-cycles worker) 10))
+          (finish (if (selected-all-accepted?) :completed :budget-exhausted) state)
+          :else
+          (let [checkpoint (atom state)
+                result
+                ;; Serialize real project writers/GPU consumers across workers.
+                ;; A rejected task retains this lock until accepted or blocked.
+                ;; Source-only workers skip it; see selected-exclusive?.
+                (with-selected-cycle-lock worker (fn []
+                  (try
+                    (if (and (selected-exclusive? worker) @selected-active-owner
+                             (not= [(:swarm-id worker) (:id worker)] @selected-active-owner))
+                      {:state state :yield true}
+                    (let [state (reconcile-held! root state accepted)
+                          state (assoc state :accepted_count @accepted)
+                          audit (when-not (:task_id state) (selected-audit! worker config (:held_executions state)))
+                          state (if audit
+                                  (assoc state :queue_audit audit
+                                         :queue_audit_unchanged (= (:fingerprint audit) (get-in state [:queue_audit :fingerprint])))
+                                  state)
+                          task (if (:task_id state)
+                                 (tasks/get-task (:task_id state))
+                                 (or (recover-provisioning-task! (:held_executions state))
+                                     (selected-next-task! worker config (:held_executions state) audit)))
+                          prior-held (get (:held_executions state) (:id task))
+                          state (if (and task prior-held)
+                                  (merge (dissoc prior-held :startup_recovery_ready :release :exit_release)
+                                         (select-keys state [:deadline_ms :cycle :held_executions :accepted_count])
+                                         {:claim_revision (:revision task) :phase "implementing"}) state)
+                          state (if prior-held (update state :held_executions dissoc (:id task)) state)
+                          state (if task (dissoc state :queue_audit_unchanged) state)
+                          state (if (and task (not (:task_id state)))
+                                  (-> state
+                                      (assoc :task_id (:id task) :claim_revision (:revision task))
+                                      (dissoc :preclaim_failures :preclaim_error))
+                                  state)
+                          _ (when (and task (selected-exclusive? worker))
+                              (reset! selected-active-owner [(:swarm-id worker) (:id worker)]))
+                          state (if (and (:workspace state) (= "in_progress" (:status task))
+                                         (false? (:paused task)) (= (:claim_revision state) (:revision task))
+                                         (not= "awaiting-acceptance" (:phase state)))
+                                  (integration-source/refresh! root state deadline) state)
+                          _ (reset! checkpoint state)
+                          _ (when (:task_id state) (selected-state! worker state "running" nil))]
+                      (cond
+                        (nil? task)
+                        (if @shutdown-requested?
+                          {:stop :interrupted :state state}
+                          (case (:state audit)
+                          "accepted" {:stop :completed :state state}
+                          "needs-reconciliation" {:stop :needs-reconciliation :state state}
+                          "externally-blocked" {:stop :externally-blocked :state state}
+                          (do
+                            (when-not (:queue_audit_unchanged state)
+                              (selected-state! worker state "waiting" :canonical-execution-running))
+                            (Thread/sleep (min 1000 (execution/remaining-ms deadline)))
+                            {:state state :waiting true :suppress-state-write (:queue_audit_unchanged state)})))
+
+                        (= "done" (:status task))
+                        (do
+                          (swap! accepted inc)
+                          (when-let [workspace (:workspace state)]
+                            (cambium/remove! root workspace))
+                          (when (selected-exclusive? worker) (reset! selected-active-owner nil))
+                          {:state {:cycle (inc (:cycle state)) :attempt 0 :deadline_ms deadline
+                                   :accepted_count @accepted :held_executions (:held_executions state)}})
+
+                        (or (:paused task) (#{"blocked" "cancelled"} (:status task))
+                            (and (= "review" (:status task)) (not= "awaiting-acceptance" (:phase state))))
+                        (hold-selected state :canonical-task-blocked task)
+
+                        (and (not= "awaiting-acceptance" (:phase state))
+                             (not= (:claim_revision state) (:revision task)))
+                        (hold-selected state :canonical-revision-conflict task)
+
+                        (= "awaiting-acceptance" (:phase state))
+                        ;; Poll authoritative acceptance; a review token cannot advance.
+                        (do (Thread/sleep (min 1000 (execution/remaining-ms deadline))) {:state state})
+
+                        (= "validating" (:phase state))
+                        (serialized-validation-step! worker task state root)
+
+                        ;; Giving up after the attempt budget (e.g. repeated
+                        ;; reviewer NEEDS_CHANGES) requeues the claim for
+                        ;; another worker instead of stranding it in_progress.
+                        (>= (:attempt state) attempt-cap)
+                        (release-selected! worker state :attempt-budget-exhausted (last-findings state))
+
+                        :else
+                        (let [validator (execution/validator-for config (:id task))
+                              state (assoc state :validator_digest (some-> validator execution/validator-digest))
+                              _ (reset! checkpoint state)
+                              workspace (or (:workspace state)
+                                            (create-iteration-worktree! root (:swarm-id worker) (:id worker) (:cycle state)))
+                              state (assoc state :task_id (:id task) :claim_revision (:revision task)
+                                           :workspace workspace :validator_digest (some-> validator execution/validator-digest)
+                                           :attempt (inc (:attempt state)) :phase "implementing")
+                              _ (reset! checkpoint state)
+                              _ (selected-state! worker state "running" nil)
+                              context {:task_status (str "Selected task " (:id task) " remains in progress")
+                                       :pending_tasks "The framework selects the next task after actual acceptance."}
+                              attempt-ms (max 1 (min (* 1000 (:attempt_timeout_seconds config))
+                                                     (execution/remaining-ms deadline)))
+                              result (run-agent! (assoc worker :timeout-ms attempt-ms)
+                                                 (:path workspace) context (:session_id state)
+                                                 (some? (:session_id state))
+                                                 :resume-prompt-override (selected-prompt worker task (:feedback state)))
+                              state (assoc state :session_id (or (:session-id result) (:session_id state)))
+                              ;; Persist the return before any external read can fail.
+                              state (update state :attempt_history (fnil conj [])
+                                            {:attempt (:attempt state) :session_id (:session_id state)
+                                             :exit (:exit result) :output (snippet (:output result) 4000)})
+                              _ (reset! checkpoint state)
+                              _ (selected-state! worker state "running" nil)
+                              fresh (tasks/get-task (:id task))
+                              blocked (execution/blocked-result (:output result) (:id task))
+                              refreshed (when (and (:merge? result) (zero? (:exit result)) (nil? blocked)
+                                                   (= "in_progress" (:status fresh)) (false? (:paused fresh))
+                                                   (= (:claim_revision state) (:revision fresh)))
+                                          (integration-source/refresh! root state deadline))]
+                          (cond
+                            (zero? (execution/remaining-ms deadline)) {:stop :wall-time-exhausted :state state}
+                            (= "done" (:status fresh)) {:state state}
+                            (or (:paused fresh) (not= "in_progress" (:status fresh)))
+                            (hold-selected state :canonical-task-blocked fresh)
+                            (not= (:claim_revision state) (:revision fresh))
+                            (hold-selected state :canonical-revision-conflict fresh)
+                            ;; block -> review -> (confirmed: canonical blocked |
+                            ;; rejected: released to open with the reviewer's
+                            ;; reason). Only a reviewer-less config keeps the
+                            ;; unreviewed block, recorded as such.
+                            blocked
+                            (let [state (assoc state :blocked_result blocked :feedback blocked)
+                                  _ (reset! checkpoint state)
+                                  review (when (seq (:reviewers worker))
+                                           (run-block-reviewer! (assoc worker :timeout-ms attempt-ms :deadline-ms deadline :selected-task fresh
+                                                                       :review-base (execution/git! root deadline "rev-parse" "HEAD"))
+                                                                (:path workspace)
+                                                                {:block blocked
+                                                                 :earlier_review_findings (some-> (last (:review_feedback state)) (snippet 2000))}))
+                                  _ (when review
+                                      (runs/write-review-log! (:swarm-id worker) (:id worker) (:cycle state) (:attempt state)
+                                                              (assoc review :kind "block")))]
+                              (cond
+                                (nil? review)
+                                (hold-selected (assoc state :block_review "unreviewed") :model-blocked (tasks/block-task! fresh blocked))
+                                (explicit-approval? review)
+                                (hold-selected (assoc state :block_review "confirmed") :model-blocked (tasks/block-task! fresh blocked))
+                                :else
+                                (release-selected! worker (assoc state :block_review "rejected") :block-rejected (:output review))))
+                            (= 124 (:exit result))
+                            (release-selected! worker state :attempt-timeout
+                                               (str "attempt " (:attempt state) " timed out; " (last-findings state)))
+                            (not (zero? (:exit result)))
+                            {:state (assoc state :feedback {:reason "model-attempt-failed" :exit (:exit result)
+                                                          :stderr (:stderr-snippet result)})}
+                            (not (:merge? result))
+                            {:state (assoc state :feedback {:reason "candidate-not-ready"
+                                                          :output (snippet (:output result) 2000)})}
+                            (and refreshed (not= state refreshed)) {:state refreshed}
+                            :else
+                            (let [pin (if validator
+                                        (execution/source-pin! (:path workspace) validator deadline)
+                                        (do
+                                          (when-not (str/blank? (execution/git! (:path workspace) deadline "status" "--porcelain"))
+                                            (throw (ex-info "Preparation candidate must be clean and committed" {:reason :dirty-source})))
+                                          {:source_commit (execution/git! (:path workspace) deadline "rev-parse" "HEAD")}))
+                                  review (when (seq (:reviewers worker))
+                                           (run-reviewer! (assoc worker :timeout-ms attempt-ms :deadline-ms deadline :selected-task task
+                                                               :review-base (execution/git! root deadline "rev-parse" "HEAD"))
+                                                          (:path workspace) (:review_feedback state)))
+                                  approved? (explicit-approval? review)
+                                  _ (when review
+                                      (runs/write-review-log! (:swarm-id worker) (:id worker) (:cycle state) (:attempt state)
+                                                              (assoc review :duration-ms (:duration-ms review))))
+                                  _ (when (and validator approved?
+                                               (not= pin (execution/source-pin! (:path workspace) validator deadline)))
+                                      (throw (ex-info "Reviewer changed the candidate source; a fresh implementation/validation is required" {})))
+                                  state (assoc state :candidate_pin pin :phase "validating")
+                                  _ (reset! checkpoint state)
+                                  _ (selected-state! worker state "running" nil)]
+                              (cond
+                                (nil? review) (hold-selected state :reviewer-unconfigured)
+                                (not approved?)
+                                {:state (-> state
+                                            (assoc :phase "implementing"
+                                                   :feedback {:reason "reviewer-rejected" :output (:output review)
+                                                              :comments (:comments review)})
+                                            (update :review_feedback (fnil conj []) (:output review)))}
+                                (nil? validator)
+                                (do (tasks/complete-task! task)
+                                    (hold-selected (assoc state :phase "awaiting-acceptance") :validator-unconfigured))
+                                :else
+                                ;; Host is the single full-oracle owner. Review
+                                ;; remains advisory and cannot mark task done.
+                                (serialized-validation-step! worker task state root))))))))
+                    (catch Exception e
+                      ;; An exception mid-verdict must not strand siblings.
+                      (release-integration! worker)
+                      (cond
+                        ;; Buddy server unreachable (restart, overload) is an
+                        ;; outage, not a task failure: keep the claim and wait
+                        ;; it out. Swarm 233859e6 (2026-10-23 12:02 UTC) lost 8
+                        ;; claimed tasks and every worker to one server restart
+                        ;; because timeouts were counted as task/preclaim failures.
+                        (and (buddy-outage? e)
+                             (< (- (System/currentTimeMillis) (or (:outage_since @checkpoint) (System/currentTimeMillis)))
+                                outage-patience-ms))
+                        (let [state (-> @checkpoint
+                                        (update :outage_since #(or % (System/currentTimeMillis)))
+                                        (assoc :outage_error (.getMessage e)))]
+                          (Thread/sleep (min (outage-backoff-ms) (execution/remaining-ms deadline)))
+                          {:state state :outage-wait true})
+
+                        (:task_id @checkpoint)
+                        (let [data (ex-data e)
+                              state (cond-> (assoc @checkpoint :feedback {:error (.getMessage e)
+                                                                         :reason (some-> data :reason name)})
+                                      (and (nil? (:workspace @checkpoint))
+                                           (zero? (or (:attempt @checkpoint) 0))
+                                           (:path data) (:dir data) (:branch data))
+                                      (update :provisioning_failures (fnil conj [])
+                                              (assoc (select-keys data [:path :dir :branch :source_commit :result])
+                                                     :kind "creation-failure")))]
+                          (if (= :dirty-source (:reason (ex-data e)))
+                            {:state state}
+                            (hold-selected state :execution-blocked)))
+
+                        :else
+                        ;; Before any claim, a failure (often several workers
+                        ;; scanning and claiming the same queue at once) is
+                        ;; transient: back off and rescan instead of retiring
+                        ;; the worker. Stop only after repeated consecutive
+                        ;; failures, with the last error kept on the record.
+                        (let [failures (inc (or (:preclaim_failures @checkpoint) 0))
+                              state (assoc @checkpoint :preclaim_failures failures
+                                           :preclaim_error (.getMessage e))]
+                          (if (>= failures 5)
+                            {:stop :execution-blocked :state state :error (.getMessage e)}
+                            (do (Thread/sleep (min (* 5000 failures (inc (rand-int 3)))
+                                                   (execution/remaining-ms deadline)))
+                                {:state state}))))))))]
+            (when-not (or (:stop result) (:suppress-state-write result))
+              (selected-state! worker (:state result) (if (:waiting result) "waiting" "running") nil))
+            (when (:yield result) (Thread/sleep (min 1000 (execution/remaining-ms deadline))))
+            (if-let [status (:stop result)]
+              (finish status (:state result) (:error result))
+              (recur (if (:outage-wait result)
+                       (:state result)
+                       (dissoc (:state result) :outage_since :outage_error)))))))))))))
+
+(defn run-worker! [worker]
+  (if (:task-execution worker)
+    (run-selected-worker! worker)
+    (run-queue-worker! worker)))
+
 ;; =============================================================================
 ;; Multi-Worker Execution
 ;; =============================================================================
@@ -1848,17 +2602,27 @@
     (contains? result :rejections) (assoc :rejections (:rejections result))
     (contains? result :recycled) (assoc :recycled (:recycled result))
     (contains? result :claims) (assoc :claims (:claims result))
+    (:queue_audit result) (assoc :queue_audit (:queue_audit result)
+                                :queue_audit_changed (:queue_audit_changed result))
     (:error result) (assoc :error (:error result))))
 
 (defn- stopped-reason
   "Honest stop reason for stopped.json. \"completed\" is reserved for a
    genuinely drained queue; when ZERO workers ended :completed and pending
    tasks remain, the swarm died, and the reason says so."
-  [results pending-count]
+  ([results pending-count] (stopped-reason results pending-count (boolean (some :task-execution results))))
+  ([results pending-count selected?]
   (let [any-completed? (boolean (some #(= :completed (:status %)) results))]
-    (if (and (not any-completed?) (pos? pending-count))
-      :workers-exhausted
-      :completed)))
+    (cond
+      ;; An expired run grant may no longer permit another task read. Deadline
+      ;; exhaustion is already decisive negative evidence and never "completed".
+      (and selected? (some #(= :wall-time-exhausted (:status %)) results)) :wall-time-exhausted
+      (and selected? (some #(= :needs-reconciliation (:status %)) results)) :needs-reconciliation
+      (and selected? (some #(= :externally-blocked (:status %)) results)) :externally-blocked
+      selected? (if (and any-completed? (selected-all-accepted?)) :completed :awaiting-buddy-acceptance)
+      (and (tasks/buddies?) (not (tasks/all-complete?))) :awaiting-buddy-acceptance
+      (and (not any-completed?) (pos? pending-count)) :workers-exhausted
+      :else :completed))))
 
 (defn run-workers!
   "Run multiple workers in parallel.
@@ -1876,7 +2640,15 @@
   ;; overlapping swarms manufactured stale-base diffs and double-claims).
   (ensure-single-swarm! force?)
   (tasks/ensure-dirs!)
-  (let [swarm-id (-> workers first :swarm-id)
+  (let [started-ms (execution/now-ms)
+        workers (mapv (fn [worker]
+                        (if-let [config (:task-execution worker)]
+                          (assoc worker :task-execution
+                                 (assoc config :deadline_ms
+                                        (min (or (:deadline_ms config) Long/MAX_VALUE)
+                                             (+ started-ms (* 1000 (:wall_time_seconds config))))))
+                          worker)) workers)
+        swarm-id (-> workers first :swarm-id)
         stale-current (tasks/list-current)]
     (when (seq stale-current)
       (println (format "WARNING: %d task(s) already in current/ from a previous run. These may be stale claims."
@@ -1945,8 +2717,10 @@
           ;; ~20h. "completed" is now reserved for a genuinely drained queue.
           (when swarm-id
             (let [worker-outcomes (mapv worker-terminal-outcome results)
-                  pending (tasks/pending-count)
-                  reason (stopped-reason results pending)]
+                  selected? (boolean (some :task-execution workers))
+                  pending (try (tasks/pending-count) (catch Exception e
+                                                     (if selected? nil (throw e))))
+                  reason (stopped-reason results pending selected?)]
               (runs/write-stopped! swarm-id reason
                                    :worker-outcomes worker-outcomes
                                    :pending-count pending)
@@ -1970,6 +2744,8 @@
    Runs in project root. Respects max_pending cap.
    Returns {:tasks-created N}"
   [{:keys [harness model prompts max-pending swarm-id]}]
+  (when (tasks/buddies?)
+    (throw (ex-info "Filesystem planner cannot run against Buddy tasks" {})))
   (tasks/ensure-dirs!)
   (let [project-root (System/getProperty "user.dir")
         pending-before (tasks/pending-count)

@@ -16,8 +16,8 @@ From the [Oompa Loompas blog post](notes/2025-01-instant_software_blog_draft.md)
 for w in $(seq 1 ${WORKERS:-3}); do
   (for i in $(seq 1 ${ITERATIONS:-5}); do
     wt=".w${w}-i${i}"
-    git worktree add $wt -b $wt 2>/dev/null
-    { echo "Worktree: $wt"; cat prompts/worker.md; } | claude -p -
+    git cambium add -b "$wt" -name "oompa-$w-$i" -ephemeral "../oompa-$w-$i"
+    { echo "Worktree: ../oompa-$w-$i"; cat prompts/worker.md; } | claude -p -
   done) &
 done; wait
 ```
@@ -29,7 +29,8 @@ Process: Create/claim tasks in tasks/{pending,in_progress,complete}.md
 Method: Isolate changes to your worktree, commit and merge when complete
 ```
 
-That's it. Parallel agents with worktree isolation.
+This historical sketch illustrates parallel agents with worktree isolation.
+Use the full runner below for guarded integration and Cambium retirement.
 
 ---
 
@@ -239,15 +240,23 @@ oompa help                  # Show all commands
 
 ## Disk-efficient worktrees
 
-Oompa prefers [`sg`](https://github.com/nbardy/simgit) when it is available on
-`PATH`. `sg` creates a real Git linked worktree and uses native copy-on-write
-clones on APFS and reflink-capable Linux filesystems, so unchanged tracked files
-share physical storage across workers. Oompa prints a warning and falls back to
-plain `git worktree add` when `sg` or native CoW is unavailable.
+Oompa requires Cambium on `PATH` and creates each worker with
+`git cambium add -b BRANCH -name NAME -ephemeral PATH`. Workspaces have unique
+names and live beside the project under `.oompa-worktrees/`, where Cambium
+can share files through copy-on-write. Creation fails if Cambium fails.
 
-Ignored dependencies, caches, build products, model weights, and media are not
-made cheap by tracked-file CoW. Keep those behind the project's worktree
-bootstrap and cleanup policy, and run `oompa cleanup` after disposable swarms.
+`oompa worktrees` discovers registered external workspaces. Cleanup uses
+`cambium remove NAME` after checking that the owner process is inactive,
+the workspace is clean, no Git operation is in progress, and its branch is
+integrated into the project checkout. Dirty, active, unmerged, and legacy
+unregistered worktrees are preserved; branches are retained. Before removal,
+git-ignored files under the workspace's `output/` move to the same path in the
+primary checkout (identical files are deduplicated); a differing destination
+keeps the workspace with reason `output-conflict`. `git status` does not show
+ignored files, so without this a paid run's output was deleted with its
+workspace (wave_sim swarm 455987ea, 2026-10-24). Workers can
+retire their own completed workspace. Cambium also carries dependency
+folders when supported; follow project bootstrap policy for anything else.
 
 ## Opencode Harness
 
@@ -277,8 +286,7 @@ so downstream UIs can identify and group worker conversations.
 - Node.js 18+ (only for npm wrapper / npx usage)
 - [Babashka](https://github.com/babashka/babashka) (bb)
 - Git 2.5+ (for worktrees)
-- Optional but recommended: [`sg`](https://github.com/nbardy/simgit) for
-  disk-efficient copy-on-write worktrees
+- Cambium (`git cambium` and `cambium`) for managed ephemeral workspaces
 - One of:
   - [Claude CLI](https://github.com/anthropics/claude-cli)
   - [Codex CLI](https://github.com/openai/codex)
@@ -287,3 +295,180 @@ so downstream UIs can identify and group worker conversations.
 ## License
 
 MIT
+
+## Buddy-task fork
+
+The `buddies-cambium` branch adds a scoped Buddy task backend. Buddy tasks remain
+the authority for ownership, done criteria, blockers and acceptance. Oompa owns
+execution, isolated workspaces and candidate review; it does not mirror tasks
+into `tasks/`. Existing filesystem mode remains available for upstream projects.
+
+```json
+{
+  "task_backend": {
+    "type": "buddies",
+    "workspace_id": "your-workspace-id",
+    "buddy_id": "accountable-buddy-id",
+    "task_ids": ["task-first", "task-next"],
+    "dependencies": {"task-next": ["task-first"]},
+    "url_env": "OOMPA_BUDDY_MCP_URL",
+    "authorization_env": "AGENT_CLI_MCP_UNLEASHD_BUDDY__AUTHORIZATION"
+  },
+  "workers": [
+    {"model": "codex:gpt-6.1-sol:medium", "max_cycle": 10,
+     "max_resumes": 100, "count": 1, "can_plan": false}
+  ]
+}
+```
+
+Start with `./swarm.bb tasks --config oompa.buddies.json` to check the selected
+canonical tasks without launching a model. Run from the target project with
+`/path/to/oompa/swarm.bb run --config oompa.buddies.json` after that check.
+`./swarm.bb audit --config oompa.buddies.json` emits a read-only executable
+`oompa.task-graph/v1` graph/source-pin audit with no claim, model or validator
+execution. Startup emits this same preflight. Readiness is per selected task:
+a missing/stale parent consumer cannot hide independent ready source work.
+Done tasks retain historical receipts; their old source pins are not checked
+against the current checkout. Unselected validators are never inspected.
+The endpoint and bearer must come from the supported scoped Buddy runtime.
+Never save a bearer in configuration, use the owner's HTTP credentials, or open
+Buddy database files. Missing, expired or denied authority stops explicitly;
+there is no local-queue fallback. A turn-scoped bearer ends with its chat. For unattended work use the Buddy
+host's owner-authorized `oompa` launch tool, which creates a separate task-scoped
+connection lasting only that run (up to twelve hours). It survives chat completion
+and backend replacement; stop, exit and deadline revoke it.
+
+Deadline-bound Cambium workspace creation may take up to ten minutes to
+materialize tracked files and dependency layers, clipped to the original run
+deadline. Other Cambium/Git queries retain their thirty-second limit. A timeout
+retains any partial workspace and owner metadata without fallback or deletion.
+Creation resolves the launch checkout's exact HEAD (including a linked checkout),
+passes that commit explicitly to Cambium and verifies the resulting HEAD before
+starting a model. It never relies on the primary checkout's default branch.
+On supported resume, a recorded creation failure before any model/session exists
+may retry provisioning once at the same exact canonical claim and original
+deadline. Partial directories remain evidence, never assumed valid source. Held
+work with model history still requires its original registered workspace and
+validator identity; blocked or changed canonical claims are never retried by
+this startup repair.
+
+Only explicit task IDs belonging to the configured Buddy and workspace are
+admitted. Claims compare the observed revision and preserve the accountable
+owner; blocked, paused, in-progress and review tasks are not new work. Configured
+`task_ids` order determines selection priority; prerequisite checks still apply.
+Explicit prerequisites must be in the admitted task set and actually done.
+
+To work a whole subtree instead of hand-picking IDs, point the backend at parent tasks:
+
+- `task_backend.root_task_ids` — parent task IDs; every scan re-expands their descendants by canonical `parentId`, so children created or reopened mid-run are picked up.
+- Work item vs container — a root with any child, or a descendant with an open (not done/cancelled) child, is a container and is never claimed; every other descendant is a work item.
+- `task_backend.task_ids` — optional alongside `root_task_ids`; explicit IDs keep first priority, then discovered work items in depth-first order.
+- Discovered tasks use their own canonical `ownerId`; `owner_by_task` applies only to explicit `task_ids`.
+- `task_execution.default_validator` — validator for any selected task without a `validators` entry; required when `root_task_ids` is set (startup refuses otherwise).
+- The Buddy launch grant then carries `oompa.rootTaskIds` and authorizes exactly that subtree (ancestry checked per request), not a frozen ID list.
+
+The filesystem
+planner is disabled in Buddy mode. Workers receive the full task criteria and
+claim results through their prompt rather than finding JSON files themselves.
+
+A merge-ready signal submits the task to **review**, never **done**. Independent
+consumer/physics validation and the accountable Buddy still own acceptance.
+An empty runnable set with unfinished canonical tasks reports
+`awaiting-buddy-acceptance`, not beta completion. After process loss, existing
+in-progress tasks stay held until their owner reconciles the original run;
+Oompa must not silently recycle another executor's claim.
+A worker that gives up on its OWN claim releases it explicitly instead
+(swarm 455987ea went idle with such claims stuck `in_progress`): on the attempt
+budget (for example repeated reviewer NEEDS_CHANGES), an attempt timeout, a
+rejected block, or a worker exit other than interrupt, the claim is CAS-set back
+to `open`. Its `nextAction` keeps the owner's text and appends one
+`[oompa-release]` section naming the reason, the retained unmerged branch and
+commit, and the last reviewer findings. The releasing worker keeps a held
+record pinned to the released revision and does not retake it; other workers
+can. An interrupt keeps the claim for `--resume`. Host/policy holds
+(`consumer-rejected`, `validation-blocked`, `reviewer-unconfigured`) and
+canonical revision conflicts are not released.
+
+For deterministic delivery use top-level `task_execution`: `wall_time_seconds`,
+`attempt_timeout_seconds`, `validators` keyed by canonical task ID and optional
+`prepare_only_task_ids`. A validator contains argv `command`, `timeout_seconds`
+and a nonempty `source_files` map of owner-pinned SHA-256 values. The host executes
+the source-bound consumer once, verifies its typed verdict and clean source,
+fast-forwards the integration checkout, then CAS-accepts the task. Configured code
+review runs before the full consumer; its verdict cannot accept physics.
+
+Rejected work keeps its native model session and Cambium source. Held work stays
+in the existing run recovery record while independent ready tasks advance.
+Missing validators permit only
+explicit preparation/review. When another accepted chunk advances integration,
+the selected writer merges its current committed HEAD into a clean registered
+candidate from the same recorded starting lineage. It preserves session and
+attempt history, invalidates prior readiness/validation, and reruns review and
+the gate on the combined source. Merge conflicts remain in the same candidate
+for its model to resolve; the framework never resets or rebases that work.
+Final completion requires every selected canonical
+task actually done, including the parent when it is included as an observed gate.
+An exhausted selected graph now returns `needs-reconciliation` for internal
+source/consumer/prerequisite repairs, or `externally-blocked` for typed external
+and acceptance gates. It does not spend the remainder of the window polling an
+unchanged blocked graph. Existing worker/run outcomes retain `queue_audit` with
+`state`, stable `fingerprint`, per-task `items`, and actionable repair `actions`.
+An unchanged resumed graph reports `queue_audit_changed=false`, performs no model
+attempt/claim and writes only the new run's required terminal receipt. Controllers
+must use the fingerprint to suppress repeated unchanged reconciliation/status
+work; a real graph/source/config change produces new information.
+
+Optional `task_execution.task_readiness` maps canonical IDs to typed owner
+metadata: `role` (`consumer` or `observed`), `blocker_class` (`internal`,
+`external` or `acceptance`), `reason_code`, `required_owner`, and `next_action`.
+Observed nodes are original canonical acceptance gates, never model work.
+Unknown holds require owner classification rather than inference from prose.
+Metadata cannot reopen a task, reset attempts or authorize spending. Register a
+reviewed source prerequisite as an actual canonical child, admit its source-bound
+check through the reviewed config, and retain real dependencies; a local status
+note or validator stub is not a prerequisite or acceptance result.
+
+Delegated renewal retains its original absolute deadline. A separate explicit
+owner launch can resume expired source/history in a new window only with
+host-injected `task_execution.owner_window` metadata (`authorization_id`,
+`expires_at_ms`, `prior_deadline_ms`) matching host environment
+`OOMPA_OWNER_WINDOW_AUTHORIZATION_ID`/`OOMPA_OWNER_WINDOW_EXPIRES_AT_MS`.
+The previous deadline is appended to existing execution history. Attempts,
+sessions, workspaces and scientific/human holds survive; amended config alone
+cannot forge a new window.
+
+A validator may set `reconcile_on_rejection:true` for an expensive consumer.
+One actual rejection then retains its source/session/attempt and executable
+receipt as a `consumer-rejected` hold and returns reconciliation work after other
+ready tasks finish. It does not run another model or consumer at the unchanged
+canonical revision. Reviewed changed-cause/source/check evidence and an explicit
+canonical reopen are required before continuation; delegated config amendment
+cannot remove this checkpoint. Cheap controls retain the normal repair loop.
+Workers can return a JSON blocked result with `status: "blocked"`, a nonempty
+`reason`, `taskComplete: false`, `readyForMergeValidation: false`, and optional
+`requiredOwnerAction`. The block is first sent to the configured reviewers
+(`config/prompts/_framework/block_reviewer.md`) with the task's done criteria and
+current `nextAction`, including any CEO DECISION line. `VERDICT: APPROVED`
+confirms it: the framework CAS-holds the canonical task as `blocked` with its
+reason and next action, retaining its source/session and return history. Any
+other verdict rejects it: the task is released to `open` with the reviewer's
+reason in `nextAction`, as above. Without configured reviewers the block stands
+unreviewed (`block_review: "unreviewed"` on the held record).
+Canonical status/revision is also rechecked after every model return. Held work
+resumes only after an explicit canonical `open` transition at a new revision;
+restarting the run or editing blocked-task metadata does not retry it or renew
+the deadline.
+Host launches may set `OOMPA_CONTINUATION_CONTROL_DIR` to an existing private
+execution journal directory. Before an authorized bounded diagnostic, the host
+atomically writes `continuation-request.json` with a nonempty string `id`.
+Selected workers acknowledge only when they have no active task, using live state
+`status: "waiting"`, `reason: "host-continuation"` and
+`execution.host_continuation_id`. Held executions remain intact. The host waits
+for every started worker to acknowledge the exact id before running diagnostics,
+then removes the request on completion, stop, failure or expiry. Workers refresh
+their waiting state and do no task selection until removal; original deadlines
+and shutdown still apply. Active tasks continue to their normal checkpoint/hold
+without an idle acknowledgement. Invalid requests stop fail closed; without the
+environment variable the existing selection behavior is unchanged.
+The wave_sim all-beta example lives at `oompa/beta/all.json` in that repository.
+Its source, account, physical and human acceptance requirements remain unchanged.

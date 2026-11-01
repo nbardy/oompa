@@ -69,3 +69,11 @@ If something goes wrong, an operator should be able to reconstruct what happened
 Every file on disk records something that happened — a swarm started, an iteration completed, a reviewer gave a verdict. No file records a computed view of what happened. Summaries, statuses, and aggregate metrics are computed at read time by whoever needs them.
 
 This eliminates ghost state (derived files outliving their validity), dual authority (two files claiming to represent the same thing), and stale reads (dashboards showing dead runs as alive). An event file is written once, is immutable, and is always true.
+
+## Worker task eligibility
+
+Optional worker `task_ids` is a typed array of nonempty canonical task IDs.
+Missing retains existing role/dependency/GPU selection; `[]` admits no tasks.
+The CLI forwards the parsed set to the worker. Both explicit CLAIM handling and
+selected-task scheduling enforce this allowlist before shared claim mutation.
+Eligibility does not waive dependencies, GPU restrictions, validators or review.

@@ -63,6 +63,7 @@
                 :started-at (str (java.time.Instant/now))
                 :pid (.pid (java.lang.ProcessHandle/current))
                 :config-file config-file
+                :continuation-control-dir (System/getenv "OOMPA_CONTINUATION_CONTROL_DIR")
                 :workers (mapv (fn [w]
                                  {:id (:id w)
                                   :harness (name (:harness w))
@@ -144,7 +145,7 @@
   [swarm-id worker-id cycle
    {:keys [attempt outcome duration-ms claimed-task-ids recycled-tasks
            error-snippet review-rounds session-id timing-ms
-           worktree-path signals merge-sha]}]
+           worktree-path signals merge-sha validation]}]
   (when swarm-id
     (let [filename (format "%s-c%d.json" worker-id cycle)]
       (write-json! (str (cycles-dir swarm-id) "/" filename)
@@ -162,6 +163,7 @@
                     :worktree-path worktree-path
                     :signals (or signals [])
                     :merge-sha merge-sha
+                    :validation validation
                     :timing-ms timing-ms}))))
 
 ;; =============================================================================
@@ -181,7 +183,7 @@
 
    status: \"running\" (cycle in progress) | \"stopped\" (worker exited; :reason
    carries the terminal status name, e.g. completed/error/fatal-error)."
-  [swarm-id worker-id {:keys [status cycle attempt reason]}]
+  [swarm-id worker-id {:keys [status cycle attempt reason execution]}]
   (when swarm-id
     (write-json! (str (run-dir swarm-id) "/workers/" worker-id ".json")
                  (cond-> {:worker-id worker-id
@@ -189,7 +191,14 @@
                           :updated-at (str (java.time.Instant/now))}
                    cycle (assoc :cycle cycle)
                    attempt (assoc :attempt attempt)
+                   execution (assoc :execution execution)
                    reason (assoc :reason reason)))))
+
+(defn read-worker-state
+  "Read the existing live worker record, including source/session continuation."
+  [swarm-id worker-id]
+  (let [f (io/file (str (run-dir swarm-id) "/workers/" worker-id ".json"))]
+    (when (.exists f) (json/parse-string (slurp f) true))))
 
 ;; =============================================================================
 ;; Read helpers (for cmd-status, dashboards)

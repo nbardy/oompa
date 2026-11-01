@@ -1,264 +1,72 @@
 (ns agentnet.tasks
-  "Folder-based task management.
+  "Task backend boundary. Filesystem is the upstream default; Buddy is explicit and fail closed."
+  (:require [agentnet.filesystem-tasks :as filesystem]
+            [agentnet.buddy-tasks :as buddy]))
 
-   Tasks live in tasks/{pending,current,complete}/*.json
+;; Backend boundary: the original implementations remain the upstream filesystem default.
+;; Buddy mode never enters filesystem I/O or migration, including directory creation.
+(defonce ^:private backend (atom :filesystem))
+(defn buddies? [] (= :buddies @backend))
+(defn backend? [] @backend)
+(defn with-deadline [deadline f]
+  (binding [buddy/*deadline-ms* deadline] (f)))
+(defn configure! [config]
+  (let [kind (keyword (or (:type config) "filesystem"))]
+    (case kind
+      :filesystem (reset! backend :filesystem)
+      :buddies (do (buddy/configure! config) (reset! backend :buddies))
+      (throw (ex-info "Unknown task backend; expected filesystem or buddies" {:type kind}))))
+  nil)
 
-   Workers:
-   - Claim tasks: mv pending/foo.json → current/foo.json
-   - Complete tasks: mv current/foo.json → complete/foo.json
-   - Create tasks: write new .json to pending/
-
-   Task format:
-   {\"id\": \"task-001\",
-    \"summary\": \"Add authentication\",
-    \"description\": \"Implement JWT auth...\",
-    \"files\": [\"src/auth.py\"],
-    \"acceptance\": [\"Login works\", \"Tests pass\"]}"
-  (:require [cheshire.core :as json]
-            [clojure.java.io :as io]
-            [clojure.string :as str]))
-
-;; =============================================================================
-;; Paths
-;; =============================================================================
-
-(def ^:const TASKS_ROOT "tasks")
-(def ^:const PENDING_DIR (str TASKS_ROOT "/pending"))
-(def ^:const CURRENT_DIR (str TASKS_ROOT "/current"))
-(def ^:const COMPLETE_DIR (str TASKS_ROOT "/complete"))
-
-(defn ensure-dirs!
-  "Create task directories if they don't exist"
-  []
-  (doseq [dir [PENDING_DIR CURRENT_DIR COMPLETE_DIR]]
-    (.mkdirs (io/file dir))))
-
-;; =============================================================================
-;; Task I/O
-;; =============================================================================
-
-(defn- read-task-file
-  "Read a single task .json file"
-  [^java.io.File f]
-  (when (.exists f)
-    (try
-      (let [task (json/parse-string (slurp f) true)]
-        (assoc task :_file (.getPath f)))
-      (catch Exception e
-        (println (format "[warn] Failed to read task %s: %s" (.getName f) (.getMessage e)))
-        nil))))
-
-(defn- list-task-files
-  "List all .json files in a directory"
-  [dir]
-  (let [d (io/file dir)]
-    (when (.exists d)
-      (->> (.listFiles d)
-           (filter #(str/ends-with? (.getName %) ".json"))
-           (sort-by #(.getName %))))))
-
-(defn list-pending
-  "List all pending tasks"
-  []
-  (->> (list-task-files PENDING_DIR)
-       (keep read-task-file)
-       vec))
-
-(defn list-current
-  "List all in-progress tasks"
-  []
-  (->> (list-task-files CURRENT_DIR)
-       (keep read-task-file)
-       vec))
-
-(defn list-complete
-  "List all completed tasks"
-  []
-  (->> (list-task-files COMPLETE_DIR)
-       (keep read-task-file)
-       vec))
-
-(defn list-all
-  "List all tasks with their status"
-  []
-  (concat
-    (map #(assoc % :status :pending) (list-pending))
-    (map #(assoc % :status :current) (list-current))
-    (map #(assoc % :status :complete) (list-complete))))
-
-;; =============================================================================
-;; Task Operations
-;; =============================================================================
-
-(defn- move-task!
-  "Move a task file from one dir to another"
-  [task from-dir to-dir]
-  (let [filename (-> (:_file task) io/file .getName)
-        from-path (io/file from-dir filename)
-        to-path (io/file to-dir filename)]
-    (when (.exists from-path)
-      (.renameTo from-path to-path)
-      (assoc task :_file (.getPath to-path)))))
-
-(defn claim-task!
-  "Claim a pending task (mv pending → current). Returns task or nil."
-  [task]
-  (move-task! task PENDING_DIR CURRENT_DIR))
-
-(defn complete-task!
-  "Mark a task complete (mv current → complete). Returns task or nil."
-  [task]
-  (move-task! task CURRENT_DIR COMPLETE_DIR))
-
-
-(defn unclaim-task!
-  "Return a task to pending (mv current → pending). Returns task or nil."
-  [task]
-  (move-task! task CURRENT_DIR PENDING_DIR))
-
-(defn claim-next!
-  "Claim the next available pending task. Returns task or nil."
-  []
-  (when-let [task (first (list-pending))]
-    (claim-task! task)))
-
+(defn ensure-dirs! [] (when-not (buddies?) (filesystem/ensure-dirs!)))
+(defn migrate-from-tasks-json! [] (when-not (buddies?) (filesystem/migrate-from-tasks-json!)))
+(defn list-pending [] (if (buddies?) (buddy/list-pending) (filesystem/list-pending)))
+(defn list-current [] (if (buddies?) (buddy/list-current) (filesystem/list-current)))
+(defn list-complete [] (if (buddies?) (buddy/list-complete) (filesystem/list-complete)))
+(defn list-all [] (if (buddies?) (buddy/list-all) (filesystem/list-all)))
+(defn selection-dependencies [] (if (buddies?) (buddy/selection-dependencies) {}))
+(defn get-task [id]
+  (if (buddies?) (buddy/get-task id) (first (filter #(= id (:id %)) (list-all)))))
+(defn claim-task! [task] (if (buddies?) (buddy/claim-task! task) (filesystem/claim-task! task)))
+(defn restore-claim! [id revision]
+  (if (buddies?) (buddy/restore-claim! id revision)
+      (throw (ex-info "Persisted selected-task execution requires the Buddy backend" {}))))
+(defn request-acceptance! [task workspace source-commit]
+  (if (buddies?) (buddy/request-acceptance! task workspace source-commit)
+      (throw (ex-info "Executable acceptance requires the run-owned Buddy host" {}))))
+(defn complete-task! [task] (if (buddies?) (buddy/complete-task! task) (filesystem/complete-task! task)))
+(defn unclaim-task! [task] (if (buddies?) (buddy/unclaim-task! task) (filesystem/unclaim-task! task)))
+(defn block-task! [task result]
+  (if (buddies?) (buddy/block-task! task result)
+      (throw (ex-info "Selected-task holds require the Buddy backend" {}))))
+(defn release-abandoned! [task next-action]
+  (if (buddies?) (buddy/release-abandoned! task next-action)
+      (throw (ex-info "Selected-task releases require the Buddy backend" {}))))
+(defn claim-next! []
+  (if (buddies?) (some buddy/claim-task! (list-pending)) (filesystem/claim-next!)))
 (defn claim-by-id!
-  "Claim a pending task by its :id string. Atomically moves pending → current.
-   Options:
-   - :claim-denial-fn receives the pending task and returns nil when the claim
-     is allowed, or a map/keyword/string describing why it must be rejected.
-
-   Returns {:status :claimed|:already-taken|:not-found|:not-claimable, :id id}."
-  ([task-id]
-   (claim-by-id! task-id nil))
-  ([task-id {:keys [claim-denial-fn]}]
-   (let [match (first (filter #(= (:id %) task-id) (list-pending)))]
-     (if match
-       (if-let [denial (when claim-denial-fn (claim-denial-fn match))]
-         (merge {:status :not-claimable :id task-id}
-                (cond
-                  (map? denial) denial
-                  (keyword? denial) {:reason (name denial)}
-                  :else {:reason (str denial)}))
-         (if (claim-task! match)
-           {:status :claimed :id task-id}
-           {:status :already-taken :id task-id}))
-       ;; Not in pending — check if already in current (raced)
-       (if (some #(= (:id %) task-id) (list-current))
-         {:status :already-taken :id task-id}
-         {:status :not-found :id task-id})))))
-
+  ([id] (claim-by-id! id nil))
+  ([id opts] (if (buddies?) (buddy/claim-by-id! id opts) (filesystem/claim-by-id! id opts))))
+(defn complete-by-ids! [ids]
+  (if (buddies?)
+    (->> ids (keep #(buddy/complete-task! (buddy/get-task %))) (mapv :id))
+    (filesystem/complete-by-ids! ids)))
+(defn create-task! [task] (if (buddies?) (buddy/create-task! task) (filesystem/create-task! task)))
+(defn pending-count [] (if (buddies?) (count (list-pending)) (filesystem/pending-count)))
+(defn current-count [] (if (buddies?) (count (list-current)) (filesystem/current-count)))
+(defn complete-count [] (if (buddies?) (count (list-complete)) (filesystem/complete-count)))
+(defn current-task-ids []
+  (if (buddies?) (set (map :id (list-current))) (filesystem/current-task-ids)))
+(defn recycle-tasks! [ids]
+  (if (buddies?)
+    (->> ids (keep #(buddy/unclaim-task! (buddy/get-task %))) (mapv :id))
+    (filesystem/recycle-tasks! ids)))
+(defn all-complete? [] (if (buddies?) (buddy/all-complete?) (filesystem/all-complete?)))
 (defn claim-by-ids!
-  "Claim multiple tasks by ID. Returns vector of result maps."
-  ([task-ids]
-   (claim-by-ids! task-ids nil))
-  ([task-ids opts]
-   (mapv #(claim-by-id! % opts) task-ids)))
-
-(defn complete-by-ids!
-  "Move tasks from current → complete by ID. Framework-owned completion.
-   Returns vector of completed task IDs."
-  [task-ids]
-  (let [id-set (set task-ids)
-        to-complete (filter #(id-set (:id %)) (list-current))]
-    (doseq [task to-complete]
-      (complete-task! task))
-    (mapv :id to-complete)))
-
-;; =============================================================================
-;; Task Creation
-;; =============================================================================
-
-(defn- generate-task-id
-  "Generate a unique task ID"
-  []
-  (format "task-%d" (System/currentTimeMillis)))
-
-(defn- task->filename
-  "Convert task to filename"
-  [task]
-  (let [id (or (:id task) (generate-task-id))
-        safe-id (str/replace id #"[^a-zA-Z0-9-_]" "-")]
-    (str safe-id ".json")))
-
-(defn create-task!
-  "Create a new task in pending/. Returns the task with :_file set."
-  [{:keys [id summary] :as task}]
-  (ensure-dirs!)
-  (let [task-id (or id (generate-task-id))
-        task (assoc task :id task-id)
-        filename (task->filename task)
-        path (io/file PENDING_DIR filename)]
-    (spit path (str (json/generate-string task {:pretty true}) "\n"))
-    (assoc task :_file (.getPath path))))
-
-(defn create-tasks!
-  "Create multiple tasks. Returns list of created tasks."
-  [tasks]
-  (mapv create-task! tasks))
-
-;; =============================================================================
-;; Status Checks
-;; =============================================================================
-
-(defn pending-count [] (count (list-task-files PENDING_DIR)))
-(defn current-count [] (count (list-task-files CURRENT_DIR)))
-(defn complete-count [] (count (list-task-files COMPLETE_DIR)))
-
-(defn current-task-ids
-  "Return a set of task IDs currently in current/."
-  []
-  (->> (list-task-files CURRENT_DIR)
-       (keep read-task-file)
-       (map :id)
-       set))
-
-(defn recycle-tasks!
-  "Move specific tasks from current/ back to pending/ by ID.
-   Returns vector of recycled task IDs."
-  [task-ids]
-  (let [current (list-current)
-        to-recycle (filter #(task-ids (:id %)) current)]
-    (doseq [task to-recycle]
-      (unclaim-task! task))
-    (mapv :id to-recycle)))
-
-(defn recycle-all-current!
-  "Move every task from current/ back to pending/.
-   Returns vector of recycled task IDs."
-  []
-  (recycle-tasks! (current-task-ids)))
-
-(defn all-complete?
-  "True if no pending or current tasks"
-  []
-  (and (zero? (pending-count))
-       (zero? (current-count))))
-
-(defn has-pending?
-  "True if there are pending tasks"
-  []
-  (pos? (pending-count)))
-
-(defn status-summary
-  "Return status counts"
-  []
-  {:pending (pending-count)
-   :current (current-count)
-   :complete (complete-count)})
-
-;; =============================================================================
-;; Migration from old format
-;; =============================================================================
-
-(defn migrate-from-tasks-json!
-  "Migrate from config/tasks.json to folder structure"
-  []
-  (let [old-file (io/file "config/tasks.json")]
-    (when (.exists old-file)
-      (println "Migrating from config/tasks.json...")
-      (ensure-dirs!)
-      (let [tasks (json/parse-string (slurp old-file) true)]
-        (doseq [task tasks]
-          (create-task! task))
-        (println (format "Migrated %d tasks to tasks/pending/" (count tasks)))))))
+  ([ids] (claim-by-ids! ids nil))
+  ([ids opts] (mapv #(claim-by-id! % opts) ids)))
+(defn create-tasks! [tasks] (mapv create-task! tasks))
+(defn recycle-all-current! [] (recycle-tasks! (current-task-ids)))
+(defn has-pending? [] (pos? (pending-count)))
+(defn status-summary []
+  {:pending (pending-count) :current (current-count) :complete (complete-count)})

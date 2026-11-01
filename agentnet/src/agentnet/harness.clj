@@ -8,6 +8,7 @@
    Harness = Codex | Claude | Opencode | Gemini | Cursor
    δ(harness) → config map → agent-cli JSON → command vector"
   (:require [babashka.process :as process]
+            [agentnet.bounded-process :as bounded]
             [cheshire.core :as json]
             [clojure.string :as str]))
 
@@ -194,13 +195,18 @@
   "Attach harness-specific extraArgs to the JSON input map.
    Only opencode needs extra flags (--format json, --attach)."
   [m harness-kw opts]
-  (if (= harness-kw :opencode)
+  (if (= harness-kw :claude)
+    (if-let [effort (:reasoning opts)]
+      (-> m (dissoc :reasoning :reasoningEffort)
+          (assoc :extraArgs ["--effort" effort]))
+      m)
+    (if (= harness-kw :opencode)
     (let [url (opencode-attach-url)
           extra (cond-> []
                   (:format? opts) (into ["--format" "json" "--print-logs" "--log-level" "WARN"])
                   url             (into ["--attach" url]))]
       (if (seq extra) (assoc m :extraArgs extra) m))
-    m))
+    m)))
 
 (defn resume-drive?
   "Per-turn dispatch: should this turn RESUME the existing session (vs create a
@@ -279,12 +285,15 @@
                     (and (:session-id opts) (not resume?)) (assoc :sessionId (:session-id opts))
                     (and (:session-id opts) resume?)       (assoc :resumeSessionId (:session-id opts))
                     (:reasoning opts)  (assoc :reasoningEffort (:reasoning opts))
-                    (or (= harness-kw :gemini) (gemini-alias? harness-kw))
+                    (or (:debug-raw-events? opts) (= harness-kw :gemini) (gemini-alias? harness-kw))
                     (assoc :debugRawEvents true))
                   (add-extra-args harness-kw opts)
                   json/generate-string)]
-    (process/sh ["agent-cli" "run" "--input" "-"]
-                {:in input :out :string :err :string})))
+    (if-let [timeout-ms (:timeout-ms opts)]
+      (bounded/run! ["agent-cli" "run" "--input" "-"]
+                    {:in input :out :string :err :string} timeout-ms)
+      (process/sh ["agent-cli" "run" "--input" "-"]
+                  {:in input :out :string :err :string}))))
 
 ;; =============================================================================
 ;; Session Management
