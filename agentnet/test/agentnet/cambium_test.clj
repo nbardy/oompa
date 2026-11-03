@@ -145,41 +145,27 @@
           (is (= (cambium/workspace-path root (:dir data)) (:path data)))
           (is (= (:dir data) (second (first @marks)))))))))
 
-(deftest cleanup-only-removes-clean-integrated-inactive-work
-  (doseq [[label additions overrides expected]
-          [[:clean {} {} nil]
-           [:active {:current-task "task-1"} {} :active]
-           [:dirty {} {["git" "status" "--porcelain"] {:out "?? result.txt\n"}} :dirty]
-           [:unmerged {} {["git" "merge-base" "--is-ancestor" "oompa/test" "HEAD"] {:exit 1}} :unmerged]
-           [:unknown-status {} {["git" "status" "--porcelain"] {:exit 128}} :unreadable]
-           [:changed-branch {} {["git" "symbolic-ref" "--short" "HEAD"] {:out "other"}} :branch-changed]
-           [:legacy {:path "/tmp/legacy"} {} :unmanaged]]]
+(deftest oompa-only-holds-never-reach-cambium
+  ;; The guard ladder lives in `cambium remove --safe`; these are the holds
+  ;; Cambium cannot know (task ownership, unmanaged path).
+  (doseq [[label additions expected]
+          [[:active {:current-task "task-1"} :active]
+           [:legacy {:path "/tmp/legacy"} :unmanaged]]]
     (testing (name label)
       (let [calls (atom [])]
-        (with-redefs [process/sh (shell-stub calls overrides)]
-          (let [result (cambium/remove! root (merge workspace additions))
-                removals (filter #(= "cambium" (ffirst %)) @calls)]
-            (is (= (nil? expected) (:removed? result)))
-            (is (= expected (:reason result)))
-            (is (= (if expected 0 1) (count removals)))
-            (when-not expected
-              (is (= ["cambium" "remove" "oompa-test"] (ffirst removals))))))))))
-
-(deftest interrupted-merge-is-preserved
-  (let [calls (atom [])
-        marker (java.io.File/createTempFile "oompa-merge-head-" ".marker")]
-    (try
-      (with-redefs [process/sh (shell-stub calls {["git" "rev-parse" "--git-path" "MERGE_HEAD"]
-                                                {:out (.getPath marker)}})]
-        (is (= :in-progress (:reason (cambium/remove! root workspace))))
-        (is (not-any? #(= "cambium" (ffirst %)) @calls)))
-      (finally (.delete marker)))))
+        (with-redefs [process/sh (shell-stub calls {})]
+          (is (= expected (:reason (cambium/remove! root (merge workspace additions)))))
+          (is (empty? @calls)))))))
 
 (deftest cleanup-failure-is-reported-without-destructive-retry
+  ;; A non-refusal failure (crash, usage error, old Cambium without --safe)
+  ;; must preserve the workspace, never fall back to an unguarded removal.
   (let [calls (atom [])]
-    (with-redefs [process/sh (shell-stub calls {["cambium" "remove" "oompa-test"] {:exit 1 :err "busy"}})]
+    (with-redefs [process/sh (shell-stub calls {})
+                  cambium/run! (fn [argv _] (swap! calls conj argv)
+                                 {:exit 2 :out "" :err "flag provided but not defined: -safe"})]
       (is (= :remove-failed (:reason (cambium/remove! root workspace))))
-      (is (= 1 (count (filter #(= "cambium" (ffirst %)) @calls)))))))
+      (is (= 1 (count @calls))))))
 
 (deftest worker-lifecycle-uses-shared-helper
   (let [calls (atom [])]
@@ -258,34 +244,41 @@
     (assert (zero? (:exit r)) (pr-str argv r))
     r))
 
-(deftest ignored-run-output-survives-workspace-removal
-  ;; Regression: swarm 455987ea (2026-10-24) removed an accepted workspace and
-  ;; with it the ignored output/ of a paid WC1 GPU run, because ignored files do
-  ;; not appear in `git status --porcelain`. Real repository, no stubs.
-  (let [tmp (fs/file (fs/create-temp-dir {:prefix "oompa-harvest-"}))
-        primary (io/file tmp "primary")
-        linked (io/file tmp "linked")]
+(deftest guarded-removal-through-real-cambium
+  ;; Real repository and real `cambium` binary, no stubs. Regression: swarm
+  ;; 455987ea (2026-10-24) removed an accepted workspace and with it the
+  ;; ignored output/ of a paid WC1 GPU run, because ignored files do not
+  ;; appear in `git status --porcelain`. Also proves Cambium's JSON refusal
+  ;; reasons map back to the keywords oompa logs.
+  (let [tmp (fs/file (fs/create-temp-dir {:prefix "oompa-safe-remove-"}))
+        primary (.getCanonicalPath (io/file tmp "primary"))
+        out (fn [base rel text] (let [f (io/file base "output" rel)] (io/make-parents f) (spit f text) f))]
     (try
-      (.mkdirs primary)
+      (.mkdirs (io/file primary))
       (sh! primary "git" "init" "-q" "-b" "main")
       (spit (io/file primary ".gitignore") "output/\n")
       (sh! primary "git" "add" ".gitignore")
       (sh! primary "git" "-c" "user.name=t" "-c" "user.email=t@t" "commit" "-q" "-m" "init")
-      (sh! primary "git" "worktree" "add" "-q" "-b" "oompa/h" (.getPath linked))
-      (let [out (fn [base rel text] (let [f (io/file base "output" rel)] (io/make-parents f) (spit f text) f))]
-        (out linked "run/gauges.csv" "t,eta\n0,0.1\n")
-        (out linked "shared/same.json" "{}")
+      (let [ws (cambium/create! primary "harvest" "oompa/")]
+        (testing "dirty work is preserved"
+          (spit (io/file (:path ws) "draft.txt") "unsaved")
+          (is (= :dirty (:reason (cambium/remove! primary ws))))
+          (is (.exists (io/file (:path ws) "draft.txt"))))
+        (testing "unintegrated commits are preserved"
+          (sh! (:path ws) "git" "add" "draft.txt")
+          (sh! (:path ws) "git" "-c" "user.name=t" "-c" "user.email=t@t" "commit" "-q" "-m" "draft")
+          (is (= :unmerged (:reason (cambium/remove! primary ws)))))
+        (sh! primary "git" "merge" "-q" "--ff-only" (:branch ws))
+        (out (:path ws) "run/gauges.csv" "t,eta\n0,0.1\n")
+        (out (:path ws) "shared/same.json" "{}")
         (out primary "shared/same.json" "{}")
-        (testing "moves new files to the same path in the primary checkout"
-          (is (= {:moved 1 :deduplicated 1 :conflicts []}
-                 (cambium/harvest-ignored-output! (.getPath linked))))
-          (is (= "t,eta\n0,0.1\n" (slurp (io/file primary "output/run/gauges.csv"))))
-          (is (not (.exists (io/file linked "output/run/gauges.csv")))))
-        (testing "a destination with different bytes blocks removal and moves nothing"
-          (out linked "run/gauges.csv" "different")
-          (out linked "run/new.csv" "new")
-          (is (= ["output/run/gauges.csv"]
-                 (:conflicts (cambium/harvest-ignored-output! (.getPath linked)))))
-          (is (.exists (io/file linked "output/run/new.csv")))
+        (testing "a differing destination blocks removal and moves nothing"
+          (out primary "run/gauges.csv" "different")
+          (is (= :output-conflict (:reason (cambium/remove! primary ws))))
+          (is (.exists (io/file (:path ws) "output/run/gauges.csv")))
+          (io/delete-file (io/file primary "output/run/gauges.csv")))
+        (testing "integrated clean work is removed and ignored output harvested"
+          (is (:removed? (cambium/remove! primary ws)))
+          (is (not (.exists (io/file (:path ws)))))
           (is (= "t,eta\n0,0.1\n" (slurp (io/file primary "output/run/gauges.csv"))))))
       (finally (fs/delete-tree tmp)))))
