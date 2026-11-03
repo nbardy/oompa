@@ -245,16 +245,20 @@ Oompa requires Cambium on `PATH` and creates each worker with
 names and live beside the project under `.oompa-worktrees/`, where Cambium
 can share files through copy-on-write. Creation fails if Cambium fails.
 
-`oompa worktrees` discovers registered external workspaces. Cleanup uses
-`cambium remove NAME` after checking that the owner process is inactive,
-the workspace is clean, no Git operation is in progress, and its branch is
-integrated into the project checkout. Dirty, active, unmerged, and legacy
-unregistered worktrees are preserved; branches are retained. Before removal,
-git-ignored files under the workspace's `output/` move to the same path in the
-primary checkout (identical files are deduplicated); a differing destination
-keeps the workspace with reason `output-conflict`. `git status` does not show
-ignored files, so without this a paid run's output was deleted with its
-workspace (wave_sim swarm 455987ea, 2026-10-24). Workers can
+`oompa worktrees` discovers registered external workspaces. Cleanup checks
+only what Cambium cannot know (the workspace holds no task, lives under
+`.oompa-worktrees/`, and its owner process is inactive), then calls
+`cambium remove --safe --json --require-merged HEAD --harvest output NAME`.
+Cambium owns the guard ladder: it refuses (exit 3, JSON `reason`) when status
+is unreadable, a Git operation is in progress, the branch changed, the tree is
+dirty, or the branch is not integrated into the project checkout's HEAD.
+Before removal it moves git-ignored files under the workspace's `output/` to
+the same path in the primary checkout (identical files are deduplicated); a
+differing destination keeps the workspace with reason `output-conflict`.
+`git status` does not show ignored files, so without this a paid run's output
+was deleted with its workspace (wave_sim swarm 455987ea, 2026-10-24). Oompa
+logs the refusal reason as a keyword; any other failure is `remove-failed`
+and never falls back to an unguarded removal. Branches are retained. Workers can
 retire their own completed workspace. Cambium also carries dependency
 folders when supported; follow project bootstrap policy for anything else.
 
@@ -286,7 +290,7 @@ so downstream UIs can identify and group worker conversations.
 - Node.js 18+ (only for npm wrapper / npx usage)
 - [Babashka](https://github.com/babashka/babashka) (bb)
 - Git 2.5+ (for worktrees)
-- Cambium (`git cambium` and `cambium`) for managed ephemeral workspaces
+- Cambium 0.6.0+ (`git cambium` and `cambium`, with `remove --safe`) for managed ephemeral workspaces
 - One of:
   - [Claude CLI](https://github.com/anthropics/claude-cli)
   - [Codex CLI](https://github.com/openai/codex)
